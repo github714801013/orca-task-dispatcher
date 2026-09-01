@@ -1,0 +1,78 @@
+version: 1
+
+workspace:
+  projects_root: "/path/to/projects"
+  projects:
+    example-repository:
+      path: "example-repository"
+      base_branches:
+        - "main"
+
+base_branch:
+  optional: true
+  default: null
+  options:
+    - "main"
+  validate: true
+
+task_source:
+  type: "prompt"
+  task_url_template: "https://example.invalid/tasks/{task_id}"
+  query: "status = ready"
+  fetch_prompt: |
+    使用当前环境可用的任务查询工具获取开发任务。
+
+    查询条件：
+    {{query}}
+
+    必须返回真实查询结果。每个任务必须包含 task_id（事项唯一标识）和 title（标题）。
+  session_prompt:
+    separate: |
+      当前任务使用 separate 布局。确认任务、仓库和基础分支后，先为该任务创建或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
+      未获得有效工作树路径时，停止分发且不得创建终端。
+    split: |
+      当前任务使用共享分屏布局。不要将后续异步流程创建的工作树路径写入 launch 输入。
+    recovery: |
+      这是恢复会话。先检查已有工作区、分支和产物；确认状态后继续任务，不要重复初始化或覆盖已有成果。
+  max_tasks: 12
+
+interaction:
+  repository_selection: "required"
+  base_branch_selection: "optional"
+  ask_batch_size: 4
+  repository_suggestion_limit: 4
+  allow_other: true
+
+dispatch:
+  agent: "claude"
+  skill:
+    command_templates:
+      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 当前worktree进行工作"
+      split: "/dev-spec-gen {task_url} base_branch={base_branch} 新建worktree进行工作"
+  layout:
+    group_by: "repository"
+    max_panes_per_tab: 4
+    mode: "separate"
+  terminal:
+    shell_commands:
+      windows: "cmd.exe /d /k"
+      posix: "sh -i"
+    read_retry_attempts: 2
+    read_retry_delay_ms: 500
+    ready_timeout_ms: 60000
+  concurrency:
+    max_agents: 12
+
+dedup:
+  enabled: true
+  strategy: "task_id"
+  skip_dispatched: true
+  state_file: ".runtime/state.json"
+
+automation:
+  enabled: false
+  name: "Weekly Task Dispatcher"
+  trigger: "weekly"
+  day: 1
+  time: "09:00"
+  reuse_session: false
