@@ -26,6 +26,10 @@ task_source:
     {{query}}
 
     必须返回真实查询结果。每个任务必须包含 task_id（事项唯一标识）和 title（标题）。
+
+    父任务解析：对每个查询到的任务，检查其是否存在父任务。存在父任务时，获取父任务信息；
+    若父任务的类型为产品需求（issuetype=产品需求），则以父任务作为该开发任务的实际任务：task_id 使用父任务编号，
+    title 使用父任务标题，任务描述使用父任务描述。父任务类型不是产品需求或没有父任务时，保持原开发任务不变。
   session_prompt:
     separate: |
       当前任务使用 separate 布局。确认任务、仓库和基础分支后，先为该任务创建或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
@@ -45,9 +49,11 @@ interaction:
 
 dispatch:
   agent: "claude"
+  # 可选：跳过工具权限弹窗（如 uv run 确认），避免任务命令被权限确认阻塞。
+  agent_extra_args: ""
   skill:
     command_templates:
-      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 当前worktree进行工作"
+      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务的worktree中进行工作"
       split: "/dev-spec-gen {task_url} base_branch={base_branch} 新建worktree进行工作"
   layout:
     group_by: "repository"
@@ -59,7 +65,7 @@ dispatch:
       posix: "sh -i"
     read_retry_attempts: 2
     read_retry_delay_ms: 500
-    ready_timeout_ms: 60000
+    ready_timeout_ms: 360000
   concurrency:
     max_agents: 12
 

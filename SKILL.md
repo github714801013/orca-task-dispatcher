@@ -25,7 +25,7 @@ uv run --project <root> python <root>/scripts/dispatcher.py <subcommand>
 2. 原样执行 `task-source` 返回的 `fetch_prompt` 获取真实任务。每项必须满足提示词要求，并至少具有 `task_id` 与 `title`；任务获取失败、无结果或字段不足时如实停止。
 3. 运行 `state`，跳过 `dispatched`；`launching` 必须先 `reset <task_id>`，不得自动重试。
 4. 用 `AskUserQuestion` 让用户逐项选仓库；仅允许 `repos` 返回的名称。再运行 `branches --repository <name>`，用户仅可选 `valid=true` 分支或默认分支。
-5. 按 `dispatcher.py launch --help` 的输入契约写入 `.runtime/current-run.json`：以任务的 `task_id`、`title` 和 `task-source` 返回的 `task_url_template` 生成 `task_url`，并填入确认的 `repository`、其返回路径与 `base_branch`。展示汇总后取得对本次 terminal 创建与发送的明确确认。
+5. 按 `dispatcher.py launch --help` 的输入契约写入 `.runtime/current-run.json`：以任务的 `task_id`、`title` 和 `task-source` 返回的 `task_url_template` 生成 `task_url`，并填入确认的 `repository`、其返回路径与 `base_branch`；`separate` 布局还必须为每项任务写入源仓库的 linked worktree 路径 `worktree_path`。展示汇总后取得对本次 terminal 创建与发送的明确确认。
 6. 运行 `launch --input <root>/.runtime/current-run.json`，如实报告 JSON 结果；不等待 `/dev-spec-gen` 完成。
 
 需要注册 Automation 时，先运行对应 `orca automations ... --help`，再单独请求授权。

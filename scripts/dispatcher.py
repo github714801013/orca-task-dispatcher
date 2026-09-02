@@ -120,6 +120,16 @@ class Repository:
 
 
 @dataclass(frozen=True)
+class OrcaWorktree:
+    worktree_id: str
+    path: Path
+
+    @property
+    def selector(self) -> str:
+        return f"id:{self.worktree_id}"
+
+
+@dataclass(frozen=True)
 class Assignment:
     task: Task
     repository: str
@@ -129,6 +139,9 @@ class Assignment:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Assignment":
+        unknown_fields = set(value) - {"task_id", "title", "task_url", "repository", "repository_path", "base_branch", "worktree_path"}
+        if unknown_fields:
+            raise DispatcherError("invalid_input", f"任务包含未知字段：{sorted(unknown_fields)[0]}")
         branch = value.get("base_branch")
         if branch is not None and (not isinstance(branch, str) or not branch.strip()):
             raise DispatcherError("invalid_input", "base_branch 必须是字符串或 null")
@@ -166,6 +179,7 @@ class TerminalPlan:
 @dataclass(frozen=True)
 class TerminalSnapshot:
     handle: str
+    worktree_id: str
     worktree_path: Path
     tab_id: str
     leaf_id: str
@@ -181,6 +195,7 @@ class TerminalSnapshot:
         worktree_path = Path(require_text(value.get("worktreePath"), "Orca terminal.worktreePath"))
         return cls(
             handle=handle,
+            worktree_id=require_text(value.get("worktreeId"), "Orca terminal.worktreeId"),
             worktree_path=worktree_path,
             tab_id=require_text(value.get("tabId"), "Orca terminal.tabId"),
             leaf_id=require_text(value.get("leafId"), "Orca terminal.leafId"),
@@ -222,6 +237,7 @@ class Config:
     read_retry_attempts: int
     read_retry_delay_ms: int
     shell_command: str
+    agent_extra_args: str
     state_file: Path
     task_url_template: str
     task_source_type: str
@@ -327,6 +343,11 @@ def load_config(config_file: Path) -> Config:
     shell_commands = require_mapping(terminal.get("shell_commands"), "dispatch.terminal.shell_commands")
     shell_platform = "windows" if os.name == "nt" else "posix"
     shell_command = require_text(shell_commands.get(shell_platform), f"dispatch.terminal.shell_commands.{shell_platform}")
+    agent_extra_args = dispatch.get("agent_extra_args")
+    if agent_extra_args is None:
+        agent_extra_args = ""
+    if not isinstance(agent_extra_args, str):
+        raise DispatcherError("invalid_config", "dispatch.agent_extra_args 必须是字符串")
 
     return Config(
         root=root,
@@ -337,10 +358,11 @@ def load_config(config_file: Path) -> Config:
         max_tasks=require_integer(task_source.get("max_tasks"), "task_source.max_tasks", 1, 12),
         max_agents=require_integer(concurrency.get("max_agents"), "dispatch.concurrency.max_agents", 1, 12),
         max_panes=require_integer(layout.get("max_panes_per_tab"), "dispatch.layout.max_panes_per_tab", 1, 4),
-        ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, 300_000),
+        ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, 360_000),
         read_retry_attempts=require_integer(terminal.get("read_retry_attempts"), "dispatch.terminal.read_retry_attempts", 1, 3),
         read_retry_delay_ms=require_integer(terminal.get("read_retry_delay_ms"), "dispatch.terminal.read_retry_delay_ms", 0, 5_000),
         shell_command=shell_command,
+        agent_extra_args=agent_extra_args,
         state_file=relative_to_root(root, dedup.get("state_file"), "dedup.state_file"),
         task_url_template=task_url_template,
         task_source_type=task_source_type,
@@ -543,20 +565,10 @@ def chunked(values: tuple[Assignment, ...], size: int) -> Iterable[tuple[Assignm
         yield chunk
 
 
-def plan_repository_path(plan: TerminalPlan) -> Repository:
-    if plan.layout_mode != "separate":
-        return plan.repository
-    worktree_path = plan.assignments[0].worktree_path
-    if worktree_path is None:
-        raise DispatcherError("invalid_input", "separate 布局缺少 worktree_path")
-    return Repository(name=plan.repository.name, path=worktree_path.resolve())
-
-
 def terminal_repositories(plans: Iterable[TerminalPlan]) -> tuple[Repository, ...]:
     repositories: OrderedDict[Path, Repository] = OrderedDict()
     for plan in plans:
-        repository = plan_repository_path(plan)
-        repositories.setdefault(repository.path.resolve(), repository)
+        repositories.setdefault(plan.repository.path.resolve(), plan.repository)
     return tuple(repositories.values())
 
 def build_terminal_plans(
@@ -922,12 +934,40 @@ class OrcaClient:
             "in-progress",
         )
 
-    def terminal_create(self, repository: Repository, title: str, command: str) -> str:
+    def worktree_resolve(self, path: Path) -> OrcaWorktree:
+        result = self._call("worktree", "show", "--worktree", f"path:{path.resolve().as_posix()}")
+        worktree = result.get("worktree")
+        if not isinstance(worktree, Mapping):
+            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 worktree 对象")
+        worktree_path = Path(require_text(worktree.get("path"), "Orca worktree.path")).resolve()
+        if worktree_path != path.resolve():
+            raise DispatcherError("orca_selector_mismatch", "Orca worktree 路径与目标工作树不一致")
+        return OrcaWorktree(
+            worktree_id=require_text(worktree.get("id"), "Orca worktree.id"),
+            path=worktree_path,
+        )
+
+    def worktree_list(self) -> tuple[OrcaWorktree, ...]:
+        result = self._call("worktree", "list")
+        worktrees = result.get("worktrees")
+        if not isinstance(worktrees, list):
+            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 worktrees 列表")
+        values: list[OrcaWorktree] = []
+        for worktree in worktrees:
+            if not isinstance(worktree, Mapping):
+                raise DispatcherError("orca_invalid_json", "Orca worktree 项格式不合法")
+            values.append(OrcaWorktree(
+                worktree_id=require_text(worktree.get("id"), "Orca worktree.id"),
+                path=Path(require_text(worktree.get("path"), "Orca worktree.path")).resolve(),
+            ))
+        return tuple(values)
+
+    def terminal_create(self, worktree_selector: str, title: str, command: str) -> str:
         result = self._call(
             "terminal",
             "create",
             "--worktree",
-            f"path:{repository.path.as_posix()}",
+            worktree_selector,
             "--title",
             title,
             "--command",
@@ -994,6 +1034,8 @@ class OrcaClient:
             raise DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
 
     def terminal_send(self, handle: str, text: str) -> None:
+        # 不传 --interrupt：interrupt-style 输入在 Claude Code TUI 中不会以回车提交文本，
+        # 曾导致命令只被输入而未触发。普通 --enter 提交即可生效。
         self._call("terminal", "send", "--terminal", handle, "--text", text, "--enter")
 
 
@@ -1122,6 +1164,59 @@ def split_parent_snapshot(
     return parent
 
 
+def agent_command_for(config: Config) -> str:
+    if not config.agent_extra_args.strip():
+        return config.agent_command
+    return f"{config.agent_command} {config.agent_extra_args.strip()}"
+
+
+TERMINAL_HANDLE_TIMEOUT_MARKER = "Timed out waiting for terminal handle"
+
+
+def create_terminal_with_retry(
+    orca: OrcaClient,
+    selector: str,
+    title: str,
+    command: str,
+) -> str:
+    """注册后首次创建可能因 Orca 注册未生效而等待 handle 超时；仅对该超时特征重试一次。"""
+    try:
+        return orca.terminal_create(selector, title, command)
+    except DispatcherError as error:
+        if TERMINAL_HANDLE_TIMEOUT_MARKER not in error.message:
+            raise
+        time.sleep(2.0)
+        return orca.terminal_create(selector, title, command)
+
+
+def resolve_assignment_worktree(
+    orca: OrcaClient,
+    config: Config,
+    repository: Repository,
+    assignment: Assignment,
+    repository_ids: dict[str, str],
+) -> OrcaWorktree:
+    worktree_path = assignment.worktree_path
+    if worktree_path is None:
+        raise DispatcherError("invalid_input", "separate 布局要求主 Agent 提供 worktree_path")
+    resolved = worktree_path.resolve()
+    for worktree in retry_read(config, orca.worktree_list):
+        if worktree.path == resolved:
+            return worktree
+    path_key = os.path.normcase(os.path.normpath(str(resolved)))
+    if path_key not in repository_ids:
+        orca.repo_add(Repository(repository.name, resolved))
+        repository_ids[path_key] = "registered"
+    return retry_read(config, lambda: orca.worktree_resolve(resolved))
+
+
+def validate_terminal_snapshot(snapshot: TerminalSnapshot, worktree: OrcaWorktree) -> None:
+    if snapshot.worktree_path.resolve() != worktree.path.resolve():
+        raise DispatcherError("orca_selector_mismatch", "Orca terminal 路径与目标工作树不一致")
+    if snapshot.worktree_id != worktree.worktree_id:
+        raise DispatcherError("orca_selector_mismatch", "Orca terminal 未绑定目标工作树")
+
+
 def launch(
     config: Config,
     assignments: tuple[Assignment, ...],
@@ -1136,10 +1231,6 @@ def launch(
     repositories = repositories_for_assignments(config, assignments)
     for assignment in assignments:
         validate_assignment(config, assignment, repositories)
-    if config.layout_mode == "separate":
-        worktree_paths = [assignment.worktree_path.resolve() for assignment in assignments if assignment.worktree_path]
-        if len(worktree_paths) != len(set(worktree_paths)):
-            raise DispatcherError("invalid_input", "separate 布局中每个任务必须使用不同的 worktree_path")
 
     with store.launch_lock(force_unlock):
         dispatched = tuple(assignment for assignment in assignments if store.status(assignment.task.task_id) == "dispatched")
@@ -1191,8 +1282,8 @@ def launch(
             raise DispatcherError("orca_repository_not_registered", f"Orca 注册后仍未找到目标仓库：{missing}")
 
         records: list[TerminalRecord] = []
+        worktree_cache: dict[str, OrcaWorktree] = {}
         for plan in plans:
-            terminal_repository = plan_repository_path(plan)
             handles: dict[int, str] = {}
             for index, assignment in enumerate(plan.assignments):
                 is_split = plan.layout_mode == "split" and index > 0
@@ -1206,18 +1297,55 @@ def launch(
                     append_history_safely(store, {"task": assignment.task.task_id, "result": "failed", "reason": "terminal_precondition"})
                     continue
                 try:
+                    terminal_worktree: OrcaWorktree | None = None
+                    if plan.layout_mode == "separate":
+                        terminal_worktree = worktree_cache.get(assignment.task.task_id)
+                        if terminal_worktree is None:
+                            terminal_worktree = resolve_assignment_worktree(
+                                orca,
+                                config,
+                                plan.repository,
+                                assignment,
+                                repository_ids,
+                            )
+                            worktree_cache[assignment.task.task_id] = terminal_worktree
+                except DispatcherError as error:
+                    results.append({
+                        "task_id": assignment.task.task_id,
+                        "status": "failed_worktree",
+                        "message": error.message,
+                    })
+                    append_history_safely(store, {"task": assignment.task.task_id, "result": "failed", "reason": error.code})
+                    continue
+                try:
                     store.mark_launching(assignment, plan, index)
                 except DispatcherError as error:
                     results.append({"task_id": assignment.task.task_id, "status": "failed_state", "message": error.message})
                     continue
                 try:
                     if not is_split:
-                        handle = orca.terminal_create(terminal_repository, plan.tab_title, config.shell_command)
+                        if plan.layout_mode == "separate":
+                            assert terminal_worktree is not None
+                            handle = create_terminal_with_retry(
+                                orca,
+                                terminal_worktree.selector,
+                                plan.tab_title,
+                                agent_command_for(config),
+                            )
+                        else:
+                            handle = orca.terminal_create(
+                                f"path:{plan.repository.path.as_posix()}",
+                                plan.tab_title,
+                                config.shell_command,
+                            )
                     elif index == 1:
                         handle = orca.terminal_split(parent_handle, "horizontal", config.shell_command)
                     else:
                         handle = orca.terminal_split(parent_handle, "vertical", config.shell_command)
                     snapshot = retry_read(config, lambda: orca.terminal_show(handle))
+                    if plan.layout_mode == "separate":
+                        assert terminal_worktree is not None
+                        validate_terminal_snapshot(snapshot, terminal_worktree)
                 except DispatcherError as error:
                     results.append({
                         "task_id": assignment.task.task_id,
@@ -1242,7 +1370,10 @@ def launch(
         ready: list[TerminalRecord] = []
         for record in records:
             try:
-                bootstrap_agent(orca, record.handle, config)
+                if record.layout_mode == "separate":
+                    retry_read(config, lambda: orca.terminal_wait(record.handle, config.ready_timeout_ms))
+                else:
+                    bootstrap_agent(orca, record.handle, config)
                 ready.append(record)
             except DispatcherError as error:
                 results.append({
@@ -1255,9 +1386,9 @@ def launch(
                     "task": record.assignment.task.task_id,
                     "terminal_handle": record.handle,
                     "result": "requires_manual_reset",
-                    "reason": "agent_bootstrap",
+                    "reason": "agent_ready",
                 })
-                state_error = mark_manual_reset_safely(store, record.assignment.task.task_id, "agent_bootstrap")
+                state_error = mark_manual_reset_safely(store, record.assignment.task.task_id, "agent_ready")
                 if state_error:
                     results[-1]["state_error"] = state_error
 
@@ -1350,15 +1481,16 @@ def launch(
 
 
 def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
-    required_fields = ("repository", "repository_path", "source_repository_path", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index", "tab_id", "leaf_id")
+    required_fields = ("repository", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index", "tab_id", "leaf_id")
     if any(field not in value for field in required_fields):
         raise DispatcherError("recovery_metadata_missing", "任务缺少恢复所需元数据")
+    repository_path = value.get("source_repository_path", value.get("repository_path"))
     return Assignment.from_dict({
         "task_id": task_id,
         "title": value.get("title"),
         "task_url": value.get("task_url"),
         "repository": value.get("repository"),
-        "repository_path": value.get("source_repository_path"),
+        "repository_path": repository_path,
         "base_branch": value.get("base_branch"),
         "worktree_path": value.get("worktree_path") if value.get("layout") == "separate" else None,
     })
@@ -1427,17 +1559,17 @@ def recover(
                     repository = Repository(name=source_repository.name, path=worktree_path.resolve())
                 else:
                     repository = source_repository
+                repository_key = os.path.normcase(os.path.normpath(str(repository.path.resolve())))
+                if repository_key not in repository_ids:
+                    orca.repo_add(repository)
+                    repository_ids[repository_key] = "registered"
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
                 append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
                 results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
                 continue
 
-            repository_key = os.path.normcase(os.path.normpath(str(repository.path.resolve())))
             try:
-                if repository_key not in repository_ids:
-                    orca.repo_add(repository)
-                    repository_ids[repository_key] = "registered"
                 snapshots = retry_read(config, lambda: orca.terminal_list(repository))
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
@@ -1504,10 +1636,24 @@ def recover(
                     )
                     direction = "horizontal" if pane_index == 1 else "vertical"
                     handle = orca.terminal_split(parent.handle, direction, config.shell_command)
+                elif layout_mode == "separate":
+                    handle = create_terminal_with_retry(
+                        orca,
+                        f"path:{repository.path.as_posix()}",
+                        tab_title,
+                        agent_command_for(config),
+                    )
                 else:
-                    handle = orca.terminal_create(repository, tab_title, config.shell_command)
+                    handle = orca.terminal_create(
+                        f"path:{repository.path.as_posix()}",
+                        tab_title,
+                        config.shell_command,
+                    )
                 snapshot = retry_read(config, lambda: orca.terminal_show(handle))
-                bootstrap_agent(orca, handle, config, resume=True)
+                if layout_mode == "separate":
+                    retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
+                else:
+                    bootstrap_agent(orca, handle, config, resume=True)
                 orca.terminal_send(handle, command_for(config, assignment, layout_mode, recovery=True))
                 store.mark_recovered(stored_task_id, snapshot, "recreated")
             except DispatcherError as error:
