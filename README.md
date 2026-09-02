@@ -30,6 +30,15 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 
 `config/dispatcher.yaml` 与根目录 `config.yml` 都是本地文件，已被忽略，**不要提交**。不要在配置或任务输入中保存令牌、密码、Cookie、内部域名、内部路径或运行状态。
 
+## 权限与信任目录
+
+Dispatcher 以 `claude` 启动任务会话，可通过 `dispatch.agent_extra_args` 配置为 `--dangerously-skip-permissions` 跳过工具权限弹窗，避免任务命令被权限确认阻塞。
+
+首次使用前，需要把项目根目录加入 Claude Code 的信任目录，否则创建 worktree 等命令可能因权限确认无法送达：
+
+1. 在根目录会话中执行 `/permissions`（或 `/trust`）将项目根目录授权为信任目录；
+2. 或在 `settings.json` 中为相应目录配置权限。
+
 ## 常用命令
 
 所有命令从项目根目录运行：

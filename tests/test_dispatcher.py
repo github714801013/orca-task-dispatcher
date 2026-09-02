@@ -375,9 +375,11 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("task_id（事项唯一标识）和 title（标题）", prompt)
         self.assertIn("父任务解析", prompt)
         self.assertIn("issuetype=产品需求", prompt)
+        self.assertIn("严禁修改", prompt)
         self.assertNotIn("priority", prompt)
         self.assertNotIn("created", prompt)
         self.assertIn("worktree_path", session_prompt)
+        self.assertIn("禁止使用原开发任务编号", session_prompt)
         self.assertNotIn("jira.9ji.com", prompt)
 
     def test_read_assignments_accepts_tasks(self) -> None:
