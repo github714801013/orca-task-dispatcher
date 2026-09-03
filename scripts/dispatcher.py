@@ -68,6 +68,28 @@ def require_string_list(value: Any, field: str) -> tuple[str, ...]:
     return tuple(require_text(item, field) for item in value)
 
 
+def require_optional_text(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return require_text(value, field)
+
+
+def require_branch_mapping(value: Any, field: str) -> Mapping[str, str | None]:
+    """解析分支配置：兼容纯字符串列表（无描述）与「分支名: 描述」键值映射。"""
+    if isinstance(value, list):
+        return {require_text(item, field): None for item in value}
+    if not isinstance(value, Mapping):
+        raise DispatcherError("invalid_config", f"{field} 必须是字符串列表或「分支名: 描述」对象")
+    mapping: dict[str, str | None] = {}
+    for branch, description in value.items():
+        name = require_text(branch, field)
+        if description is None or (isinstance(description, str) and not description.strip()):
+            mapping[name] = None
+        else:
+            mapping[name] = require_text(description, f"{field}.{name}")
+    return mapping
+
+
 TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 COMMAND_ARGUMENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 SHELL_PROMPT_PATTERN = re.compile(
@@ -114,9 +136,10 @@ class Task:
 class Repository:
     name: str
     path: Path
+    description: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"name": self.name, "path": self.path.as_posix()}
+    def to_dict(self) -> dict[str, str | None]:
+        return {"name": self.name, "path": self.path.as_posix(), "description": self.description}
 
 
 @dataclass(frozen=True)
@@ -220,7 +243,8 @@ class TerminalRecord:
 @dataclass(frozen=True)
 class Project:
     path: str
-    base_branches: tuple[str, ...]
+    base_branches: Mapping[str, str | None]
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,7 +252,7 @@ class Config:
     root: Path
     projects_root: Path
     projects: Mapping[str, Project]
-    branch_options: tuple[str, ...]
+    branch_options: Mapping[str, str | None]
     validate_branch: bool
     max_tasks: int
     max_agents: int
@@ -236,6 +260,8 @@ class Config:
     ready_timeout_ms: int
     read_retry_attempts: int
     read_retry_delay_ms: int
+    ready_retry_attempts: int
+    send_retry_attempts: int
     shell_command: str
     agent_extra_args: str
     state_file: Path
@@ -254,6 +280,9 @@ class Config:
         return self.state_file.parent
 
     def branches_for(self, repository: str) -> tuple[str, ...]:
+        return tuple(self.branch_map_for(repository))
+
+    def branch_map_for(self, repository: str) -> Mapping[str, str | None]:
         project = self.projects.get(repository)
         if project is not None:
             return project.base_branches
@@ -304,9 +333,13 @@ def load_config(config_file: Path) -> Config:
     projects = MappingProxyType({
         require_text(name, "workspace.projects 键"): Project(
             path=require_text(require_mapping(project, f"workspace.projects.{name}").get("path"), f"workspace.projects.{name}.path"),
-            base_branches=require_string_list(
+            base_branches=require_branch_mapping(
                 require_mapping(project, f"workspace.projects.{name}").get("base_branches"),
                 f"workspace.projects.{name}.base_branches",
+            ),
+            description=require_optional_text(
+                require_mapping(project, f"workspace.projects.{name}").get("description"),
+                f"workspace.projects.{name}.description",
             ),
         )
         for name, project in projects_data.items()
@@ -353,7 +386,7 @@ def load_config(config_file: Path) -> Config:
         root=root,
         projects_root=projects_root,
         projects=projects,
-        branch_options=require_string_list(base_branch.get("options", []), "base_branch.options"),
+        branch_options=require_branch_mapping(base_branch.get("options", []), "base_branch.options"),
         validate_branch=require_bool(base_branch.get("validate"), "base_branch.validate"),
         max_tasks=require_integer(task_source.get("max_tasks"), "task_source.max_tasks", 1, 12),
         max_agents=require_integer(concurrency.get("max_agents"), "dispatch.concurrency.max_agents", 1, 12),
@@ -361,6 +394,8 @@ def load_config(config_file: Path) -> Config:
         ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, 360_000),
         read_retry_attempts=require_integer(terminal.get("read_retry_attempts"), "dispatch.terminal.read_retry_attempts", 1, 3),
         read_retry_delay_ms=require_integer(terminal.get("read_retry_delay_ms"), "dispatch.terminal.read_retry_delay_ms", 0, 5_000),
+        ready_retry_attempts=require_integer(terminal.get("ready_retry_attempts", 1), "dispatch.terminal.ready_retry_attempts", 0, 3),
+        send_retry_attempts=require_integer(terminal.get("send_retry_attempts", 1), "dispatch.terminal.send_retry_attempts", 0, 3),
         shell_command=shell_command,
         agent_extra_args=agent_extra_args,
         state_file=relative_to_root(root, dedup.get("state_file"), "dedup.state_file"),
@@ -394,20 +429,20 @@ def is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def repository_from_path(name: str, path: Path, projects_root: Path) -> Repository:
+def repository_from_path(name: str, path: Path, projects_root: Path, description: str | None = None) -> Repository:
     resolved = path.resolve()
     if not is_within(resolved, projects_root):
         raise DispatcherError("invalid_repository", f"仓库路径越出 projects_root：{name}")
     if not resolved.is_dir() or not (resolved / ".git").is_dir():
         raise DispatcherError("invalid_repository", f"不是可用 Git 仓库：{resolved}")
-    return Repository(name=name, path=resolved)
+    return Repository(name=name, path=resolved, description=description)
 
 
 def configured_repository(config: Config, name: str) -> Repository | None:
     project = config.projects.get(name)
     if project is None:
         return None
-    return repository_from_path(name, config.projects_root / project.path, config.projects_root)
+    return repository_from_path(name, config.projects_root / project.path, config.projects_root, project.description)
 
 
 def repository_for_name(config: Config, name: str) -> Repository:
@@ -451,7 +486,7 @@ def discover_repositories(config: Config) -> tuple[Repository, ...]:
         relative = Path(project.path)
         if relative.is_absolute() or ".." in relative.parts:
             raise DispatcherError("invalid_config", f"projects.{name}.path 不能越出 projects_root")
-        repository = repository_from_path(name, config.projects_root / relative, config.projects_root)
+        repository = repository_from_path(name, config.projects_root / relative, config.projects_root, project.description)
         found.append(repository)
 
     return tuple(found)
@@ -1093,10 +1128,37 @@ def retry_read(config: Config, operation: Callable[[], Any]) -> Any:
     raise error
 
 
+def retry_ready_wait(orca: OrcaClient, handle: str, config: Config, resend_command: str | None = None) -> None:
+    """就绪等待超时后按配置重试；resend_command 非空时在每轮重试前重发命令以重新启动 agent。"""
+    for attempt in range(config.ready_retry_attempts + 1):
+        try:
+            retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
+            return
+        except DispatcherError as error:
+            if attempt >= config.ready_retry_attempts:
+                raise error
+            if resend_command is not None:
+                orca.terminal_send(handle, resend_command)
+
+
+def retry_send(orca: OrcaClient, handle: str, config: Config, text: str) -> None:
+    """发送命令超时后按配置重发；命令可能已送达，重发次数由配置显式允许。"""
+    for attempt in range(config.send_retry_attempts + 1):
+        try:
+            orca.terminal_send(handle, text)
+            return
+        except DispatcherError as error:
+            if attempt >= config.send_retry_attempts:
+                raise error
+            if config.read_retry_delay_ms:
+                time.sleep(config.read_retry_delay_ms / 1000)
+
+
 def bootstrap_agent(orca: OrcaClient, handle: str, config: Config, resume: bool = False) -> None:
-    retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
-    orca.terminal_send(handle, f"{config.agent_command} --continue" if resume else config.agent_command)
-    retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
+    retry_ready_wait(orca, handle, config)
+    command = f"{config.agent_command} --continue" if resume else config.agent_command
+    retry_send(orca, handle, config, command)
+    retry_ready_wait(orca, handle, config, resend_command=command)
 
 
 def mark_manual_reset_safely(store: StateStore, task_id: str, reason: str) -> str | None:
@@ -1371,7 +1433,7 @@ def launch(
         for record in records:
             try:
                 if record.layout_mode == "separate":
-                    retry_read(config, lambda: orca.terminal_wait(record.handle, config.ready_timeout_ms))
+                    retry_ready_wait(orca, record.handle, config)
                 else:
                     bootstrap_agent(orca, record.handle, config)
                 ready.append(record)
@@ -1395,7 +1457,7 @@ def launch(
         for record in ready:
             assignment = record.assignment
             try:
-                orca.terminal_send(record.handle, command_for(config, assignment, record.layout_mode))
+                retry_send(orca, record.handle, config, command_for(config, assignment, record.layout_mode))
             except DispatcherError as error:
                 results.append({
                     "task_id": assignment.task.task_id,
@@ -1756,6 +1818,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def branch_entries(mapping: Mapping[str, str | None]) -> list[dict[str, str | None]]:
+    return [{"name": branch, "description": description} for branch, description in mapping.items()]
+
+
 def execute(arguments: argparse.Namespace) -> dict[str, object]:
     config = load_config(arguments.config)
     store = StateStore(config.state_file)
@@ -1771,7 +1837,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             return {
                 "match_mode": "configured",
                 "repository": repository.to_dict(),
-                "base_branches": list(config.branches_for(arguments.name)),
+                "base_branches": branch_entries(config.branch_map_for(arguments.name)),
             }
         candidates = recursive_repositories(config, arguments.name)
         if not candidates:
@@ -1780,7 +1846,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             return {
                 "match_mode": "recursive",
                 "repository": candidates[0].to_dict(),
-                "base_branches": list(config.branch_options),
+                "base_branches": branch_entries(config.branch_options),
             }
         return {
             "match_mode": "ambiguous",
@@ -1791,8 +1857,9 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
         return {
             "repository": repository.to_dict(),
             "branches": [
-                {"name": branch, "valid": branch_exists(repository, branch) if config.validate_branch else None}
-                for branch in config.branches_for(repository.name)
+                {"name": branch, "description": description,
+                 "valid": branch_exists(repository, branch) if config.validate_branch else None}
+                for branch, description in config.branch_map_for(repository.name).items()
             ],
         }
     if arguments.command == "state":

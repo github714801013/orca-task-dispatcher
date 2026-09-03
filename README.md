@@ -23,7 +23,7 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 
 随后编辑本地配置，至少替换：
 
-- `workspace.projects_root` 和 `workspace.projects`
+- `workspace.projects_root` 和 `workspace.projects`；项目与分支均可配置 `description`，供分发流程按任务描述自动匹配，纯字符串分支列表亦兼容
 - `base_branch.options`
 - `task_source.task_url_template`、`query`、`fetch_prompt`
 - 需要时的 `dispatch.skill.command_templates`
@@ -56,7 +56,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 
 1. 运行 `validate` 验证配置和候选仓库。
 2. 运行 `task-source` 获取任务查询提示词，并用当前环境中可用的工具查询真实任务。
-3. 人工确认任务、仓库和基础分支。
+3. 按任务标题/描述与 `repos`、`branches` 返回的仓库/分支描述自动匹配目标，描述缺失或无法唯一确定时回退询问用户。
 4. `separate` 布局中，为每项任务准备有效的 linked worktree 路径。
 5. 写入任务输入 JSON 并执行 `launch`。
 
@@ -96,6 +96,7 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 - `split`：同一项目的任务在项目主仓库 `<项目>.tabN` 的 pane 中聚合，使用 shell 启动后由 Dispatcher 发送 `claude` 并等待就绪。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会等待注册生效并重试一次；其他创建失败不重试。
+- 就绪等待超时与命令发送超时按 `dispatch.terminal.ready_retry_attempts` / `send_retry_attempts` 在同轮内重试；发送重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
 - `dispatched` 任务会被跳过，避免重复发送。
 - `launching` 或 `requires_manual_reset` 不会自动重试。确认终端与任务状态后，使用 `reset <task_id>` 清除本地状态；复位 `dispatched` 状态需要明确传入 `--force`。
@@ -111,7 +112,7 @@ uv run --project . python scripts/dispatcher.py reset TASK-123 --force
 
 - 仅将已确认的任务输入交给 `launch`；不要猜测任务 ID、标题、仓库或路径。
 - 分支名和任务 ID 会被限制为安全字符；任务标题仅按数据处理，不作为 shell 命令执行。
-- Orca 的创建和发送操作不自动重试，因为超时后无法确认副作用是否已经发生。
+- Orca 的创建操作不自动重试（仅对 terminal handle 等待超时特征重试一次），因为超时后无法确认副作用是否已经发生；发送操作仅按 `send_retry_attempts` 配置的次数重试。
 - Git Bash/MSYS 环境下，Dispatcher 会仅对 Orca CLI 子进程关闭路径参数转换，保证 slash command 和 URL 原样送达终端。
 
 ## 开发与验证

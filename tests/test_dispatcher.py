@@ -124,6 +124,9 @@ class FakeOrca:
         repository_ids: dict[Path, str] | None = None,
         failure: str | None = None,
         create_timeout_once: bool = False,
+        wait_timeout_count: int = 0,
+        wait_timeout_after_claude_count: int = 0,
+        send_timeout_count: int = 0,
     ) -> None:
         self.operations: list[tuple[str, str]] = []
         self.repository_ids = {
@@ -133,6 +136,9 @@ class FakeOrca:
         self.failure = failure
         self.create_timeout_once = create_timeout_once
         self._create_timeout_consumed = False
+        self._wait_timeouts_left = wait_timeout_count
+        self._wait_timeouts_after_claude_left = wait_timeout_after_claude_count
+        self._send_timeouts_left = send_timeout_count
         self.next_handle = 1
         self.snapshots: dict[str, dispatcher.TerminalSnapshot] = {}
         self.worktrees: dict[str, dispatcher.OrcaWorktree] = {}
@@ -241,10 +247,22 @@ class FakeOrca:
     def terminal_wait(self, handle: str, timeout_ms: int) -> None:
         self.operations.append(("wait", handle))
         self._raise_if("wait")
+        snapshot = self.snapshots.get(handle)
+        if snapshot is not None and snapshot.agent_identity == "claude":
+            if self._wait_timeouts_after_claude_left > 0:
+                self._wait_timeouts_after_claude_left -= 1
+                raise dispatcher.DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
+            return
+        if self._wait_timeouts_left > 0:
+            self._wait_timeouts_left -= 1
+            raise dispatcher.DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
 
     def terminal_send(self, handle: str, text: str) -> None:
         self.operations.append(("send", text))
         self._raise_if("send")
+        if self._send_timeouts_left > 0:
+            self._send_timeouts_left -= 1
+            raise dispatcher.DispatcherError("orca_timeout", "Orca CLI 调用超时：terminal send")
         if text.startswith("claude"):
             snapshot = self.snapshots[handle]
             self.snapshots[handle] = dispatcher.TerminalSnapshot(
@@ -463,7 +481,7 @@ class DispatcherTests(unittest.TestCase):
     def test_command_rejects_unsafe_base_branch(self) -> None:
         config = dispatcher.Config(
             root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
+            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
             task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
             task_source_query="", fetch_prompt="", agent_command="claude",
             command_templates={"separate": "/dev-spec-gen {task_url} base_branch={base_branch}", "split": "/dev-spec-gen {task_url}"},
@@ -485,7 +503,7 @@ class DispatcherTests(unittest.TestCase):
     def test_command_rejects_invalid_template(self) -> None:
         config = dispatcher.Config(
             root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
+            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
             task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
             task_source_query="", fetch_prompt="", agent_command="claude",
             command_templates={"separate": "/dev-spec-gen {task_url", "split": "/dev-spec-gen {task_url}"},
@@ -522,7 +540,7 @@ class DispatcherTests(unittest.TestCase):
             result = dispatcher.execute(arguments)
 
             self.assertEqual(result["repository"]["name"], "mapped")
-            self.assertEqual(result["base_branches"], ["origin/release"])
+            self.assertEqual(result["base_branches"], [{"name": "origin/release", "description": None}])
 
     def test_project_lookup_recurses_but_excludes_linked_worktrees(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -556,7 +574,59 @@ class DispatcherTests(unittest.TestCase):
             result = dispatcher.execute(arguments)
 
             self.assertEqual(result["repository"]["name"], "custom-service")
-            self.assertEqual(result["branches"], [{"name": "origin/default", "valid": None}])
+            self.assertEqual(result["branches"], [{"name": "origin/default", "description": None, "valid": None}])
+
+    def test_descriptions_from_config_and_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace(
+                    'base_branches: ["origin/release"]',
+                    'description: "示例业务系统"\n      base_branches:\n        origin/release: "九机业务线"',
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+            config = dispatcher.load_config(config_path)
+
+            self.assertEqual(config.projects["mapped"].description, "示例业务系统")
+            self.assertEqual(config.branch_map_for("mapped"), {"origin/release": "九机业务线"})
+            self.assertEqual(config.branches_for("mapped"), ("origin/release",))
+
+            repos_result = dispatcher.execute(dispatcher.build_parser().parse_args([
+                "--config", str(config_path), "repos",
+            ]))
+            self.assertEqual(repos_result["repositories"][0]["description"], "示例业务系统")
+
+            project_result = dispatcher.execute(dispatcher.build_parser().parse_args([
+                "--config", str(config_path), "project", "--name", "mapped",
+            ]))
+            self.assertEqual(project_result["repository"]["description"], "示例业务系统")
+            self.assertEqual(
+                project_result["base_branches"],
+                [{"name": "origin/release", "description": "九机业务线"}],
+            )
+
+    def test_branch_mapping_rejects_non_text_description(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace(
+                    'base_branches: ["origin/release"]',
+                    "base_branches:\n        origin/release: 42",
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "必须是非空字符串"):
+                dispatcher.load_config(config_path)
 
     def test_snapshot_rejects_invalid_task_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -737,6 +807,50 @@ class DispatcherTests(unittest.TestCase):
                 statuses = {item["task_id"]: item["status"] for item in result["results"]}
                 self.assertEqual(statuses[affected_task_id], "requires_manual_reset")
                 self.assertEqual(store.status(affected_task_id), "requires_manual_reset")
+
+    def test_launch_retries_ready_wait_after_timeout(self) -> None:
+        for wait_timeout_count, after_claude_count, expected_waits, expected_claude_sends in (
+            (2, 0, 4, 1),  # 纯等待重试：超时耗尽后重新等待成功，不重发命令
+            (2, 2, 6, 2),  # 第二段就绪超时：重发 agent 命令后重新等待成功
+        ):
+            with self.subTest(wait_timeout_count=wait_timeout_count), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                projects = root / "projects"
+                repository_path = projects / "repo-a"
+                (repository_path / ".git").mkdir(parents=True)
+                config = write_config(root, projects)
+                store = dispatcher.StateStore(config.state_file)
+                fake_orca = FakeOrca(
+                    {repository_path: "repo-mapped"},
+                    wait_timeout_count=wait_timeout_count,
+                    wait_timeout_after_claude_count=after_claude_count,
+                )
+                item = assignment("XSWL-1", "mapped", repository_path)
+
+                result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+                self.assertEqual(result["results"][0]["status"], "dispatched")
+                waits = [value for operation, value in fake_orca.operations if operation == "wait"]
+                self.assertEqual(len(waits), expected_waits)
+                sends = [value for operation, value in fake_orca.operations if operation == "send"]
+                self.assertEqual(sends.count("claude"), expected_claude_sends)
+
+    def test_launch_retries_send_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, send_timeout_count=1)
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            sends = [value for operation, value in fake_orca.operations if operation == "send"]
+            self.assertEqual(sends[:2], ["claude", "claude"])
 
     def test_separate_layout_creates_independent_task_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

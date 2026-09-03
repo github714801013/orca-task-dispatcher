@@ -5,14 +5,17 @@ workspace:
   projects:
     example-repository:
       path: "example-repository"
+      # 可选：项目描述，用于按任务描述自动匹配仓库。
+      description: "示例业务系统"
+      # 基础分支（分支名: 分支描述，描述用于按任务描述自动匹配；纯字符串列表亦可）。
       base_branches:
-        - "main"
+        main: "默认主分支"
 
 base_branch:
   optional: true
   default: null
   options:
-    - "main"
+    main: "默认主分支"
   validate: true
 
 task_source:
@@ -69,6 +72,9 @@ dispatch:
       posix: "sh -i"
     read_retry_attempts: 2
     read_retry_delay_ms: 500
+    # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。
+    ready_retry_attempts: 1
+    send_retry_attempts: 1
     ready_timeout_ms: 360000
   concurrency:
     max_agents: 12
