@@ -1135,17 +1135,29 @@ def retry_read(config: Config, operation: Callable[[], Any]) -> Any:
     raise error
 
 
+def terminal_has_content(orca: OrcaClient, config: Config, handle: str) -> bool:
+    """检测会话内容：preview 非空即认为任务已实际运行。"""
+    snapshot = retry_read(config, lambda: orca.terminal_show(handle))
+    return bool(snapshot.preview.strip())
+
+
 def retry_ready_wait(orca: OrcaClient, handle: str, config: Config, resend_command: str | None = None) -> None:
-    """就绪等待超时后按配置重试；resend_command 非空时在每轮重试前重发命令以重新启动 agent。"""
+    """就绪等待后检测会话内容确认任务实际运行；未运行按配置重发命令重试，预算耗尽才失败。"""
     for attempt in range(config.ready_retry_attempts + 1):
         try:
             retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
-            return
         except DispatcherError as error:
             if attempt >= config.ready_retry_attempts:
                 raise error
             if resend_command is not None:
                 orca.terminal_send(handle, resend_command)
+            continue
+        if terminal_has_content(orca, config, handle):
+            return
+        if attempt >= config.ready_retry_attempts:
+            raise DispatcherError("orca_not_ready", f"Claude terminal 会话无内容，任务未运行：{handle}")
+        if resend_command is not None:
+            orca.terminal_send(handle, resend_command)
 
 
 def retry_send(orca: OrcaClient, handle: str, config: Config, text: str) -> None:

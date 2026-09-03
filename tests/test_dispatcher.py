@@ -127,6 +127,8 @@ class FakeOrca:
         wait_timeout_count: int = 0,
         wait_timeout_after_claude_count: int = 0,
         send_timeout_count: int = 0,
+        show_empty_count: int = 0,
+        show_empty_after_claude_count: int = 0,
     ) -> None:
         self.operations: list[tuple[str, str]] = []
         self.repository_ids = {
@@ -139,6 +141,8 @@ class FakeOrca:
         self._wait_timeouts_left = wait_timeout_count
         self._wait_timeouts_after_claude_left = wait_timeout_after_claude_count
         self._send_timeouts_left = send_timeout_count
+        self._show_empty_left = show_empty_count
+        self._show_empty_after_claude_left = show_empty_after_claude_count
         self.next_handle = 1
         self.snapshots: dict[str, dispatcher.TerminalSnapshot] = {}
         self.worktrees: dict[str, dispatcher.OrcaWorktree] = {}
@@ -207,7 +211,7 @@ class FakeOrca:
             connected=True,
             writable=True,
             agent_identity="claude" if command.split(maxsplit=1)[0] == "claude" else None,
-            preview="" if command.split(maxsplit=1)[0] == "claude" else "PS D:\\repo>",
+            preview="claude tui" if command.split(maxsplit=1)[0] == "claude" else "PS D:\\repo>",
         )
         return handle
 
@@ -237,7 +241,14 @@ class FakeOrca:
     def terminal_show(self, handle: str) -> dispatcher.TerminalSnapshot:
         self.operations.append(("show", handle))
         self._raise_if("show")
-        return self.snapshots[handle]
+        snapshot = self.snapshots[handle]
+        if snapshot.agent_identity == "claude" and self._show_empty_after_claude_left > 0:
+            self._show_empty_after_claude_left -= 1
+            return dispatcher.TerminalSnapshot(**{**snapshot.__dict__, "preview": ""})
+        if self._show_empty_left > 0:
+            self._show_empty_left -= 1
+            return dispatcher.TerminalSnapshot(**{**snapshot.__dict__, "preview": ""})
+        return snapshot
 
     def terminal_list(self, repository: dispatcher.Repository) -> tuple[dispatcher.TerminalSnapshot, ...]:
         self.operations.append(("list", repository.path.as_posix()))
@@ -266,7 +277,7 @@ class FakeOrca:
         if text.startswith("claude"):
             snapshot = self.snapshots[handle]
             self.snapshots[handle] = dispatcher.TerminalSnapshot(
-                **{**snapshot.__dict__, "agent_identity": "claude", "preview": ""}
+                **{**snapshot.__dict__, "agent_identity": "claude", "preview": "claude tui"}
             )
 
     def restore_handle(self, handle: str, restored_handle: str, agent_identity: str | None = "claude", preview: str = "") -> None:
@@ -716,8 +727,9 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual([item[0] for item in fake_orca.operations], [
                 "status", "repo-list", "create", "show", "split-horizontal", "show", "split-vertical", "show",
-                "split-vertical", "show", "wait", "send", "wait", "wait", "send", "wait", "wait", "send",
-                "wait", "wait", "send", "wait", "send", "worktree-status", "send", "worktree-status",
+                "split-vertical", "show", "wait", "show", "send", "wait", "show", "wait", "show", "send",
+                "wait", "show", "wait", "show", "send", "wait", "show", "wait", "show", "send", "wait", "show",
+                "send", "worktree-status", "send", "worktree-status",
                 "send", "worktree-status", "send", "worktree-status",
             ])
             self.assertEqual([item["status"] for item in result["results"]], ["dispatched"] * 4)
@@ -743,7 +755,7 @@ class DispatcherTests(unittest.TestCase):
             expected_path = os.path.normcase(os.path.normpath(str(repository_path.resolve())))
             self.assertEqual([item[0] for item in fake_orca.operations], [
                 "status", "repo-list", "repo-add", "repo-list", "create", "show",
-                "wait", "send", "wait", "send", "worktree-status",
+                "wait", "show", "send", "wait", "show", "send", "worktree-status",
             ])
             self.assertIn(("repo-add", expected_path), fake_orca.operations)
             self.assertEqual(result["results"][0]["status"], "dispatched")
@@ -903,6 +915,56 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(result["results"][0]["status"], "dispatched")
             sends = [value for operation, value in fake_orca.operations if operation == "send"]
             self.assertEqual(sends[:2], ["claude", "claude"])
+
+    def test_launch_retries_when_session_has_no_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=1)
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            waits = [value for operation, value in fake_orca.operations if operation == "wait"]
+            self.assertEqual(len(waits), 2)
+
+    def test_launch_resends_agent_when_claude_session_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_after_claude_count=1)
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            sends = [value for operation, value in fake_orca.operations if operation == "send"]
+            self.assertEqual(sends.count("claude"), 2)
+
+    def test_launch_fails_when_session_stays_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            # 创建验证 1 次 + 第一段就绪检测 2 次均返回空会话
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=3)
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
 
     def test_separate_layout_creates_independent_task_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
