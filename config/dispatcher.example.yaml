@@ -1,0 +1,94 @@
+version: 1
+
+workspace:
+  projects_root: "/path/to/projects"
+  projects:
+    example-repository:
+      path: "example-repository"
+      # 可选：项目描述，用于按任务描述自动匹配仓库。
+      description: "示例业务系统"
+      # 基础分支（分支名: 分支描述，描述用于按任务描述自动匹配；纯字符串列表亦可）。
+      base_branches:
+        main: "默认主分支"
+
+base_branch:
+  optional: true
+  default: null
+  options:
+    main: "默认主分支"
+  validate: true
+
+task_source:
+  type: "prompt"
+  task_url_template: "https://example.invalid/tasks/{task_id}"
+  query: "status = ready"
+  fetch_prompt: |
+    使用当前环境可用的任务查询工具获取开发任务。
+
+    查询条件（JQL）必须原样使用以下内容，严禁修改：
+    {{query}}
+
+    查询对象只能是开发任务。禁止把查询类型改为 产品需求 或任何其他类型；
+    产品需求只能作为已查询到任务的父任务获取，绝不直接作为查询条件。
+
+    必须返回真实查询结果。每个任务必须包含 task_id（事项唯一标识）和 title（标题）。
+
+    父任务解析：对每个查询到的开发任务，检查其是否存在父任务。存在父任务时，获取父任务信息；
+    若父任务的类型为产品需求（issuetype=产品需求），则以父任务作为该开发任务的实际任务：task_id 使用父任务编号，
+    title 使用父任务标题，任务描述使用父任务描述。父任务类型不是产品需求或没有父任务时，保持原开发任务不变。
+  session_prompt:
+    separate: |
+      当前任务使用 separate 布局。确认任务、仓库和基础分支后，先为该任务创建或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
+      worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发任务编号。
+      未获得有效工作树路径时，停止分发且不得创建终端。
+    split: |
+      当前任务使用共享分屏布局。不要将后续异步流程创建的工作树路径写入 launch 输入。
+    recovery: |
+      这是恢复会话。先检查已有工作区、分支和产物；确认状态后继续任务，不要重复初始化或覆盖已有成果。
+  max_tasks: 12
+
+interaction:
+  repository_selection: "required"
+  base_branch_selection: "optional"
+  ask_batch_size: 4
+  repository_suggestion_limit: 4
+  allow_other: true
+
+dispatch:
+  agent: "claude"
+  # 可选：跳过工具权限弹窗（如 uv run 确认），避免任务命令被权限确认阻塞。
+  agent_extra_args: ""
+  skill:
+    command_templates:
+      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务的worktree中进行工作"
+      split: "/dev-spec-gen {task_url} base_branch={base_branch} 新建worktree进行工作"
+  layout:
+    group_by: "repository"
+    max_panes_per_tab: 4
+    mode: "separate"
+  terminal:
+    shell_commands:
+      windows: "cmd.exe /d /k"
+      posix: "sh -i"
+    read_retry_attempts: 2
+    read_retry_delay_ms: 500
+    # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。
+    ready_retry_attempts: 1
+    send_retry_attempts: 1
+    ready_timeout_ms: 360000
+  concurrency:
+    max_agents: 12
+
+dedup:
+  enabled: true
+  strategy: "task_id"
+  skip_dispatched: true
+  state_file: ".runtime/state.json"
+
+automation:
+  enabled: false
+  name: "Weekly Task Dispatcher"
+  trigger: "weekly"
+  day: 1
+  time: "09:00"
+  reuse_session: false
