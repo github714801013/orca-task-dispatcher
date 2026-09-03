@@ -88,7 +88,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 uv run --project . python scripts/dispatcher.py launch --input tasks.json
 ```
 
-`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；未提供有效路径时启动直接失败。`split` 布局不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合。任务 URL 必须由配置中的 `task_url_template` 生成。
+`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；未提供有效路径时启动直接失败。`split` 布局不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合。任务 URL 必须由配置中的 `task_url_template` 生成。`reference_plan` 为可选的参考方案文本，非空时会作为任务信息的一部分随开发请求发送给下游会话。
 
 ## 布局与状态
 

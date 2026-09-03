@@ -784,6 +784,58 @@ class DispatcherTests(unittest.TestCase):
             self.assertNotIn("origin/release", create)
             self.assertIn("base_branch=origin/release", task_command)
 
+    def test_reference_plan_sent_as_part_of_task_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "测试任务", "https://jira.example/XSWL-1"),
+                repository="mapped",
+                repository_path=repository_path,
+                base_branch=None,
+                reference_plan="参考方案内容",
+            )
+
+            dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            sends = [value for operation, value in fake_orca.operations if operation == "send"]
+            task_command = next(value for value in sends if value.startswith("/dev-spec-gen"))
+            self.assertIn("- 参考方案：参考方案内容", task_command)
+
+    def test_reference_plan_omitted_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            sends = [value for operation, value in fake_orca.operations if operation == "send"]
+            task_command = next(value for value in sends if value.startswith("/dev-spec-gen"))
+            self.assertNotIn("参考方案", task_command)
+
+    def test_assignment_rejects_blank_reference_plan(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "reference_plan 必须是字符串或 null"):
+            dispatcher.Assignment.from_dict({
+                "task_id": "XSWL-1",
+                "title": "测试任务",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "repository_path": "C:/repo",
+                "base_branch": None,
+                "reference_plan": "   ",
+            })
+
     def test_terminal_failures_require_manual_reset(self) -> None:
         for failure, task_count, affected_task_id in (
             ("create", 1, "XSWL-0"),
