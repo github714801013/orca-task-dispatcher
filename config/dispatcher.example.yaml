@@ -42,7 +42,8 @@ task_source:
     供下游 /dev-spec-gen 作为任务提示词的一部分；两处均为空时省略该字段。
   session_prompt:
     separate: |
-      当前任务使用 separate 布局。确认任务、仓库和基础分支后，先为该任务创建或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
+      当前任务使用 separate 布局。确认任务、仓库和基础分支后，使用 dev-spec-gen 的统一 worktree CLI 为该任务创建 worktree，
+      或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
       worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发任务编号。
       未获得有效工作树路径时，停止分发且不得创建终端。
     split: |

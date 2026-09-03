@@ -1814,7 +1814,19 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser = commands.add_parser(
         "launch",
         help="创建、等待并发送开发请求",
-        description="输入 JSON 顶层只能为 tasks 列表。",
+        description=(
+            "输入 JSON 顶层只能为 tasks 列表，每项任务字段：\n"
+            "  task_id（必填，字符串）：任务唯一标识\n"
+            "  title（必填，字符串）：任务标题\n"
+            "  task_url（必填，HTTPS）：必须由 task_url_template 生成\n"
+            "  repository（必填，字符串）：仓库名，来自 repos 输出\n"
+            "  repository_path（必填，字符串）：仓库绝对路径\n"
+            "  base_branch（可选，字符串或 null）：基础分支，须在仓库白名单且存在\n"
+            "  worktree_path（可选，字符串或 null）：仅 separate 布局必填，须为源仓库已登记的 linked worktree 绝对路径；split 布局不接受\n"
+            "  reference_plan（可选，字符串或 null）：参考方案文本，非空时随任务信息发送给下游会话\n"
+            "separate 布局的 worktree 由 dev-spec-gen 统一 worktree CLI 创建或复用独立 linked worktree。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     launch_parser.add_argument("--input", type=Path, required=True)
     launch_parser.add_argument("--force-unlock", action="store_true")
