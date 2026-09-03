@@ -19,6 +19,10 @@ uv run --project <root> python <root>/scripts/dispatcher.py <subcommand>
 
 每个子命令执行前先查看其 `--help`，并按 CLI 返回的提示准备输入。stdout 为单个 JSON；`ok=false` 或非零退出码时停止。任务获取提示词仅由 `task-source` 子命令输出。
 
+## 硬性约束
+
+- 本地配置文件（`config/dispatcher.yaml`）在执行本技能期间**禁止读取与修改**：任何场景（含配置异常排障）都不得读取或编辑该文件。配置信息一律通过本 CLI 子命令的输出获取；配置异常时仅依据 CLI 错误输出停止并如实转达用户，由用户自行排查文件。
+
 ## 使用顺序
 
 1. 运行 `validate`、`repos`、`task-source`。
