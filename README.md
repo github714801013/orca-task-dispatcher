@@ -96,7 +96,7 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 - `split`：同一项目的任务在项目主仓库 `<项目>.tabN` 的 pane 中聚合，使用 shell 启动后由 Dispatcher 发送 `claude` 并等待就绪。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会等待注册生效并重试一次；其他创建失败不重试。
-- 就绪等待（`tui-idle`，超时 `ready_timeout_ms`，默认 60s）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
+- 就绪等待（`tui-idle`，超时 `ready_timeout_ms`，默认 120s）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
 - `dispatched` 任务会被跳过，避免重复发送。
 - `launching` 或 `requires_manual_reset` 不会自动重试。确认终端与任务状态后，使用 `reset <task_id>` 清除本地状态；复位 `dispatched` 状态需要明确传入 `--force`。

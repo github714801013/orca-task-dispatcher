@@ -80,7 +80,7 @@ dispatch:
     # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。
     ready_retry_attempts: 1
     send_retry_attempts: 1
-    ready_timeout_ms: 60000
+    ready_timeout_ms: 120000
   concurrency:
     max_agents: 12
 
