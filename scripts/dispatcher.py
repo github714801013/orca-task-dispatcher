@@ -98,6 +98,7 @@ SHELL_PROMPT_PATTERN = re.compile(
 TASK_STATUSES = frozenset({"launching", "dispatched", "requires_manual_reset"})
 COMMAND_TEMPLATE_FIELDS = frozenset({"task_url", "task_id", "base_branch"})
 ORCA_COMMAND_TIMEOUT_SECONDS = 30
+READY_TIMEOUT_MS_MAX = 360_000
 
 
 def require_task_id(value: Any) -> str:
@@ -397,7 +398,7 @@ def load_config(config_file: Path) -> Config:
         max_tasks=require_integer(task_source.get("max_tasks"), "task_source.max_tasks", 1, 12),
         max_agents=require_integer(concurrency.get("max_agents"), "dispatch.concurrency.max_agents", 1, 12),
         max_panes=require_integer(layout.get("max_panes_per_tab"), "dispatch.layout.max_panes_per_tab", 1, 4),
-        ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, 360_000),
+        ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, READY_TIMEOUT_MS_MAX),
         read_retry_attempts=require_integer(terminal.get("read_retry_attempts"), "dispatch.terminal.read_retry_attempts", 1, 3),
         read_retry_delay_ms=require_integer(terminal.get("read_retry_delay_ms"), "dispatch.terminal.read_retry_delay_ms", 0, 5_000),
         ready_retry_attempts=require_integer(terminal.get("ready_retry_attempts", 1), "dispatch.terminal.ready_retry_attempts", 0, 3),
@@ -1142,10 +1143,11 @@ def terminal_has_content(orca: OrcaClient, config: Config, handle: str) -> bool:
 
 
 def retry_ready_wait(orca: OrcaClient, handle: str, config: Config, resend_command: str | None = None) -> None:
-    """就绪等待后检测会话内容确认任务实际运行；未运行按配置重发命令重试，预算耗尽才失败。"""
+    """就绪等待后检测会话内容确认任务实际运行；未运行按配置重发命令重试，超时逐轮递增，预算耗尽才失败。"""
     for attempt in range(config.ready_retry_attempts + 1):
+        timeout_ms = min(config.ready_timeout_ms * (attempt + 1), READY_TIMEOUT_MS_MAX)
         try:
-            retry_read(config, lambda: orca.terminal_wait(handle, config.ready_timeout_ms))
+            retry_read(config, lambda: orca.terminal_wait(handle, timeout_ms))
         except DispatcherError as error:
             if attempt >= config.ready_retry_attempts:
                 raise error

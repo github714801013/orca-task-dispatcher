@@ -58,7 +58,9 @@ dispatch:
       posix: "sh -i"
     read_retry_attempts: 2
     read_retry_delay_ms: 1
-    ready_timeout_ms: 360000
+    ready_retry_attempts: 3
+    send_retry_attempts: 1
+    ready_timeout_ms: 120000
   concurrency:
     max_agents: 12
 dedup:
@@ -256,7 +258,7 @@ class FakeOrca:
         return tuple(snapshot for snapshot in self.snapshots.values() if snapshot.worktree_path == repository.path)
 
     def terminal_wait(self, handle: str, timeout_ms: int) -> None:
-        self.operations.append(("wait", handle))
+        self.operations.append(("wait", f"{handle}:{timeout_ms}"))
         self._raise_if("wait")
         snapshot = self.snapshots.get(handle)
         if snapshot is not None and snapshot.agent_identity == "claude":
@@ -958,13 +960,36 @@ class DispatcherTests(unittest.TestCase):
             (repository_path / ".git").mkdir(parents=True)
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
-            # 创建验证 1 次 + 第一段就绪检测 2 次均返回空会话
-            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=3)
+            # 创建验证 1 次 + 每轮就绪检测(ready_retry_attempts+1=4 轮)均返回空会话
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=5)
             item = assignment("XSWL-1", "mapped", repository_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
+
+    def test_ready_wait_timeout_increments_across_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            # 前 5 次 wait 失败：120s×2、240s×2 耗尽后 360s 轮第一次失败第二次成功
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, wait_timeout_count=5)
+            item = assignment("XSWL-1", "mapped", repository_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            waits = [value for operation, value in fake_orca.operations if operation == "wait"]
+            self.assertEqual(waits, [
+                "term-1:120000", "term-1:120000",
+                "term-1:240000", "term-1:240000",
+                "term-1:360000", "term-1:360000",
+                "term-1:120000",
+            ])
 
     def test_separate_layout_creates_independent_task_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
