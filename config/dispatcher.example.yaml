@@ -38,13 +38,18 @@ task_source:
     title 使用父任务标题，任务描述使用父任务描述。父任务类型不是产品需求或没有父任务时，保持原开发任务不变。
 
     参考方案字段：对每个任务，先读取开发任务自身的参考方案字段（如 customfield_11103）；若为空，
-    再读取实际任务（存在父产品需求时为父任务）的该字段。取到的非空内容写入 launch 输入的 reference_plan 字段，
-    供下游 /dev-spec-gen 作为任务提示词的一部分；两处均为空时省略该字段。
+    再读取实际任务（存在父产品需求时为父任务）的该字段。取到的非空内容除写入 launch 输入的 reference_plan 字段外，
+    还必须与任务标题、描述共同用于匹配 `repos` 返回的项目描述和 `branches --repository <项目>` 返回的分支描述，辅助选择项目与基础分支。
+    参考方案只提供匹配证据，不得覆盖明确的任务信息；若项目或基础分支仍无法唯一确定，必须向用户询问，不得猜测。
   session_prompt:
     separate: |
-      当前任务使用 separate 布局。确认任务、仓库和基础分支后，使用 dev-spec-gen 的统一 worktree CLI 为该任务创建 worktree，
-      或复用独立 linked worktree，再将最终绝对路径写入 worktree_path。
-      worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发任务编号。
+      当前任务使用 separate 布局。确认任务、仓库和基础分支后，必须先读取并核验 dev-spec-gen 的完整技能正文，
+      再运行其统一 worktree CLI 的 `worktree.py --help`；不得仅依据技能名称或元数据推断用法。
+      必须使用 dev-spec-gen 的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
+      仅当 CLI 返回 status=success 的独立纯 JSON stdout 时，才能将其中返回的绝对路径写入 worktree_path；失败输出、混合日志或自行推导的路径均不得使用。
+      separate 终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
+      只有确认不存在时才允许重建。多匹配、查询失败或无法确认时停止并等待人工复位，不得猜测或重复发送任务。
+      worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发需求编号。
       未获得有效工作树路径时，停止分发且不得创建终端。
     split: |
       当前任务使用共享分屏布局。不要将后续异步流程创建的工作树路径写入 launch 输入。

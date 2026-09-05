@@ -629,8 +629,8 @@ def build_terminal_plans(
         chunks = chunked(tuple(values), max_panes) if layout_mode == "split" else ((assignment,) for assignment in values)
         for tab_index, chunk in enumerate(chunks, start=1):
             tab_title = (
-                f"{repository_name}.{chunk[0].task.task_id}"
-                if layout_mode == "separate"
+                chunk[0].worktree_path.resolve().name
+                if layout_mode == "separate" and chunk[0].worktree_path is not None
                 else f"{repository_name}.tab{tab_index}"
             )
             plans.append(TerminalPlan(
@@ -744,10 +744,12 @@ class StateStore:
                 "base_branch": assignment.base_branch,
                 "task_url": assignment.task.task_url,
                 "title": assignment.task.title,
+                "reference_plan": assignment.reference_plan,
                 "layout": plan.layout_mode,
                 "tab_title": plan.tab_title,
                 "pane_index": pane_index,
                 "status": "launching",
+                "dispatch_state": "pending",
                 "updated_at": utc_now(),
             },
         }
@@ -1254,22 +1256,51 @@ def agent_command_for(config: Config) -> str:
 
 
 TERMINAL_HANDLE_TIMEOUT_MARKER = "Timed out waiting for terminal handle"
+TERMINAL_CREATE_RETRY_ATTEMPTS = 3
+
+
+def terminal_creation_match(
+    snapshot: TerminalSnapshot,
+    repository: Repository,
+    title: str,
+) -> bool:
+    return snapshot.worktree_path.resolve() == repository.path.resolve() and snapshot.title == title
+
+
+def find_created_terminal(
+    config: Config,
+    orca: OrcaClient,
+    repository: Repository,
+    title: str,
+) -> str | None:
+    snapshots = retry_read(config, lambda: orca.terminal_list(repository))
+    matches = tuple(snapshot for snapshot in snapshots if terminal_creation_match(snapshot, repository, title))
+    if len(matches) > 1:
+        raise DispatcherError("terminal_identity_ambiguous", "无法唯一确认超时后创建的终端")
+    return matches[0].handle if matches else None
 
 
 def create_terminal_with_retry(
     orca: OrcaClient,
+    config: Config,
+    repository: Repository,
     selector: str,
     title: str,
     command: str,
 ) -> str:
-    """注册后首次创建可能因 Orca 注册未生效而等待 handle 超时；仅对该超时特征重试一次。"""
-    try:
-        return orca.terminal_create(selector, title, command)
-    except DispatcherError as error:
-        if TERMINAL_HANDLE_TIMEOUT_MARKER not in error.message:
-            raise
-        time.sleep(2.0)
-        return orca.terminal_create(selector, title, command)
+    """句柄等待超时后先按 worktree 和唯一标题接管，确认不存在才重建。"""
+    for attempt in range(TERMINAL_CREATE_RETRY_ATTEMPTS + 1):
+        try:
+            return orca.terminal_create(selector, title, command)
+        except DispatcherError as error:
+            if TERMINAL_HANDLE_TIMEOUT_MARKER not in error.message:
+                raise
+            recovered_handle = find_created_terminal(config, orca, repository, title)
+            if recovered_handle is not None:
+                return recovered_handle
+            if attempt >= TERMINAL_CREATE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(2.0)
 
 
 def resolve_assignment_worktree(
@@ -1411,6 +1442,8 @@ def launch(
                             assert terminal_worktree is not None
                             handle = create_terminal_with_retry(
                                 orca,
+                                config,
+                                Repository(name=plan.repository.name, path=terminal_worktree.path),
                                 terminal_worktree.selector,
                                 plan.tab_title,
                                 agent_command_for(config),
@@ -1564,9 +1597,11 @@ def launch(
 
 
 def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
-    required_fields = ("repository", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index", "tab_id", "leaf_id")
+    required_fields = ("repository", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index")
     if any(field not in value for field in required_fields):
         raise DispatcherError("recovery_metadata_missing", "任务缺少恢复所需元数据")
+    if value.get("status") == "dispatched" and any(field not in value for field in ("tab_id", "leaf_id")):
+        raise DispatcherError("recovery_metadata_missing", "已分发任务缺少终端身份元数据")
     repository_path = value.get("source_repository_path", value.get("repository_path"))
     return Assignment.from_dict({
         "task_id": task_id,
@@ -1575,6 +1610,7 @@ def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
         "repository": value.get("repository"),
         "repository_path": repository_path,
         "base_branch": value.get("base_branch"),
+        "reference_plan": value.get("reference_plan"),
         "worktree_path": value.get("worktree_path") if value.get("layout") == "separate" else None,
     })
 
@@ -1606,7 +1642,10 @@ def recover(
         selected = [
             (stored_task_id, value)
             for stored_task_id, value in tasks.items()
-            if (task_id is None or stored_task_id == task_id) and isinstance(value, Mapping) and value.get("status") == "dispatched"
+            if (task_id is None or stored_task_id == task_id)
+            and isinstance(value, Mapping)
+            and value.get("status") in {"dispatched", "launching"}
+            and (value.get("status") == "dispatched" or value.get("layout") == "separate")
         ]
         if not selected:
             return {"results": []}
@@ -1661,6 +1700,32 @@ def recover(
                 continue
 
             matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, value))
+            if value.get("status") == "launching" and layout_mode == "separate":
+                matches = tuple(
+                    snapshot
+                    for snapshot in snapshots
+                    if terminal_creation_match(snapshot, repository, require_text(value.get("tab_title"), "恢复 tab_title"))
+                )
+                if len(matches) == 1:
+                    snapshot = matches[0]
+                    try:
+                        if not snapshot.connected or not snapshot.writable:
+                            raise DispatcherError("terminal_state_unverified", "无法确认 launching 终端处于可发送任务状态")
+                        retry_ready_wait(orca, snapshot.handle, config)
+                        retry_send(orca, snapshot.handle, config, command_for(config, assignment, layout_mode))
+                        store.mark_recovered(stored_task_id, snapshot, "handle_recovered")
+                    except DispatcherError as error:
+                        store.mark_requires_manual_reset(stored_task_id, error.code)
+                        append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
+                        results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                        continue
+                    result = {"task_id": stored_task_id, "status": "recovered", "terminal_handle": snapshot.handle}
+                    workspace_status_error = set_worktree_in_progress_safely(orca, store, stored_task_id, snapshot)
+                    if workspace_status_error:
+                        result["workspace_status_error"] = workspace_status_error
+                    append_history_safely(store, {"task": stored_task_id, "result": "handle_recovered", "terminal_handle": snapshot.handle})
+                    results.append(result)
+                    continue
             if len(matches) == 1:
                 snapshot = matches[0]
                 if (
@@ -1722,6 +1787,8 @@ def recover(
                 elif layout_mode == "separate":
                     handle = create_terminal_with_retry(
                         orca,
+                        config,
+                        repository,
                         f"path:{repository.path.as_posix()}",
                         tab_title,
                         agent_command_for(config),

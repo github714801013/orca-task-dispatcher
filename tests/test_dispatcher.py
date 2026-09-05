@@ -125,7 +125,8 @@ class FakeOrca:
         self,
         repository_ids: dict[Path, str] | None = None,
         failure: str | None = None,
-        create_timeout_once: bool = False,
+        create_timeout_count: int = 0,
+        create_side_effect_timeout_count: int = 0,
         wait_timeout_count: int = 0,
         wait_timeout_after_claude_count: int = 0,
         send_timeout_count: int = 0,
@@ -138,8 +139,8 @@ class FakeOrca:
             for path, repository_id in (repository_ids or {}).items()
         }
         self.failure = failure
-        self.create_timeout_once = create_timeout_once
-        self._create_timeout_consumed = False
+        self._create_timeouts_left = create_timeout_count
+        self._create_side_effect_timeouts_left = create_side_effect_timeout_count
         self._wait_timeouts_left = wait_timeout_count
         self._wait_timeouts_after_claude_left = wait_timeout_after_claude_count
         self._send_timeouts_left = send_timeout_count
@@ -189,8 +190,8 @@ class FakeOrca:
         command: str,
     ) -> str:
         self.operations.append(("create", f"{worktree_selector}:{title}:{command}"))
-        if self.create_timeout_once and not self._create_timeout_consumed:
-            self._create_timeout_consumed = True
+        if self._create_timeouts_left > 0:
+            self._create_timeouts_left -= 1
             raise dispatcher.DispatcherError(
                 "orca_command_failed",
                 "{'code': 'runtime_error', 'message': 'Timed out waiting for terminal handle after creation'}",
@@ -215,6 +216,12 @@ class FakeOrca:
             agent_identity="claude" if command.split(maxsplit=1)[0] == "claude" else None,
             preview="claude tui" if command.split(maxsplit=1)[0] == "claude" else "PS D:\\repo>",
         )
+        if self._create_side_effect_timeouts_left > 0:
+            self._create_side_effect_timeouts_left -= 1
+            raise dispatcher.DispatcherError(
+                "orca_command_failed",
+                "{'code': 'runtime_error', 'message': 'Timed out waiting for terminal handle after creation'}",
+            )
         return handle
 
     def terminal_split(self, handle: str, direction: str, command: str) -> str:
@@ -410,7 +417,14 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotIn("priority", prompt)
         self.assertNotIn("created", prompt)
         self.assertIn("worktree_path", session_prompt)
-        self.assertIn("禁止使用原开发任务编号", session_prompt)
+        self.assertIn("禁止使用原开发需求编号", session_prompt)
+        self.assertIn("完整技能正文", session_prompt)
+        self.assertIn("worktree.py --help", session_prompt)
+        self.assertIn("orca worktree create", session_prompt)
+        self.assertIn("status=success", session_prompt)
+        self.assertIn("参考方案字段", prompt)
+        self.assertIn("辅助选择项目与基础分支", prompt)
+        self.assertIn("参考方案只提供匹配证据", prompt)
         self.assertNotIn("jira.9ji.com", prompt)
 
     def test_read_assignments_accepts_tasks(self) -> None:
@@ -1011,14 +1025,14 @@ class DispatcherTests(unittest.TestCase):
 
             creates = [value for operation, value in fake_orca.operations if operation == "create"]
             self.assertEqual(creates, [
-                f"id:repo-{worktree_paths[0].name}::{worktree_paths[0].resolve().as_posix()}:mapped.XSWL-0:claude",
-                f"id:repo-{worktree_paths[1].name}::{worktree_paths[1].resolve().as_posix()}:mapped.XSWL-1:claude",
+                f"id:repo-{worktree_paths[0].name}::{worktree_paths[0].resolve().as_posix()}:{worktree_paths[0].name}:claude",
+                f"id:repo-{worktree_paths[1].name}::{worktree_paths[1].resolve().as_posix()}:{worktree_paths[1].name}:claude",
             ])
             self.assertFalse(any(operation.startswith("split-") for operation, _ in fake_orca.operations))
             self.assertFalse(any(value == "claude" for operation, value in fake_orca.operations if operation == "send"))
             state = store.snapshot()["tasks"]
             self.assertEqual(state["XSWL-0"]["layout"], "separate")
-            self.assertEqual(state["XSWL-0"]["tab_title"], "mapped.XSWL-0")
+            self.assertEqual(state["XSWL-0"]["tab_title"], worktree_paths[0].name)
             self.assertEqual(state["XSWL-0"]["repository_path"], worktree_paths[0].resolve().as_posix())
             self.assertEqual(state["XSWL-0"]["source_repository_path"], repository_path.resolve().as_posix())
             self.assertEqual(state["XSWL-0"]["worktree_path"], worktree_paths[0].resolve().as_posix())
@@ -1037,7 +1051,7 @@ class DispatcherTests(unittest.TestCase):
             create_linked_worktree(repository_path, worktree_path)
             config = write_config(root, projects, layout_mode="separate")
             store = dispatcher.StateStore(config.state_file)
-            fake_orca = FakeOrca(create_timeout_once=True)
+            fake_orca = FakeOrca(create_timeout_count=1)
             item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
@@ -1047,7 +1061,59 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(len(creates), 2)
             self.assertEqual(creates[0], creates[1])
             self.assertTrue(creates[0].startswith(f"id:repo-{worktree_path.name}::"))
-            self.assertTrue(creates[0].endswith(":mapped.XSWL-1:claude"))
+            self.assertTrue(creates[0].endswith(f":{worktree_path.name}:claude"))
+
+    def test_terminal_create_reclaims_handle_after_side_effect_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            config = write_config(root, projects, layout_mode="separate")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca(create_side_effect_timeout_count=1)
+            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 1)
+            self.assertEqual(store.snapshot()["tasks"]["XSWL-1"]["terminal_handle"], "term-1")
+            self.assertEqual(sum(value.startswith("/dev-spec-gen") for operation, value in fake_orca.operations if operation == "send"), 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            config = write_config(root, projects, layout_mode="separate")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca(create_timeout_count=3)
+            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 4)
+
+    def test_terminal_create_stops_after_three_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            config = write_config(root, projects, layout_mode="separate")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca(create_timeout_count=4)
+            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
+
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
+            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 4)
 
     def test_separate_layout_does_not_retry_other_create_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1231,7 +1297,7 @@ class DispatcherTests(unittest.TestCase):
             creates = [value for operation, value in fake_orca.operations if operation == "create"]
             self.assertEqual(
                 creates[-1],
-                f"path:{worktree_path.resolve().as_posix()}:mapped.XSWL-1:claude",
+                f"path:{worktree_path.resolve().as_posix()}:{worktree_path.name}:claude",
             )
             self.assertTrue(any("这是恢复会话" in value for operation, value in fake_orca.operations if operation == "send"))
 

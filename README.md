@@ -56,7 +56,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 
 1. 运行 `validate` 验证配置和候选仓库。
 2. 运行 `task-source` 获取任务查询提示词，并用当前环境中可用的工具查询真实任务。
-3. 按任务标题/描述与 `repos`、`branches` 返回的仓库/分支描述自动匹配目标，描述缺失或无法唯一确定时回退询问用户。
+3. 按任务标题、描述和非空 `reference_plan` 与 `repos`、`branches` 返回的仓库/分支描述自动匹配目标；参考方案仅作为辅助证据，描述缺失或无法唯一确定时回退询问用户。
 4. `separate` 布局中，为每项任务准备有效的 linked worktree 路径。
 5. 写入任务输入 JSON 并执行 `launch`。
 
@@ -88,14 +88,14 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 uv run --project . python scripts/dispatcher.py launch --input tasks.json
 ```
 
-`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；未提供有效路径时启动直接失败。`split` 布局不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合。任务 URL 必须由配置中的 `task_url_template` 生成。`reference_plan` 为可选的参考方案文本，非空时会作为任务信息的一部分随开发请求发送给下游会话。
+`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；未提供有效路径时启动直接失败。`split` 布局不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合。任务 URL 必须由配置中的 `task_url_template` 生成。`reference_plan` 为可选的参考方案文本；非空时既作为项目和基础分支自动匹配的辅助证据，也会作为任务信息随开发请求发送给下游会话。
 
 ## 布局与状态
 
-- `separate`：每项任务使用独立 linked worktree 和独立的 `<项目>.<任务编号>` tab；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。
+- `separate`：每项任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
 - `split`：同一项目的任务在项目主仓库 `<项目>.tabN` 的 pane 中聚合，使用 shell 启动后由 Dispatcher 发送 `claude` 并等待就绪。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
-- 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会等待注册生效并重试一次；其他创建失败不重试。
+- 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。
 - 就绪等待（`tui-idle`，首轮超时 `ready_timeout_ms`，默认 120s，重试逐轮递增至 360s 上限）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
 - `dispatched` 任务会被跳过，避免重复发送。
@@ -112,7 +112,7 @@ uv run --project . python scripts/dispatcher.py reset TASK-123 --force
 
 - 仅将已确认的任务输入交给 `launch`；不要猜测任务 ID、标题、仓库或路径。
 - 分支名和任务 ID 会被限制为安全字符；任务标题仅按数据处理，不作为 shell 命令执行。
-- Orca 的创建操作不自动重试（仅对 terminal handle 等待超时特征重试一次），因为超时后无法确认副作用是否已经发生；发送操作仅按 `send_retry_attempts` 配置的次数重试。
+- Orca 的创建操作不自动重试（仅对 separate 布局的 terminal handle 等待超时先查找唯一已有终端，确认不存在时才自动重建最多三次）；多匹配、查询失败和 split 布局的句柄不确定均需人工复位，因为无法确认副作用是否已经发生。
 - Git Bash/MSYS 环境下，Dispatcher 会仅对 Orca CLI 子进程关闭路径参数转换，保证 slash command 和 URL 原样送达终端。
 
 ## 开发与验证
