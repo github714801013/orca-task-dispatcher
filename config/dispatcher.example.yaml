@@ -46,8 +46,8 @@ task_source:
     JQL 仅用于筛选，不决定返回字段。若接口支持选择返回字段，显式请求 key、summary、description、assignee/displayName，并分别映射为 task_id、title、description、assignee。
     必须返回真实查询结果，禁止猜测。每个任务必须包含 task_id（事项唯一标识）、title（标题）和 assignee（当前负责人显示名称）。
 
-    参考方案字段：配置值为 {{reference_plan_field}}。若配置为具体 Jira 字段（customfield ID 或字段名），必须读取该字段内容并映射为 reference_plan；
-    若未配置、字段读取失败或值为空，reference_plan 必须显式返回 null，严禁猜测或从其他字段拼接。
+    参考方案字段：配置值为 {{reference_plan_field}}。若配置为具体 Jira 字段（customfield ID 或字段名），读取其内容并在非空时映射为 reference_plan；
+    字段未配置、读取失败或值为空时可省略 reference_plan，继续后续流程；不得伪造字段值。
 
     任务获取阶段先读取完整原始需求与全部附件本体；原件保存或 SHA-256 校验失败时，标记 incomplete 并阻断后续 GitNexus 调研和分发。
     先暂存 `<root>/.runtime/requirements/<实际-task-id>/`：Markdown 完整保留正文，图片写 OCR 文本和语义描述；其他附件保留原件并在 Markdown 索引相对路径、SHA-256 与可读性状态。
@@ -59,12 +59,10 @@ task_source:
     多个子任务归一化到同一父产品需求时，按实际任务编号合并；仅当 source_assignee 与参考方案中的人员分工一致时才可合并，
     来源负责人冲突时只暂停该实际任务，禁止写入重复 task_id。
 
-    项目与分支匹配时，先从参考方案中提取“人员—项目/技术栈”分工，再将当前查询子任务的 source_assignee 与该分工交叉验证。
+    项目与分支匹配时，若参考方案提供了“人员—项目/技术栈”分工，应提取该分工并与当前查询子任务的 source_assignee 交叉验证。
     source_assignee 是当前执行归属，父任务负责人只作为上下文，不能覆盖或否定子任务负责人。
-    若参考方案明确写明“谢熊坤只负责 C# oanew，吴遥遥负责 Java stock”，且当前子任务负责人为谢熊坤，
-    则应将该任务唯一匹配为仓库 oanew、基础分支 master-new；这是分工证据的组合判断，不是对任务编号的硬编码。
-    若参考方案明确写出当前开发子任务负责人的项目或技术栈归属，即使标题、描述或 GitNexus 报告命中多个候选，也必须按该指定项目及其有效基础分支分发；参考方案不是“只能辅助”的弱证据。
-    只有人员分工缺失、互相冲突，或无法映射到配置候选时，才请求用户确认；不得因父产品需求负责人不同而制造歧义。
+    参考方案为空、缺失、冲突或无法映射到配置候选时，不构成阻断：仍可依据父产品需求、任务标题/描述、GitNexus 报告和项目/分支描述联合决策；
+    仅当这些证据仍不能唯一确定项目、租户或基础分支时，才请求用户确认；不得因父产品需求负责人不同而制造歧义。
 
     state 过滤后，为每个可处理任务立即派发独立 GitNexus 子 Agent，使用一次跨项目只读远程 query；不得先锁定仓库、
     不得创建 worktree，不得修改文件、执行 launch 或进行全目录泛搜。报告必须返回候选项目/分支、完整查询意图、命中证据、
@@ -76,8 +74,8 @@ task_source:
     同一实际 task_id 同时命中多个配置租户时，必须展开为多条 tenant assignment；每条后续都使用独立 worktree，禁止因 task_id 相同而合并。
     项目级 branch_priority 命中时必须使用其分支；未命中、项目/租户未确认或规则冲突时返回 needs_confirmation。调用 `dispatcher.py decide --input <json>` 校验；
     返回 needs_confirmation 时仅暂停该任务，其他已确认任务继续。
-    例如 XSWL-28372（谢熊坤）归一化到 XSWL-26585，参考方案明确谢熊坤负责 C# oanew、吴遥遥负责 Java stock，应唯一锁定 oanew/master-new；
-    这是组合证据示例，不得硬编码任务编号。只有证据缺失、冲突或无法唯一映射时，才暂停当前任务并继续其他任务。
+    例如 XSWL-28372（谢熊坤）归一化到 XSWL-26585，参考方案明确谢熊坤负责 C# oanew、吴遥遥负责 Java stock，可作为唯一锁定 oanew/master-new 的强路由证据；
+    这是组合证据示例，不得硬编码任务编号。参考方案缺失时仍可依据其他证据联合决策；只有证据缺失、冲突或无法唯一映射时，才暂停当前任务并继续其他任务。
 
     同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），每条都必须提供各自 worktree_path；split 不再通过共享源仓库 pane 隐式创建租户工作树。
     项目和租户确定、worktree 创建后，必须将每个临时需求归档复制到该 worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`。

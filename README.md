@@ -25,7 +25,7 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 
 - `workspace.projects_root` 和 `workspace.projects`；项目可配置 `description`、`tenants` 与项目级 `branch_priority`。同一 Jira 任务命中多个租户时，每个租户必须输出独立 assignment 和 worktree；分支规则只在所属项目内生效
 - `base_branch.options`
-- `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；留空（null）时上游获取必须显式返回 `reference_plan: null`，不得猜测字段
+- `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；字段未配置或值为空时可省略 `reference_plan`，不得伪造字段值
 - 需要时的 `dispatch.skill.command_templates`；提示词整体只按该模板渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务信息不下发
 
 `config/dispatcher.yaml` 与根目录 `config.yml` 都是本地文件，已被忽略，**不要提交**。不要在配置或任务输入中保存令牌、密码、Cookie、内部域名、内部路径或运行状态。
@@ -56,7 +56,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 推荐流程：
 
 1. 运行 `validate` 验证配置和候选仓库。
-2. 运行 `task-source` 获取固定 JQL 与字段契约；由外部 Jira 工具实际拉取开发需求，逐条解析父产品需求，保留实际任务、来源子任务、标题、描述、负责人和参考方案。参考方案按配置 `task_source.reference_plan_field` 指定的 Jira 字段读取并映射为 `reference_plan`；未配置或读取失败时显式返回 `null`，不得猜测字段。
+2. 运行 `task-source` 获取固定 JQL 与字段契约；由外部 Jira 工具实际拉取开发需求，逐条解析父产品需求，保留实际任务、来源子任务、标题、描述、负责人和参考方案。参考方案按配置 `task_source.reference_plan_field` 指定的 Jira 字段读取并在非空时映射为 `reference_plan`；未配置或值为空时可省略，参考方案缺失不阻断项目与分支的联合决策。
 3. 运行 `state`，跳过 `dispatched`；`launching` 或 `requires_manual_reset` 按现有规则处理。单个任务暂停不得阻塞其他任务。
 4. 对每个可处理任务，先读取完整 Jira 原始需求与全部附件本体：完整性校验失败时该任务不得进入 GitNexus 调研或分发。需求快照临时保存于 `.runtime/requirements/<实际-task-id>/`；图片在 Markdown 中保留 OCR 文本与语义描述，其他附件保留原件并由 Markdown 索引相对路径、SHA-256 与可读性状态。随后由外部子 Agent 进行一次跨项目、只读的 GitNexus 远程调研，不创建 worktree；报告返回候选、证据和排除理由。再将报告与实际任务标题/描述、子任务负责人、父产品需求、参考方案人员分工及 `repos`、`branches` 描述联合决策仓库、租户和基础分支。同一 Jira 实际任务命中多个项目或租户时，保留同一个 `task_id`，但展开为多条 tenant assignment；例如 saasoanew 的九讯云（智乐方）与易腾各一条，oanew 与 saasoanew 同时命中时也各一条。项目配置的 `branch_priority` 优先于普通分支候选，例如项目内同时命中九机与九讯云（智乐方）时选择 `release_saas`。
 5. 将外部已决策任务写为 `version: 1` 的决策 JSON，运行 `decide --input decision.json`。该命令只校验显式项目/分支是否属于当前配置并输出规范化任务，不调用 Jira、GitNexus 或 Orca，也不写分发状态。若输出 `needs_confirmation`，仅暂停对应任务并补充人工决策后重跑；绝不以候选顺序猜测项目或分支。
