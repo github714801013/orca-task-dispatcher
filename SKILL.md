@@ -5,20 +5,11 @@ description: 用 CLI 生成并启动用户确认的任务分发。用于手动�
 
 # Orca 任务分发器
 
-`<root>` 是本文件所在目录。统一使用 `uv run --project <root> python <root>/scripts/dispatcher.py <subcommand>`；
-每个子命令执行前先查看其 `--help`，并按 CLI 返回的提示准备输入。stdout 为单个 JSON；`ok=false` 或非零退出码时停止。任务获取提示词仅由 `task-source` 子命令输出。
+按“任务获取与归一化 → 完整需求与附件归档校验 → 状态校验 → 跨项目远程调研 → 联合证据确认仓库/分支 → 工作区准备 → 用户确认 → 开发会话启动”的顺序执行任务分发。
 
-## 硬性约束
+- 每个任务独立进行只读 GitNexus 跨项目远程调研；联合证据还需区分项目与租户，同一实际任务命中多个租户时展开独立 assignment/worktree，项目级分支优先规则按配置执行。
+- 调研、路由或报告无法确认时只暂停当前任务，不阻塞其他任务；主流程不得进行全目录泛搜。
+- 项目和分支确认后才准备 worktree 和分发输入；开发会话复用报告并跳过重复调研。
+- 具体命令、字段、报告格式和布局差异以对应 CLI 的 `--help`、`task-source`、`decide` 输出及配置提示为准；只有 `decide` 确认的任务才进入 worktree 与 launch。
 
-- 本地配置文件（`config/dispatcher.yaml`）在执行本技能期间**禁止读取与修改**：任何场景（含配置异常排障）都不得读取或编辑该文件。配置信息一律通过本 CLI 子命令的输出获取；配置异常时仅依据 CLI 错误输出停止并如实转达用户，由用户自行排查文件。
-
-## 使用顺序
-
-1. 运行 `validate`、`repos`、`task-source`。
-2. 原样执行 `task-source` 返回的 `fetch_prompt` 获取真实任务；任务获取失败、无结果或字段不足时如实停止。
-3. 运行 `state`，跳过 `dispatched`；`launching` 必须先 `reset <task_id>`，不得自动重试。
-4. 按任务的标题/描述与 `repos` 返回的仓库描述自动匹配仓库，仅允许 `repos` 返回的名称；再运行 `branches --repository <name>`，按任务描述与分支描述自动匹配分支，仅可选 `valid=true` 分支。描述缺失或无法唯一确定时，用 `AskUserQuestion` 展示带描述的候选项回退询问用户。
-5. 按 `dispatcher.py launch --help` 的输入契约写入 `.runtime/current-run.json`。展示汇总后取得对本次 terminal 创建与发送的明确确认。
-6. 运行 `launch --input <root>/.runtime/current-run.json`；不等待 `/dev-spec-gen` 完成。
-
-需要注册 Automation 时，先运行对应 `orca automations ... --help`，再单独请求授权。
+本地配置文件的读取和修改遵循项目安全约束；不要绕过 CLI 或自行猜测配置和输入。
