@@ -374,6 +374,7 @@ class Config:
     agent_command: str
     command_templates: Mapping[str, str]
     reference_plan_field: str | None = None
+    task_source_flows: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     layout_mode: str = "split"
     session_prompt: str = ""
     recovery_session_prompt: str = ""
@@ -403,6 +404,49 @@ def skill_root_from_config(config_file: Path) -> Path:
 def config_path_from_script() -> Path:
     return Path(__file__).resolve().parents[1] / "config" / "dispatcher.yaml"
 
+
+def config_default_path_from_script() -> Path:
+    return Path(__file__).resolve().parents[1] / "config" / "dispatcher.default.yaml"
+
+
+def merge_config_values(base: Any, override: Any, path: tuple[str, ...] = ()) -> Any:
+    if path == ("workspace", "projects"):
+        return override
+    if isinstance(base, Mapping) and isinstance(override, Mapping):
+        return {
+            **base,
+            **{
+                key: merge_config_values(base[key], value, (*path, str(key))) if key in base else value
+                for key, value in override.items()
+            },
+        }
+    return override
+
+
+def read_config_yaml(config_file: Path, *, required: bool) -> Mapping[str, Any] | None:
+    try:
+        raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise DispatcherError("config_unreadable", f"无法读取配置：{config_file}")
+    except OSError as error:
+        raise DispatcherError("config_unreadable", f"无法读取配置：{config_file}") from error
+    except yaml.YAMLError as error:
+        raise DispatcherError("invalid_config", f"YAML 格式错误：{error}") from error
+    return require_mapping(raw, "配置根")
+
+
+def config_layers(config_file: Path | None) -> Mapping[str, Any]:
+    default_file = config_default_path_from_script()
+    default = read_config_yaml(default_file, required=False)
+    user_file = config_file or config_path_from_script()
+    user = read_config_yaml(user_file, required=False)
+    if default is None and user is None:
+        raise DispatcherError("config_unreadable", f"默认配置不存在：{default_file}")
+    if default is None:
+        return user or {}
+    return merge_config_values(default, user or {})
 
 def relative_to_root(root: Path, value: Any, field: str) -> Path:
     candidate = Path(require_text(value, field))
@@ -441,14 +485,8 @@ def require_branch_priority(value: Any, field: str) -> tuple[Mapping[str, object
 
 
 def load_config(config_file: Path) -> Config:
-    try:
-        raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
-    except OSError as error:
-        raise DispatcherError("config_unreadable", f"无法读取配置：{config_file}") from error
-    except yaml.YAMLError as error:
-        raise DispatcherError("invalid_config", f"YAML 格式错误：{error}") from error
+    root_data = config_layers(config_file)
 
-    root_data = require_mapping(raw, "配置根")
     workspace = require_mapping(root_data.get("workspace"), "workspace")
     base_branch = require_mapping(root_data.get("base_branch"), "base_branch")
     task_source = require_mapping(root_data.get("task_source"), "task_source")
@@ -497,6 +535,9 @@ def load_config(config_file: Path) -> Config:
     reference_plan_field = task_source.get("reference_plan_field")
     if reference_plan_field is not None and (not isinstance(reference_plan_field, str) or not reference_plan_field.strip()):
         raise DispatcherError("invalid_config", "task_source.reference_plan_field 必须是字符串或 null")
+    task_source_flows = task_source.get("flows", {})
+    if not isinstance(task_source_flows, Mapping):
+        raise DispatcherError("invalid_config", "task_source.flows 必须是对象")
     session_prompt = require_mapping(task_source.get("session_prompt"), "task_source.session_prompt")
     recovery_session_prompt = require_text(session_prompt.get("recovery"), "task_source.session_prompt.recovery")
     require_text(interaction.get("repository_selection"), "interaction.repository_selection")
@@ -551,6 +592,10 @@ def load_config(config_file: Path) -> Config:
         task_source_query=task_source_query,
         fetch_prompt=fetch_prompt,
         reference_plan_field=reference_plan_field,
+        task_source_flows=MappingProxyType({
+            require_text(name, "task_source.flows 键"): require_mapping(value, f"task_source.flows.{name}")
+            for name, value in task_source_flows.items()
+        }),
         agent_command=require_text(dispatch.get("agent"), "dispatch.agent"),
         command_templates=template_values,
         layout_mode=layout_mode,
@@ -577,20 +622,36 @@ def is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def repository_from_path(name: str, path: Path, projects_root: Path, description: str | None = None) -> Repository:
+def repository_from_path(
+    name: str,
+    path: Path,
+    projects_root: Path,
+    description: str | None = None,
+    allow_outside_projects_root: bool = False,
+) -> Repository:
     resolved = path.resolve()
-    if not is_within(resolved, projects_root):
+    if not allow_outside_projects_root and not is_within(resolved, projects_root):
         raise DispatcherError("invalid_repository", f"仓库路径越出 projects_root：{name}")
     if not resolved.is_dir() or not (resolved / ".git").is_dir():
         raise DispatcherError("invalid_repository", f"不是可用 Git 仓库：{resolved}")
     return Repository(name=name, path=resolved, description=description)
 
 
+def configured_project_path(config: Config, project: Project) -> tuple[Path, bool]:
+    path = Path(project.path)
+    if path.is_absolute():
+        return path, True
+    if ".." in path.parts:
+        raise DispatcherError("invalid_config", "项目路径不能越出 projects_root")
+    return config.projects_root / path, False
+
+
 def configured_repository(config: Config, name: str) -> Repository | None:
     project = config.projects.get(name)
     if project is None:
         return None
-    return repository_from_path(name, config.projects_root / project.path, config.projects_root, project.description)
+    path, allow_outside = configured_project_path(config, project)
+    return repository_from_path(name, path, config.projects_root, project.description, allow_outside)
 
 
 def repository_for_name(config: Config, name: str) -> Repository:
@@ -631,10 +692,8 @@ def discover_repositories(config: Config) -> tuple[Repository, ...]:
     found: list[Repository] = []
 
     for name, project in config.projects.items():
-        relative = Path(project.path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise DispatcherError("invalid_config", f"projects.{name}.path 不能越出 projects_root")
-        repository = repository_from_path(name, config.projects_root / relative, config.projects_root, project.description)
+        path, allow_outside = configured_project_path(config, project)
+        repository = repository_from_path(name, path, config.projects_root, project.description, allow_outside)
         found.append(repository)
 
     return tuple(found)
@@ -2515,9 +2574,29 @@ def decide(config: Config, path: Path) -> dict[str, object]:
     }
 
 
-def task_source_prompt(config: Config) -> dict[str, object]:
+def task_source_prompt(
+    config: Config,
+    query_override: str | None = None,
+    flow: str | None = None,
+) -> dict[str, object]:
+    selected_flow = flow or "complete"
+    if selected_flow not in {"direct", "complete"}:
+        raise DispatcherError("invalid_input", "flow 必须是 direct 或 complete")
+    configured_flow = config.task_source_flows.get(selected_flow)
+    if configured_flow is not None and not isinstance(configured_flow.get("next_steps"), list):
+        raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是列表")
+    next_steps = configured_flow.get("next_steps") if configured_flow else None
+    if not next_steps:
+        next_steps = (
+            ["拉取任务", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
+            if selected_flow == "direct"
+            else ["拉取完整需求与附件", "执行需求/GitNexus 调研", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
+        )
+    if not all(isinstance(step, str) and step.strip() for step in next_steps):
+        raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是非空字符串列表")
+    query = config.task_source_query if query_override is None else require_text(query_override, "jql")
     variables = {
-        "query": config.task_source_query,
+        "query": query,
         "reference_plan_field": config.reference_plan_field or "未配置",
     }
     names = set(re.findall(r"\{\{([^{}]+)\}\}", config.fetch_prompt))
@@ -2534,6 +2613,10 @@ def task_source_prompt(config: Config) -> dict[str, object]:
         "task_url_template": config.task_url_template,
         "max_tasks": config.max_tasks,
         "reference_plan_field": config.reference_plan_field,
+        "query": query,
+        "jql_source": "cli" if query_override is not None else "config",
+        "flow": selected_flow,
+        "next_steps": list(next_steps),
     }
 
 
@@ -2564,7 +2647,9 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--task-id")
     recover.add_argument("--tenant-slug", help="指定同一任务下要恢复的租户")
     recover.add_argument("--force-unlock", action="store_true")
-    commands.add_parser("task-source", help="输出已渲染的任务获取提示词")
+    task_source_parser = commands.add_parser("task-source", help="输出已渲染的任务获取提示词")
+    task_source_parser.add_argument("--jql", help="仅本次运行覆盖配置中的 JQL")
+    task_source_parser.add_argument("--flow", choices=("direct", "complete"), required=True, help="用户选择的任务流程")
     decide_parser = commands.add_parser(
         "decide",
         help="校验外部调研后的项目与分支决策",
@@ -2672,7 +2757,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             tenant_slug=arguments.tenant_slug,
         )
     if arguments.command == "task-source":
-        return task_source_prompt(config)
+        return task_source_prompt(config, arguments.jql, arguments.flow)
     if arguments.command == "decide":
         return decide(config, arguments.input)
     if arguments.command == "reset":

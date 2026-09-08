@@ -12,7 +12,14 @@
 
 ## 安装与配置
 
-安装依赖后，复制公开样例为本地配置：
+安装依赖后，默认配置由仓库托管，用户只需创建本地覆盖文件：
+
+```text
+config/dispatcher.default.yaml  # 托管默认配置，不修改
+config/dispatcher.yaml          # 用户覆盖配置，已忽略，不提交
+```
+
+用户覆盖按 mapping 递归合并；标量和 `null` 直接覆盖，列表整体替换。显式 `--config <path>` 仍可加载完整旧配置文件。
 
 ```bash
 uv sync
@@ -21,7 +28,7 @@ cp config/dispatcher.example.yaml config/dispatcher.yaml
 
 Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重命名为 `config/dispatcher.yaml`。
 
-随后编辑本地配置，至少替换：
+随后在用户覆盖配置中填写：
 
 - `workspace.projects_root` 和 `workspace.projects`；项目可配置 `description`、`tenants` 与项目级 `branch_priority`。同一 Jira 任务命中多个租户时，每个租户必须输出独立 assignment 和 worktree；分支规则只在所属项目内生效
 - `base_branch.options`
@@ -47,7 +54,8 @@ Dispatcher 以 `claude` 启动任务会话，可通过 `dispatch.agent_extra_arg
 uv run --project . python scripts/dispatcher.py --help
 uv run --project . python scripts/dispatcher.py validate
 uv run --project . python scripts/dispatcher.py repos
-uv run --project . python scripts/dispatcher.py task-source
+uv run --project . python scripts/dispatcher.py task-source --flow complete
+uv run --project . python scripts/dispatcher.py task-source --flow direct --jql "project = DEMO AND status = ready"
 uv run --project . python scripts/dispatcher.py decide --input decision.json
 uv run --project . python scripts/dispatcher.py state
 uv run --project . python scripts/dispatcher.py branches --repository example-repository

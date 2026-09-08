@@ -1,0 +1,147 @@
+version: 1
+
+workspace:
+  projects_root: "/path/to/projects"
+  projects:
+    example-repository:
+      path: "example-repository"
+      # 可选：项目描述，用于按任务描述自动匹配仓库。
+      description: "示例业务系统"
+      # 可选：同一任务命中多个租户时，每个租户分别创建 worktree。
+      tenants:
+        example-tenant:
+          slug: "example-tenant"
+      # 可选：项目级分支优先规则；when_all 全部命中时优先指定分支。
+      branch_priority:
+        - when_all: ["tenant-a", "tenant-b"]
+          branch: "main"
+      # 基础分支（分支名: 分支描述，描述用于按任务描述自动匹配；纯字符串列表亦可）。
+      base_branches:
+        main: "默认主分支"
+
+base_branch:
+  optional: true
+  default: null
+  options:
+    main: "默认主分支"
+  validate: true
+
+task_source:
+  type: "prompt"
+  task_url_template: "https://jira.9ji.com/{task_id}"
+  # 可按需在 query 中追加 reference_plan_field 的 IS NOT EMPTY 过滤，只拉取有参考方案的任务。
+  query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser() AND customfield_11103 IS NOT EMPTY"
+  # Jira 中“参考方案”字段的实际字段 ID 或字段名。
+  reference_plan_field: customfield_11103
+  fetch_prompt: |
+    使用当前环境可用的任务查询工具获取开发任务。
+
+    查询条件（JQL）必须原样使用以下内容，严禁修改：
+    {{query}}
+
+    查询对象只能是开发任务。禁止把查询类型改为 产品需求 或任何其他类型；
+    产品需求只能作为已查询到任务的父任务获取，绝不直接作为查询条件。
+
+    JQL 仅用于筛选，不决定返回字段。若接口支持选择返回字段，显式请求 key、summary、description、assignee/displayName，并分别映射为 task_id、title、description、assignee。
+    必须返回真实查询结果，禁止猜测。每个任务必须包含 task_id（事项唯一标识）、title（标题）和 assignee（当前负责人显示名称）。
+
+    参考方案字段：配置值为 {{reference_plan_field}}。若配置为具体 Jira 字段（customfield ID 或字段名），读取其内容并在非空时映射为 reference_plan；
+    字段未配置、读取失败或值为空时可省略 reference_plan，继续后续流程；不得伪造字段值。
+
+    任务获取阶段先读取完整原始需求与全部附件本体；原件保存或 SHA-256 校验失败时，标记 incomplete 并阻断后续 GitNexus 调研和分发。
+    先暂存 `<root>/.runtime/requirements/<实际-task-id>/`：Markdown 完整保留正文，图片写 OCR 文本和语义描述；其他附件保留原件并在 Markdown 索引相对路径、SHA-256 与可读性状态。
+    不得将需求正文或二进制附件拼入 terminal 命令。
+
+    父任务解析：对每个查询到的开发子任务，必须同时保留原始子任务编号、原始负责人（source_task_id、source_assignee）和父任务信息。
+    存在父任务时获取父任务信息；若父任务类型为产品需求，则以父任务作为实际任务，使用父任务编号、标题、描述和参考方案，
+    但不得用父任务负责人覆盖 source_assignee。分发上下文必须同时记录子任务负责人和父任务负责人。
+    多个子任务归一化到同一父产品需求时，按实际任务编号合并；仅当 source_assignee 与参考方案中的人员分工一致时才可合并，
+    来源负责人冲突时只暂停该实际任务，禁止写入重复 task_id。
+
+    项目与分支匹配时，若参考方案提供了“人员—项目/技术栈”分工，应提取该分工并与当前查询子任务的 source_assignee 交叉验证。
+    source_assignee 是当前执行归属，父任务负责人只作为上下文，不能覆盖或否定子任务负责人。
+    参考方案为空、缺失、冲突或无法映射到配置候选时，不构成阻断：仍可依据父产品需求、任务标题/描述、GitNexus 报告和项目/分支描述联合决策；
+    仅当这些证据仍不能唯一确定项目、租户或基础分支时，才请求用户确认；不得因父产品需求负责人不同而制造歧义。
+
+    state 过滤后，为每个可处理任务立即派发独立 GitNexus 子 Agent，使用一次跨项目只读远程 query；不得先锁定仓库、
+    不得创建 worktree，不得修改文件、执行 launch 或进行全目录泛搜。报告必须返回候选项目/分支、完整查询意图、命中证据、
+    排除理由、未确认项和 Markdown 调研结论。
+
+    项目与分支必须将 GitNexus 报告、任务标题/描述、source_assignee、父产品需求信息、参考方案和 `repos`/`branches` 描述联合判断。
+    先从参考方案提取“人员—项目/技术栈”分工，再与当前开发子任务负责人交叉验证；父产品需求负责人只作上下文，不能覆盖 source_assignee。
+    联合判断由外部编排器完成后，必须将每个任务的显式 repository、tenant、tenant_slug 与 base_branch 连同调研上下文写入 version=1 决策 JSON。
+    同一实际 task_id 同时命中多个配置租户时，必须展开为多条 tenant assignment；每条后续都使用独立 worktree，禁止因 task_id 相同而合并。
+    项目级 branch_priority 命中时必须使用其分支；未命中、项目/租户未确认或规则冲突时返回 needs_confirmation。调用 `dispatcher.py decide --input <json>` 校验；
+    返回 needs_confirmation 时仅暂停该任务，其他已确认任务继续。
+    例如 XSWL-28372（谢熊坤）归一化到 XSWL-26585，参考方案明确谢熊坤负责 C# oanew、吴遥遥负责 Java stock，可作为唯一锁定 oanew/master-new 的强路由证据；
+    这是组合证据示例，不得硬编码任务编号。参考方案缺失时仍可依据其他证据联合决策；只有证据缺失、冲突或无法唯一映射时，才暂停当前任务并继续其他任务。
+
+    同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），每条都必须提供各自 worktree_path；split 不再通过共享源仓库 pane 隐式创建租户工作树。
+    项目和租户确定、worktree 创建后，必须将每个临时需求归档复制到该 worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`。
+    最终将需求 Markdown 的绝对路径写入 requirement_snapshot_path；下游先读此文件，再按其相对路径读取附件本体。
+    租户任务缺失 worktree_path 或 requirement_snapshot_path，或快照/附件清单未标记 complete、附件大小与 SHA-256 不一致时，`dispatcher.py decide` 对该任务返回 needs_confirmation。
+    调研报告先暂存于 `<root>/.runtime/research/<实际-task-id>-gitnexus.md`。项目和基础分支确定后，separate 和 split 均须先由统一 worktree CLI 创建/复用对应租户 worktree，再写入 launch 输入。
+  session_prompt:
+    separate: |
+      项目和分支已由任务报告与联合证据确认后，必须先读取并核验 dev-spec-gen 的完整技能正文，
+      再运行其统一 worktree CLI 的 `worktree.py --help`；不得仅依据技能名称或元数据推断用法。
+      必须使用 dev-spec-gen 的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
+      仅当 CLI 返回 status=success 的独立纯 JSON stdout 时，才能将其中返回的绝对路径写入 worktree_path；失败输出、混合日志或自行推导的路径均不得使用。
+      GitNexus 调研报告必须先从 gitnexus_report_path 读取并校验；报告有效时复用结论并跳过 GitNexus 调研节点。
+      separate 终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
+      只有确认不存在时才允许重建。多匹配、查询失败或无法确认时停止并等待人工复位，不得猜测或重复发送任务。
+      worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发需求编号。
+      任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动；这不等同于任务或分发失败，等待补充有效路径或人工处理。
+    split: |
+      当前任务已绑定租户独立 worktree。必须复用该路径，不得新建或推断其他 worktree。
+    recovery: |
+      这是恢复会话。先检查已有工作区、分支和产物；确认状态后继续任务，不要重复初始化或覆盖已有成果。
+  max_tasks: 12
+
+interaction:
+  repository_selection: "required"
+  base_branch_selection: "optional"
+  ask_batch_size: 4
+  repository_suggestion_limit: 4
+  allow_other: true
+
+dispatch:
+  agent: "claude"
+  # 可选：跳过工具权限弹窗（如 uv run 确认），避免任务命令被权限确认阻塞。
+  agent_extra_args: ""
+  skill:
+    # 命令模板必须以 /dev-spec-gen 开头；任务上下文字段与命令合并为同一提示词。
+    # 不要在模板中追加其他 slash command 或改变 /dev-spec-gen 的开头位置。
+    command_templates:
+      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+      split: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务 worktree 中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+  layout:
+    group_by: "repository"
+    max_panes_per_tab: 4
+    mode: "separate"
+  terminal:
+    shell_commands:
+      windows: "cmd.exe /d /k"
+      posix: "sh -i"
+    read_retry_attempts: 2
+    read_retry_delay_ms: 500
+    # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。
+    ready_retry_attempts: 3
+    send_retry_attempts: 1
+    ready_timeout_ms: 120000
+  concurrency:
+    max_agents: 12
+
+dedup:
+  enabled: true
+  strategy: "task_id"
+  skip_dispatched: true
+  state_file: ".runtime/state.json"
+
+automation:
+  enabled: false
+  name: "Weekly Task Dispatcher"
+  trigger: "weekly"
+  day: 1
+  time: "09:00"
+  reuse_session: false

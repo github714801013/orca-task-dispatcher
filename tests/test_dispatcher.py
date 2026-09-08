@@ -447,7 +447,11 @@ class DispatcherTests(unittest.TestCase):
                 "session_prompt": "新建该任务的 worktree",
                 "task_url_template": "https://jira.example/{task_id}",
                 "max_tasks": 12,
-                "reference_plan_field": None,
+                "reference_plan_field": "customfield_11103",
+                "query": "status = 待开发",
+                "jql_source": "config",
+                "flow": "complete",
+                "next_steps": ["拉取完整需求与附件", "执行需求/GitNexus 调研", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"],
             })
 
     def test_task_source_rejects_unknown_prompt_variable(self) -> None:
@@ -476,7 +480,7 @@ class DispatcherTests(unittest.TestCase):
             stdout = io.StringIO()
 
             with contextlib.redirect_stdout(stdout):
-                code = dispatcher.main(["--config", str(root / "config" / "dispatcher.yaml"), "task-source"])
+                code = dispatcher.main(["--config", str(root / "config" / "dispatcher.yaml"), "task-source", "--flow", "complete"])
 
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(stdout.getvalue())["result"]["fetch_prompt"], "按 status = 待开发 查询任务")
@@ -549,7 +553,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("报告先暂存", prompt)
 
         self.assertIn("严禁修改", prompt)
-        self.assertIn("参考方案字段：配置值为 未配置", prompt)
+        self.assertIn("参考方案字段：配置值为 customfield_11103", prompt)
         self.assertIn("可省略 reference_plan", prompt)
         self.assertIn("branch_priority", prompt)
         self.assertNotIn("created", prompt)
@@ -1066,6 +1070,95 @@ class DispatcherTests(unittest.TestCase):
             sends = [value for operation, value in fake_orca.operations if operation == "send"]
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertEqual(sends, [dispatcher.CLAUDE_AUTHORIZATION_ACCEPT])
+
+    def test_task_source_jql_override_is_not_persistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+
+            result = dispatcher.task_source_prompt(config, "project = X AND status = ready")
+
+            self.assertEqual(result["query"], "project = X AND status = ready")
+            self.assertEqual(result["jql_source"], "cli")
+            self.assertIn("project = X AND status = ready", result["fetch_prompt"])
+            self.assertEqual(config.task_source_query, "status = 待开发")
+
+    def test_task_source_rejects_blank_jql_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "jql 必须是非空字符串"):
+                dispatcher.task_source_prompt(config, "   ")
+
+    def test_merge_config_values_recursively_replaces_lists_and_null(self) -> None:
+        merged = dispatcher.merge_config_values(
+            {"nested": {"keep": 1, "replace": 1}, "items": [1, 2], "value": "default"},
+            {"nested": {"replace": 2}, "items": [], "value": None},
+        )
+
+        self.assertEqual(merged, {"nested": {"keep": 1, "replace": 2}, "items": [], "value": None})
+
+    def test_task_source_cli_accepts_jql_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = dispatcher.main([
+                    "--config", str(root / "config" / "dispatcher.yaml"),
+                    "task-source", "--flow", "complete", "--jql", "issuetype = 开发需求",
+                ])
+
+            self.assertEqual(code, 0)
+            result = json.loads(stdout.getvalue())["result"]
+            self.assertEqual(result["query"], "issuetype = 开发需求")
+            self.assertEqual(result["jql_source"], "cli")
+
+    def test_configured_project_accepts_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            projects.mkdir()
+            repository_path = root / "external" / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace('path: "repo-a"', f'path: "{repository_path.as_posix()}"').format(
+                    projects_root=projects.as_posix()
+                ),
+                encoding="utf-8",
+            )
+            config = dispatcher.load_config(config_path)
+
+            repositories = dispatcher.discover_repositories(config)
+
+            self.assertEqual(repositories[0].path, repository_path.resolve())
+
+    def test_configured_project_rejects_relative_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace('path: "repo-a"', 'path: "../repo-a"').format(
+                    projects_root=projects.as_posix()
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "不能越出 projects_root"):
+                dispatcher.discover_repositories(dispatcher.load_config(config_path))
 
     def test_command_rejects_unsafe_base_branch(self) -> None:
         config = dispatcher.Config(
