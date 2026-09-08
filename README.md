@@ -91,7 +91,7 @@ GitNexus 调研发生在“实际任务归一化、state 校验”之后和项�
 uv run --project . python scripts/dispatcher.py launch --input tasks.json
 ```
 
-`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动，这不等同于任务或分发失败，等待补充有效路径或人工处理。`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，所有字段值压缩为单行并去除反引号，字段值为空的行省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
+`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动，这不等同于任务或分发失败，等待补充有效路径或人工处理。`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
 
 同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
@@ -102,6 +102,7 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 - `separate`：每项任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
 - `split`：同一项目、同一租户的任务可在一个 tab 的 pane 中聚合；每条租户 assignment 仍必须绑定各自的 linked worktree，不能因 task_id 相同而共享工作树。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
+- Claude Code TUI 仅在 preview 同时出现明确的 `No, exit` 与 `Yes, I accept` 授权选项时，自动提交一次 `Yes, I accept`；授权界面未消失、终端状态无法确认或发送失败时停止并进入 `requires_manual_reset`。未知登录、更新或其他确认界面绝不自动操作。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。
 - 就绪等待（`tui-idle`，首轮超时 `ready_timeout_ms`，默认 120s，重试逐轮递增至 360s 上限）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。

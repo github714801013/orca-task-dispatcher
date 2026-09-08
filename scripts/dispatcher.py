@@ -104,6 +104,9 @@ TASK_CONTEXT_TEMPLATE_FIELDS = frozenset({
     "reference_plan", "gitnexus_report_path", "requirement_snapshot_path",
 })
 COMMAND_TEMPLATE_ALLOWED_FIELDS = COMMAND_TEMPLATE_FIELDS | TASK_CONTEXT_TEMPLATE_FIELDS
+CLAUDE_AUTHORIZATION_ACCEPT = "Yes, I accept"
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+CLAUDE_AUTHORIZATION_OPTION_PATTERN = re.compile(r"^(?:[>❯]\s*)?(No, exit|Yes, I accept)$")
 ORCA_COMMAND_TIMEOUT_SECONDS = 30
 READY_TIMEOUT_MS_MAX = 360_000
 
@@ -1368,6 +1371,8 @@ class OrcaClient:
 
 
 def validate_command_template(template: str) -> None:
+    if not template.startswith("/dev-spec-gen"):
+        raise DispatcherError("invalid_config", "分发命令模板必须以 /dev-spec-gen 开头")
     try:
         fields = {
             name
@@ -1380,6 +1385,19 @@ def validate_command_template(template: str) -> None:
         template.format(**{name: "x" for name in COMMAND_TEMPLATE_ALLOWED_FIELDS})
     except (IndexError, KeyError, ValueError) as error:
         raise DispatcherError("invalid_config", f"分发命令模板格式不合法：{error}") from error
+
+
+def detect_claude_authorization_prompt(preview: str) -> bool:
+    normalized = ANSI_ESCAPE_PATTERN.sub("", preview.replace("\r\n", "\n").replace("\r", "\n"))
+    options = [
+        (index, match.group(1))
+        for index, line in enumerate(normalized.splitlines())
+        if (match := CLAUDE_AUTHORIZATION_OPTION_PATTERN.fullmatch(line.strip()))
+    ]
+    return any(
+        first == "No, exit" and second == "Yes, I accept" and second_index - first_index <= 3
+        for (first_index, first), (second_index, second) in zip(options, options[1:])
+    )
 
 
 def safe_task_context_value(value: str) -> str:
@@ -1421,7 +1439,6 @@ def command_for(config: Config, assignment: Assignment, layout_mode: str = "spli
                 lines.append(line)
                 continue
             line_values = {name: values[name] for name in names}
-            # 任务上下文字段全部为空的行省略；命令核心字段所在行（含 base_branch）始终保留。
             if names <= TASK_CONTEXT_TEMPLATE_FIELDS and not any(line_values.values()):
                 continue
             lines.append(line.format(**line_values))
@@ -1450,20 +1467,65 @@ def retry_read(config: Config, operation: Callable[[], Any]) -> Any:
     raise error
 
 
-def terminal_has_content(orca: OrcaClient, config: Config, handle: str) -> bool:
+def terminal_has_content(orca: OrcaClient, config: Config, handle: str, snapshot: TerminalSnapshot | None = None) -> bool:
     """检测会话内容：preview 非空即认为任务已实际运行。"""
+    current = snapshot or retry_read(config, lambda: orca.terminal_show(handle))
+    return bool(current.preview.strip())
+
+
+def accept_claude_authorization(orca: OrcaClient, config: Config, handle: str) -> tuple[bool, TerminalSnapshot]:
     snapshot = retry_read(config, lambda: orca.terminal_show(handle))
-    return bool(snapshot.preview.strip())
+    if not detect_claude_authorization_prompt(snapshot.preview):
+        return False, snapshot
+    if not snapshot.connected or not snapshot.writable or snapshot.agent_identity != "claude":
+        raise DispatcherError("claude_authorization_unverified", "无法确认 Claude 授权终端状态")
+    retry_log(f"claude_authorization accepting handle={handle}")
+    try:
+        orca.terminal_send(handle, CLAUDE_AUTHORIZATION_ACCEPT)
+    except DispatcherError as error:
+        raise DispatcherError("claude_authorization_unverified", "Claude 授权发送失败") from error
+    try:
+        orca.terminal_wait(handle, config.ready_timeout_ms)
+    except DispatcherError as error:
+        raise DispatcherError("claude_authorization_timeout", "Claude 授权后未能确认会话就绪") from error
+    after = retry_read(config, lambda: orca.terminal_show(handle))
+    if (
+        not after.connected
+        or not after.writable
+        or after.agent_identity != "claude"
+        or detect_claude_authorization_prompt(after.preview)
+        or not after.preview.strip()
+    ):
+        raise DispatcherError("claude_authorization_unverified", "Claude 授权结果无法确认")
+    retry_log(f"claude_authorization accepted handle={handle}")
+    return True, after
 
 
-def retry_ready_wait(orca: OrcaClient, handle: str, config: Config, resend_command: str | None = None) -> None:
+def retry_ready_wait(
+    orca: OrcaClient,
+    handle: str,
+    config: Config,
+    resend_command: str | None = None,
+    authorization_attempted: bool = False,
+) -> None:
     """就绪等待后检测会话内容确认任务实际运行；未运行按配置重发命令重试，超时逐轮递增，预算耗尽才失败。"""
     for attempt in range(config.ready_retry_attempts + 1):
         timeout_ms = min(config.ready_timeout_ms * (attempt + 1), READY_TIMEOUT_MS_MAX)
         retry_log(f"ready_wait attempt={attempt + 1}/{config.ready_retry_attempts + 1} timeout_ms={timeout_ms} handle={handle}")
         try:
             retry_read(config, lambda: orca.terminal_wait(handle, timeout_ms))
+            if authorization_attempted:
+                snapshot = retry_read(config, lambda: orca.terminal_show(handle))
+                if detect_claude_authorization_prompt(snapshot.preview):
+                    raise DispatcherError("claude_authorization_unverified", "Claude 授权结果无法确认")
+                authorization_accepted = False
+            else:
+                authorization_accepted, snapshot = accept_claude_authorization(orca, config, handle)
+                authorization_attempted = authorization_attempted or authorization_accepted
         except DispatcherError as error:
+            if error.code.startswith("claude_authorization_"):
+                retry_log(f"ready_wait authorization failed handle={handle}")
+                raise error
             if attempt >= config.ready_retry_attempts:
                 retry_log(f"ready_wait exhausted handle={handle}")
                 raise error
@@ -1472,7 +1534,10 @@ def retry_ready_wait(orca: OrcaClient, handle: str, config: Config, resend_comma
                 retry_log(f"ready_wait resend handle={handle}")
                 orca.terminal_send(handle, resend_command)
             continue
-        if terminal_has_content(orca, config, handle):
+        if authorization_accepted:
+            retry_log(f"ready_wait succeeded authorization handle={handle}")
+            return
+        if terminal_has_content(orca, config, handle, snapshot):
             retry_log(f"ready_wait succeeded attempt={attempt + 1}/{config.ready_retry_attempts + 1} handle={handle}")
             return
         if attempt >= config.ready_retry_attempts:
