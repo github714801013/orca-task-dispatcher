@@ -2383,26 +2383,14 @@ def read_assignments(path: Path) -> tuple[Assignment, ...]:
     return tuple(assignments)
 
 
-def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise DispatcherError("input_unreadable", f"无法读取项目决策文件：{path}") from error
-    if not isinstance(raw, Mapping):
-        raise DispatcherError("invalid_input", "决策 JSON 根节点必须是对象")
+def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(tasks, list):
+        raise DispatcherError("invalid_input", "决策 JSON 必须含 tasks 列表")
     decision_fields = {
         "task_id", "title", "description", "task_url", "assignee", "tenant", "tenant_slug",
         "source_task_id", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan",
-        "dispatch_flow",        "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_path",
+        "dispatch_flow", "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_path",
     }
-    unknown_fields = set(raw) - {"version", "tasks"}
-    if unknown_fields:
-        raise DispatcherError("invalid_input", f"决策 JSON 包含未知顶层字段：{sorted(unknown_fields)[0]}")
-    if raw.get("version") != 1:
-        raise DispatcherError("invalid_input", "决策 JSON version 必须为 1")
-    tasks = raw.get("tasks")
-    if not isinstance(tasks, list):
-        raise DispatcherError("invalid_input", "决策 JSON 必须含 tasks 列表")
     values: list[Mapping[str, Any]] = []
     task_ids: set[tuple[str, str]] = set()
     for item in tasks:
@@ -2422,6 +2410,22 @@ def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
         task_ids.add(identity)
         values.append(item)
     return tuple(values)
+
+
+def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise DispatcherError("input_unreadable", f"无法读取项目决策文件：{path}") from error
+    if not isinstance(raw, Mapping):
+        raise DispatcherError("invalid_input", "决策 JSON 根节点必须是对象")
+    unknown_fields = set(raw) - {"version", "tasks"}
+    if unknown_fields:
+        raise DispatcherError("invalid_input", f"决策 JSON 包含未知顶层字段：{sorted(unknown_fields)[0]}")
+    if raw.get("version") != 1:
+        raise DispatcherError("invalid_input", "决策 JSON version 必须为 1")
+    tasks = raw.get("tasks")
+    return validate_decision_values(tasks)
 
 
 def preferred_branch_for(config: Config, repository: Repository, tenants: Iterable[str]) -> str | None:
@@ -2449,9 +2453,8 @@ def decision_branch_candidates(config: Config, repository: Repository) -> list[d
     ]
 
 
-def decide(config: Config, path: Path) -> dict[str, object]:
+def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict[str, object]:
     """校验外部调研后的显式路由，不执行语义匹配或任何外部调用。"""
-    values = read_decision_input(path)
     repositories = repositories_by_name(config)
     tenant_sets: dict[tuple[str, str], set[str]] = {}
     for value in values:
@@ -2618,6 +2621,10 @@ def decide(config: Config, path: Path) -> dict[str, object]:
     }
 
 
+def decide(config: Config, path: Path) -> dict[str, object]:
+    return decide_values(config, read_decision_input(path))
+
+
 def task_source_prompt(
     config: Config,
     query_override: str | None = None,
@@ -2732,7 +2739,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    decide_parser.add_argument("--input", type=Path, required=True)
+    decide_parser.add_argument("--input", type=Path)
+    for name, kwargs in (
+        ("task-id", {"dest": "task_id"}),
+        ("title", {}), ("task-url", {"dest": "task_url"}), ("repository", {}),
+        ("base-branch", {"dest": "base_branch"}), ("dispatch-flow", {"dest": "dispatch_flow", "choices": ("direct", "complete", "proposal")}),
+        ("source-task-id", {"dest": "source_task_id"}), ("description", {}), ("assignee", {}),
+        ("tenant", {}), ("tenant-slug", {"dest": "tenant_slug"}), ("source-assignee", {"dest": "source_assignee"}),
+        ("parent-task-id", {"dest": "parent_task_id"}), ("parent-assignee", {"dest": "parent_assignee"}),
+        ("reference-plan", {"dest": "reference_plan"}), ("gitnexus-report-path", {"dest": "gitnexus_report_path"}),
+        ("requirement-snapshot-path", {"dest": "requirement_snapshot_path"}), ("worktree-path", {"dest": "worktree_path"}),
+    ):
+        decide_parser.add_argument(f"--{name}", **kwargs)
     launch_parser = commands.add_parser(
         "launch",
         help="创建、等待并发送开发请求",
@@ -2830,7 +2848,17 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
     if arguments.command == "task-source":
         return task_source_prompt(config, arguments.jql, arguments.flow)
     if arguments.command == "decide":
-        return decide(config, arguments.input)
+        cli_fields = ("task_id", "title", "task_url", "repository", "base_branch", "dispatch_flow", "source_task_id", "description", "assignee", "tenant", "tenant_slug", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan", "gitnexus_report_path", "requirement_snapshot_path", "worktree_path")
+        supplied = {name: getattr(arguments, name) for name in cli_fields if getattr(arguments, name) is not None}
+        if arguments.input is not None:
+            if supplied:
+                raise DispatcherError("invalid_input", "decide --input 不能与任务参数混用")
+            return decide(config, arguments.input)
+        required = ("task_id", "title", "task_url", "repository")
+        missing = next((name for name in required if getattr(arguments, name) is None), None)
+        if missing is not None:
+            raise DispatcherError("invalid_input", f"缺少单任务参数：--{missing.replace('_', '-')}")
+        return decide_values(config, validate_decision_values([supplied]))
     if arguments.command == "reset":
         removed = store.reset(
             arguments.task_id,

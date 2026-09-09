@@ -16,6 +16,6 @@ proposal（出具开发方案）流程必须拆分为两个独立节点：Jira �
 - 调研、路由或报告无法确认时只暂停当前任务，不阻塞其他任务；主流程不得进行全目录泛搜。
 
 - 项目和分支确认后才准备 worktree 和分发输入；开发会话复用报告并跳过重复调研。
-- 具体命令、字段、报告格式和布局差异以对应 CLI 的 `--help`、`task-source`、`decide` 输出及配置提示为准；只有 `decide` 确认的任务才进入 worktree 与 launch。
+- 具体命令、字段、报告格式和布局差异以对应 CLI 的 `--help`、`task-source`、`decide` 输出及配置提示为准；只有 `decide` 确认的任务才进入 worktree 与 launch。单任务优先通过 CLI 参数调用 `decide`，direct 必须显式传 `--dispatch-flow direct --source-task-id <原始开发子任务编号>`；将返回的 `result.launch_input` 原样保存给 launch，禁止手工重建 JSON 导致流程字段丢失。
 
 本地配置文件的读取和修改遵循项目安全约束；不要绕过 CLI 或自行猜测配置和输入。

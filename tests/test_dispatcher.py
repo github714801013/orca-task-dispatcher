@@ -968,7 +968,40 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual([item.task.task_id for item in assignments], ["XSWL-1"])
 
+    def test_decide_cli_preserves_direct_flow_and_source_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "projects" / "repo-a"
+            (repository / ".git").mkdir(parents=True)
+            write_config(root, root / "projects")
+            arguments = dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"), "decide",
+                "--task-id", "CW-7622", "--source-task-id", "CW-7624",
+                "--title", "测试任务", "--task-url", "https://jira.example/CW-7622", "--repository", "mapped",
+                "--base-branch", "origin/release", "--dispatch-flow", "direct",
+            ])
+            result = dispatcher.execute(arguments)
+            selected = result["launch_input"]["tasks"][0]
+            self.assertEqual(selected["dispatch_flow"], "direct")
+            self.assertEqual(selected["source_task_id"], "CW-7624")
+            self.assertEqual(result["tasks"], result["launch_input"]["tasks"])
+            self.assertFalse((root / ".runtime" / "state.json").exists())
+
+    def test_decide_cli_rejects_input_and_task_arguments_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "projects").mkdir()
+            write_config(root, root / "projects")
+            arguments = dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"), "decide",
+                "--input", str(root / "decision.json"), "--dispatch-flow", "complete",
+            ])
+            with self.assertRaises(dispatcher.DispatcherError) as raised:
+                dispatcher.execute(arguments)
+            self.assertIn("不能与任务参数混用", raised.exception.message)
+
     def test_decide_normalizes_explicit_project_without_runtime_side_effect(self) -> None:
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"

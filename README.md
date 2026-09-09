@@ -63,6 +63,7 @@ uv run --project . python scripts/dispatcher.py validate
 uv run --project . python scripts/dispatcher.py repos
 uv run --project . python scripts/dispatcher.py task-source --flow complete
 uv run --project . python scripts/dispatcher.py task-source --flow direct --jql "project = DEMO AND status = ready"
+uv run --project . python scripts/dispatcher.py decide --task-id CW-7622 --source-task-id CW-7624 --title "任务标题" --task-url "https://jira.example/CW-7622" --repository finance --base-branch origin/release_saas --dispatch-flow direct
 uv run --project . python scripts/dispatcher.py decide --input decision.json
 uv run --project . python scripts/dispatcher.py state
 uv run --project . python scripts/dispatcher.py branches --repository example-repository
@@ -74,7 +75,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 2. 运行 `task-source` 获取固定 JQL 与字段契约；由外部 Jira 工具实际拉取开发需求，逐条解析父产品需求，保留实际任务、来源子任务、标题、描述、负责人和参考方案。参考方案按配置 `task_source.reference_plan_field` 指定的 Jira 字段读取并在非空时映射为 `reference_plan`；未配置或值为空时可省略，参考方案缺失不阻断项目与分支的联合决策。
 3. 运行 `state`，跳过 `dispatched`；`launching` 或 `requires_manual_reset` 按现有规则处理。单个任务暂停不得阻塞其他任务。
 4. 对每个可处理任务，先读取完整 Jira 原始需求与全部附件本体：完整性校验失败时该任务不得进入 GitNexus 调研或分发。需求快照临时保存于 `.runtime/requirements/<实际-task-id>/`；图片在 Markdown 中保留 OCR 文本与语义描述，其他附件保留原件并由 Markdown 索引相对路径、SHA-256 与可读性状态。随后由外部子 Agent 进行一次跨项目、只读的 GitNexus 远程调研，不创建 worktree；报告返回候选、证据和排除理由。再将报告与实际任务标题/描述、子任务负责人、父产品需求、参考方案人员分工及 `repos`、`branches` 描述联合决策仓库、租户和基础分支。同一 Jira 实际任务命中多个项目或租户时，保留同一个 `task_id`，但展开为多条 tenant assignment；例如 saasoanew 的九讯云（智乐方）与易腾各一条，oanew 与 saasoanew 同时命中时也各一条。项目配置的 `branch_priority` 优先于普通分支候选，例如项目内同时命中九机与九讯云（智乐方）时选择 `release_saas`。
-5. 将外部已决策任务写为 `version: 1` 的决策 JSON，运行 `decide --input decision.json`。该命令只校验显式项目/分支是否属于当前配置并输出规范化任务，不调用 Jira、GitNexus 或 Orca，也不写分发状态。若输出 `needs_confirmation`，仅暂停对应任务并补充人工决策后重跑；绝不以候选顺序猜测项目或分支。
+5. 通过 `decide` 校验外部联合决策：可以使用单任务 CLI 参数直接传入 `dispatch-flow direct` 与 `source-task-id`，也可以使用旧版 `--input`。禁止手工重建或删减字段；直接使用返回 JSON 的 `launch_input` 作为后续 `launch` 输入。该命令只校验显式项目/分支，不调用 Jira、GitNexus 或 Orca，也不写分发状态。若输出 `needs_confirmation`，仅暂停对应任务并补充人工决策后重跑；绝不以候选顺序猜测项目或分支。
 6. 将每个归档复制到最终 tenant worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`；将最终快照绝对路径写入 `requirement_snapshot_path`。GitNexus 调研报告先暂存于 `.runtime/research/<实际-task-id>-gitnexus.md`，同样在项目和分支锁定后迁移到最终 worktree。
 7. 将 `decide` 的 `launch_input` 中 selected 任务保存为 `tasks.json`；下游开发会话读取并复用报告，跳过已完成的 GitNexus 调研节点。展示汇总并取得 terminal 创建/发送确认后执行 `launch`。
 
@@ -112,7 +113,7 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 
 同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
-`decide` 输入的顶层必须是 `{ "version": 1, "tasks": [...] }`。任务必须有 `task_id`、`title`、`task_url`，并由外部编排器在调研和联合判断后显式填入 `repository`、`base_branch`；它只做配置白名单与分支可用性校验，既不请求 Jira/GitNexus，也不根据标题或描述自动选择。指定 `tenant` 的租户任务还必须提供各自 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
+`decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。指定 `tenant` 的租户任务还必须提供各自 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
 
 ## 布局与状态
 
