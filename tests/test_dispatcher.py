@@ -44,11 +44,17 @@ interaction:
   ask_batch_size: 4
 dispatch:
   agent: "claude"
+  agent_commands:
+    windows_pwsh: "claude"
+    windows_powershell: "claude"
+    macos: "claude"
+    linux: "claude"
   agent_extra_args: ""
   skill:
     command_templates:
+      direct: "/dev-spec-gen {{task_url}} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{{source_task_id}}；全自动执行，无需人员介入"
       separate: |
-        /dev-spec-gen {{task_url}} base_branch={{base_branch}} 在当前任务的worktree中进行工作
+        /dev-spec-gen {{task_url}} 当前工作区当前分支 标准开发流程；base_branch={{base_branch}}；在当前任务的worktree中进行工作
         - 任务编号：{{task_id}}
         - 任务标题：“{{title}}”
         - 任务描述：“{{description}}”
@@ -451,8 +457,88 @@ class DispatcherTests(unittest.TestCase):
                 "query": "status = 待开发",
                 "jql_source": "config",
                 "flow": "complete",
-                "next_steps": ["拉取完整需求与附件", "执行需求/GitNexus 调研", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"],
+                "dispatch_flow": "complete",
+                "proposal_command": None,
+                "jql_semantics": "native_jql_then_parent_post_filter",
+                "parent_lookup": {"relation": "parent", "field": "customfield_11103", "required": True},
+                "post_filter": "child.reference_plan 非空 OR parent.reference_plan 非空",
+                "next_steps": ["执行独立 Jira 节点并归档完整需求与附件", "执行独立 GitNexus 调研节点", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"],
             })
+
+    def test_task_source_proposal_uses_independent_jira_and_research_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+
+            result = dispatcher.task_source_prompt(config, flow="proposal")
+
+            self.assertEqual(result["dispatch_flow"], "proposal")
+            self.assertEqual(result["proposal_command"], "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}")
+            self.assertEqual(result["jql_semantics"], "native_jql_then_parent_post_filter")
+            self.assertEqual(result["parent_lookup"]["relation"], "parent")
+            self.assertIn("parent.reference_plan", result["post_filter"])
+            self.assertIn("独立 Jira 节点", " ".join(result["next_steps"]))
+            self.assertIn("独立 GitNexus", " ".join(result["next_steps"]))
+            self.assertIn("独立 GitNexus 调研节点", " ".join(result["next_steps"]))
+
+    def test_proposal_command_only_contains_jira_url_and_snapshot_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            repository_path.mkdir(parents=True)
+            config = write_config(root, projects)
+            snapshot_path = worktree_path / "docs" / "engineering" / "specs" / "2026-09-09-test-raw-requirements.md"
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "不应下发的标题", "https://jira.example/XSWL-1", "不应下发的正文"),
+                repository="repo-a",
+                repository_path=repository_path,
+                base_branch="main",
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
+                dispatch_flow="proposal",
+            )
+
+            command = dispatcher.command_for(config, item, "separate")
+
+            self.assertEqual(command, f"/dev-spec-gen 出具开发方案 https://jira.example/XSWL-1 {snapshot_path.resolve().as_posix()}")
+            self.assertNotIn("不应下发", command)
+
+    def test_assignment_rejects_unknown_dispatch_flow(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "dispatch_flow 必须"):
+            dispatcher.Assignment.from_dict({
+                "task_id": "XSWL-1",
+                "title": "测试",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "repo-a",
+                "repository_path": "D:/repo-a",
+                "base_branch": "main",
+                "dispatch_flow": "unknown",
+            })
+
+    def test_direct_command_preserves_source_task_and_falls_back_to_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            (repository / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            for source, expected in (("CHILD-2", "CHILD-2"), (None, "PARENT-1")):
+                with self.subTest(source=source):
+                    item = dispatcher.Assignment(
+                        task=dispatcher.Task("PARENT-1", "测试", "https://jira.example/PARENT-1"),
+                        repository="mapped", repository_path=repository, base_branch=None,
+                        source_task_id=source, dispatch_flow="direct",
+                    )
+                    command = dispatcher.command_for(config, item, "separate")
+                    self.assertIn("https://jira.example/PARENT-1", command)
+                    self.assertIn(f"当前实际开发任务：{expected}", command)
+                    self.assertNotIn("当前实际开发任务", dispatcher.command_for(
+                        config, assignment("PARENT-1", "mapped", repository), "separate",
+                    ))
 
     def test_task_source_rejects_unknown_prompt_variable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -537,6 +623,10 @@ class DispatcherTests(unittest.TestCase):
             prompt = dispatcher.task_source_prompt(dispatcher.load_config(config_path))["fetch_prompt"]
             session_prompt = dispatcher.task_source_prompt(dispatcher.load_config(config_path))["session_prompt"]
 
+        self.assertIn("用户提供的内容可能是伪 SQL 或伪 JQL", prompt)
+        self.assertIn("交给 Jira 原生解析器校验", prompt)
+        self.assertIn("通过校验后才执行查询", prompt)
+        self.assertIn("解析、转换或原生校验失败时停止", prompt)
         self.assertIn("task_id（事项唯一标识）、title（标题）和 assignee", prompt)
         self.assertIn("父任务解析", prompt)
         self.assertIn("source_task_id、source_assignee", prompt)
@@ -557,10 +647,19 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("可省略 reference_plan", prompt)
         self.assertIn("branch_priority", prompt)
         self.assertNotIn("created", prompt)
+        self.assertIn("当前会话完成", session_prompt)
+        self.assertIn("不通过 Orca 编排创建或打开新的 Agent 会话", session_prompt)
+        self.assertIn("仅最终 launch 阶段使用 Orca", session_prompt)
         self.assertIn("worktree_path", session_prompt)
         self.assertIn("GitNexus 调研报告必须先从 gitnexus_report_path", session_prompt)
-        self.assertIn("完整技能正文", session_prompt)
-        self.assertIn("worktree.py --help", session_prompt)
+        self.assertIn("工具边界：需要打开 Claude terminal、并发分发或恢复会话时使用 Orca", session_prompt)
+        self.assertIn("只需要创建 worktree 或运行 dev-spec-gen CLI 时不使用 Orca", session_prompt)
+        self.assertIn("先用 dev-spec-gen 创建/复用 worktree，再用 Orca 绑定该 worktree 启动 terminal", session_prompt)
+        self.assertIn("不得在调用 worktree CLI 前询问、要求用户提供或自行猜测 worktree_path", session_prompt)
+        self.assertIn("Dispatch capability is invalid", session_prompt)
+        self.assertIn("不等于本地 dev-spec-gen worktree CLI 失败", session_prompt)
+        self.assertIn("只有 dev-spec-gen 技能缺失、CLI 执行失败", session_prompt)
+        self.assertIn("重试时创建新的有效 Orca dispatch", session_prompt)
         self.assertIn("orca worktree create", session_prompt)
         self.assertIn("status=success", session_prompt)
         self.assertNotIn("jira.9ji.com", prompt)

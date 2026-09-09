@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import string
 import subprocess
 import sys
@@ -98,10 +99,11 @@ SHELL_PROMPT_PATTERN = re.compile(
     r"(?:^|\n)(?:PS [^\n>]+>|(?:[A-Za-z]:)?[\\/][^\n>]*>|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\n$#]*[$#])\s*\Z"
 )
 TASK_STATUSES = frozenset({"launching", "dispatched", "requires_manual_reset"})
-COMMAND_TEMPLATE_FIELDS = frozenset({"task_url", "task_id", "base_branch"})
+DISPATCH_FLOWS = frozenset({"direct", "complete", "proposal"})
+COMMAND_TEMPLATE_FIELDS = frozenset({"task_url", "task_id", "base_branch", "requirement_snapshot_path"})
 TASK_CONTEXT_TEMPLATE_FIELDS = frozenset({
     "title", "description", "assignee", "tenant", "assignment_id",
-    "reference_plan", "gitnexus_report_path", "requirement_snapshot_path",
+    "reference_plan", "gitnexus_report_path", "requirement_snapshot_path", "source_task_id",
 })
 COMMAND_TEMPLATE_ALLOWED_FIELDS = COMMAND_TEMPLATE_FIELDS | TASK_CONTEXT_TEMPLATE_FIELDS
 CLAUDE_AUTHORIZATION_ACCEPT = "Yes, I accept"
@@ -192,6 +194,7 @@ class Assignment:
     parent_assignee: str | None = None
     gitnexus_report_path: Path | None = None
     requirement_snapshot_path: Path | None = None
+    dispatch_flow: str = "complete"
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Assignment":
@@ -200,6 +203,7 @@ class Assignment:
             "base_branch", "worktree_path", "reference_plan", "assignee", "tenant", "tenant_slug", "assignment_id",
             "source_task_id", "source_assignee", "parent_task_id", "parent_assignee", "gitnexus_report_path",
             "requirement_snapshot_path",
+            "dispatch_flow",
         }
         if unknown_fields:
             raise DispatcherError("invalid_input", f"任务包含未知字段：{sorted(unknown_fields)[0]}")
@@ -245,6 +249,9 @@ class Assignment:
         snapshot_value = requirement_snapshot_path.strip() if isinstance(requirement_snapshot_path, str) else None
         if snapshot_value is not None and not Path(snapshot_value).is_absolute():
             raise DispatcherError("invalid_input", "requirement_snapshot_path 必须是绝对路径")
+        dispatch_flow = require_text(value.get("dispatch_flow", "complete"), "dispatch_flow")
+        if dispatch_flow not in DISPATCH_FLOWS:
+            raise DispatcherError("invalid_input", "dispatch_flow 必须是 direct、complete 或 proposal")
         return cls(
             task=Task.from_dict(value),
             repository=require_text(value.get("repository"), "repository"),
@@ -261,6 +268,7 @@ class Assignment:
             parent_assignee=parent_assignee,
             gitnexus_report_path=Path(report_value) if report_value is not None else None,
             requirement_snapshot_path=Path(snapshot_value) if snapshot_value is not None else None,
+            dispatch_flow=dispatch_flow,
         )
 
     @property
@@ -288,6 +296,7 @@ class Assignment:
             "parent_assignee": self.parent_assignee,
             "gitnexus_report_path": self.gitnexus_report_path.as_posix() if self.gitnexus_report_path else None,
             "requirement_snapshot_path": self.requirement_snapshot_path.as_posix() if self.requirement_snapshot_path else None,
+            "dispatch_flow": self.dispatch_flow,
         }
 
 
@@ -558,7 +567,15 @@ def load_config(config_file: Path) -> Config:
         mode: require_text(command_templates.get(mode), f"dispatch.skill.command_templates.{mode}")
         for mode in ("separate", "split")
     })
-    for template in template_values.values():
+    direct_template = require_text(
+        command_templates.get("direct", "/dev-spec-gen {task_url}"),
+        "dispatch.skill.command_templates.direct",
+    )
+    proposal_template = require_text(
+        command_templates.get("proposal", "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"),
+        "dispatch.skill.command_templates.proposal",
+    )
+    for template in (*template_values.values(), direct_template, proposal_template):
         validate_command_template(template)
 
     shell_commands = require_mapping(terminal.get("shell_commands"), "dispatch.terminal.shell_commands")
@@ -569,6 +586,18 @@ def load_config(config_file: Path) -> Config:
         agent_extra_args = ""
     if not isinstance(agent_extra_args, str):
         raise DispatcherError("invalid_config", "dispatch.agent_extra_args 必须是字符串")
+    agent_commands = dispatch.get("agent_commands")
+    if agent_commands is None:
+        agent_command = require_text(dispatch.get("agent"), "dispatch.agent")
+    else:
+        agent_commands = require_mapping(agent_commands, "dispatch.agent_commands")
+        if os.name == "nt":
+            agent_key = "windows_pwsh" if shutil.which("pwsh.exe") else "windows_powershell"
+        elif sys.platform == "darwin":
+            agent_key = "macos"
+        else:
+            agent_key = "linux"
+        agent_command = require_text(agent_commands.get(agent_key), f"dispatch.agent_commands.{agent_key}")
 
     return Config(
         root=root,
@@ -596,8 +625,8 @@ def load_config(config_file: Path) -> Config:
             require_text(name, "task_source.flows 键"): require_mapping(value, f"task_source.flows.{name}")
             for name, value in task_source_flows.items()
         }),
-        agent_command=require_text(dispatch.get("agent"), "dispatch.agent"),
-        command_templates=template_values,
+        agent_command=agent_command,
+        command_templates=MappingProxyType({**template_values, "direct": direct_template, "proposal": proposal_template}),
         layout_mode=layout_mode,
         session_prompt=require_text(session_prompt.get(layout_mode), f"task_source.session_prompt.{layout_mode}"),
         recovery_session_prompt=recovery_session_prompt,
@@ -1071,6 +1100,7 @@ class StateStore:
                 "parent_assignee": assignment.parent_assignee,
                 "gitnexus_report_path": assignment.gitnexus_report_path.as_posix() if assignment.gitnexus_report_path else None,
                 "requirement_snapshot_path": assignment.requirement_snapshot_path.as_posix() if assignment.requirement_snapshot_path else None,
+                "dispatch_flow": assignment.dispatch_flow,
                 "layout": plan.layout_mode,
                 "tab_title": plan.tab_title,
                 "pane_index": pane_index,
@@ -1477,13 +1507,16 @@ def task_context_values(assignment: Assignment) -> Mapping[str, str]:
         "reference_plan": safe_task_context_value(assignment.reference_plan or ""),
         "gitnexus_report_path": assignment.gitnexus_report_path.resolve().as_posix() if assignment.gitnexus_report_path else "",
         "requirement_snapshot_path": assignment.requirement_snapshot_path.resolve().as_posix() if assignment.requirement_snapshot_path else "",
+        "dispatch_flow": assignment.dispatch_flow,
+        "source_task_id": require_command_argument(assignment.source_task_id or assignment.task.task_id, "source_task_id"),
     }
 
 
 def command_for(config: Config, assignment: Assignment, layout_mode: str = "split", recovery: bool = False) -> str:
-    template = config.command_templates.get(layout_mode)
+    template_key = "proposal" if assignment.dispatch_flow == "proposal" else "direct" if assignment.dispatch_flow == "direct" else layout_mode
+    template = config.command_templates.get(template_key)
     if template is None:
-        raise DispatcherError("invalid_config", f"未配置 {layout_mode} 分发命令模板")
+        raise DispatcherError("invalid_config", f"未配置 {template_key} 分发命令模板")
     values = {
         "task_url": assignment.task.task_url,
         "task_id": require_command_argument(assignment.task.task_id, "task_id"),
@@ -1627,7 +1660,7 @@ def retry_send(orca: OrcaClient, handle: str, config: Config, text: str) -> None
 
 def bootstrap_agent(orca: OrcaClient, handle: str, config: Config, resume: bool = False) -> None:
     retry_ready_wait(orca, handle, config)
-    command = f"{config.agent_command} --continue" if resume else config.agent_command
+    command = agent_command_for(config, resume=resume)
     retry_send(orca, handle, config, command)
     retry_ready_wait(orca, handle, config, resend_command=command)
 
@@ -1697,10 +1730,20 @@ def split_parent_snapshot(
     return parent
 
 
-def agent_command_for(config: Config) -> str:
-    if not config.agent_extra_args.strip():
+def agent_command_for(config: Config, resume: bool = False) -> str:
+    arguments = " ".join(
+        value for value in (config.agent_extra_args.strip(), "--continue" if resume else "") if value
+    )
+    if "{agent_args}" in config.agent_command:
+        return config.agent_command.replace("{agent_args}", f" {arguments}" if arguments else "")
+    if not arguments:
         return config.agent_command
-    return f"{config.agent_command} {config.agent_extra_args.strip()}"
+    marker = "claude"
+    position = config.agent_command.find(marker)
+    if position < 0:
+        return f"{config.agent_command} {arguments}"
+    end = position + len(marker)
+    return f"{config.agent_command[:end]} {arguments}{config.agent_command[end:]}"
 
 
 TERMINAL_HANDLE_TIMEOUT_MARKER = "Timed out waiting for terminal handle"
@@ -2088,6 +2131,7 @@ def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
         "tenant_slug": value.get("tenant_slug", "legacy"),
         "gitnexus_report_path": value.get("gitnexus_report_path"),
         "requirement_snapshot_path": value.get("requirement_snapshot_path"),
+        "dispatch_flow": value.get("dispatch_flow", "complete"),
         "worktree_path": value.get("worktree_path") if value.get("layout") == "separate" else None,
     })
 
@@ -2225,7 +2269,7 @@ def recover(
                 if (
                     snapshot.connected
                     and snapshot.writable
-                    and snapshot.agent_identity == config.agent_command.split(maxsplit=1)[0]
+                    and snapshot.agent_identity == "claude"
                 ):
                     store.mark_recovered(stored_task_id, snapshot, "native_recovered")
                     recovered_snapshots[stored_task_id] = snapshot
@@ -2349,7 +2393,7 @@ def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
     decision_fields = {
         "task_id", "title", "description", "task_url", "assignee", "tenant", "tenant_slug",
         "source_task_id", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan",
-        "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_path",
+        "dispatch_flow",        "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_path",
     }
     unknown_fields = set(raw) - {"version", "tasks"}
     if unknown_fields:
@@ -2580,18 +2624,32 @@ def task_source_prompt(
     flow: str | None = None,
 ) -> dict[str, object]:
     selected_flow = flow or "complete"
-    if selected_flow not in {"direct", "complete"}:
-        raise DispatcherError("invalid_input", "flow 必须是 direct 或 complete")
+    if selected_flow not in DISPATCH_FLOWS:
+        raise DispatcherError("invalid_input", "flow 必须是 direct、complete 或 proposal")
     configured_flow = config.task_source_flows.get(selected_flow)
     if configured_flow is not None and not isinstance(configured_flow.get("next_steps"), list):
         raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是列表")
     next_steps = configured_flow.get("next_steps") if configured_flow else None
     if not next_steps:
-        next_steps = (
-            ["拉取任务", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
-            if selected_flow == "direct"
-            else ["拉取完整需求与附件", "执行需求/GitNexus 调研", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
-        )
+        if selected_flow == "direct":
+            next_steps = [
+                "根据实际任务编号和标题提炼语义 slug",
+                "创建或复用对应 worktree",
+                "在该 worktree 启动开发会话",
+                "仅将 Jira 地址和 direct 开发指令交给实际任务",
+            ]
+        elif selected_flow == "proposal":
+            next_steps = [
+                "执行独立 Jira 节点并归档完整需求与附件",
+                "执行独立 GitNexus 调研节点",
+                "联合确定项目、租户与基础分支",
+                "查找任一基础分支下同名 linked worktree",
+                "不存在时调用 dev-spec-gen worktree CLI 创建或复用",
+                "生成 version=1 decide 输入",
+                "通过 Orca 绑定 worktree 并分发开发方案",
+            ]
+        else:
+            next_steps = ["执行独立 Jira 节点并归档完整需求与附件", "执行独立 GitNexus 调研节点", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
     if not all(isinstance(step, str) and step.strip() for step in next_steps):
         raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是非空字符串列表")
     query = config.task_source_query if query_override is None else require_text(query_override, "jql")
@@ -2604,8 +2662,16 @@ def task_source_prompt(
     if unknown:
         raise DispatcherError("invalid_config", f"task_source.fetch_prompt 包含未知变量：{sorted(unknown)[0]}")
     prompt = config.fetch_prompt
-    for name, value in variables.items():
-        prompt = prompt.replace(f"{{{{{name}}}}}", value)
+    if selected_flow == "direct":
+        prompt = (
+            "使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。\n"
+            "查询条件（真实 Jira JQL，必须原样使用）：\n"
+            f"{query}\n"
+            "不要读取 Jira 详情、父需求、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。"
+        )
+    else:
+        for name, value in variables.items():
+            prompt = prompt.replace(f"{{{{{name}}}}}", value)
     return {
         "type": config.task_source_type,
         "fetch_prompt": prompt,
@@ -2616,6 +2682,11 @@ def task_source_prompt(
         "query": query,
         "jql_source": "cli" if query_override is not None else "config",
         "flow": selected_flow,
+        "dispatch_flow": selected_flow,
+        "proposal_command": config.command_templates.get("proposal") if selected_flow == "proposal" else None,
+        "jql_semantics": "native_jql_then_parent_post_filter",
+        "parent_lookup": {"relation": "parent", "field": config.reference_plan_field, "required": True},
+        "post_filter": "child.reference_plan 非空 OR parent.reference_plan 非空",
         "next_steps": list(next_steps),
     }
 
@@ -2649,7 +2720,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--force-unlock", action="store_true")
     task_source_parser = commands.add_parser("task-source", help="输出已渲染的任务获取提示词")
     task_source_parser.add_argument("--jql", help="仅本次运行覆盖配置中的 JQL")
-    task_source_parser.add_argument("--flow", choices=("direct", "complete"), required=True, help="用户选择的任务流程")
+    task_source_parser.add_argument("--flow", choices=("direct", "complete", "proposal"), required=True, help="用户选择的任务流程")
     decide_parser = commands.add_parser(
         "decide",
         help="校验外部调研后的项目与分支决策",

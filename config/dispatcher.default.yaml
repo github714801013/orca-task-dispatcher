@@ -30,14 +30,22 @@ task_source:
   type: "prompt"
   task_url_template: "https://jira.9ji.com/{task_id}"
   # 可按需在 query 中追加 reference_plan_field 的 IS NOT EMPTY 过滤，只拉取有参考方案的任务。
-  query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser() AND customfield_11103 IS NOT EMPTY"
-  # Jira 中“参考方案”字段的实际字段 ID 或字段名。
+  query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()"
+  # Jira 节点先执行合法基础 JQL，再按 parent key 读取父需求字段并后置过滤；不得伪造父字段 JQL。
+  # proposal 流程由独立 Jira 节点和独立调研节点分别参考 dev-spec-gen 后执行。
+  flows:
+    proposal:
+      next_steps: ["独立 Jira 节点归档完整需求与附件", "独立 GitNexus 调研节点执行只读调研", "联合确定项目、租户与基础分支", "查找任一基础分支下同名 worktree", "不存在时调用 dev-spec-gen worktree CLI", "通过 Orca 绑定 worktree 分发开发方案"]
   reference_plan_field: customfield_11103
   fetch_prompt: |
     使用当前环境可用的任务查询工具获取开发任务。
 
     查询条件（JQL）必须原样使用以下内容，严禁修改：
     {{query}}
+
+    用户提供的内容可能是伪 SQL 或伪 JQL；Jira 节点必须先参考 dev-spec-gen 公开 CLI 契约分析查询语法，识别是否为伪 JQL。
+    若是伪 JQL，先转换为当前 Jira 实例支持的正确原生 JQL；随后必须把转换后的 JQL 原样交给 Jira 原生解析器校验，通过校验后才执行查询。
+    若不是伪 JQL，也必须先交给 Jira 原生解析器校验后再执行。解析、转换或原生校验失败时停止，不得把未经校验的输入交给 Jira，不得猜测修正。
 
     查询对象只能是开发任务。禁止把查询类型改为 产品需求 或任何其他类型；
     产品需求只能作为已查询到任务的父任务获取，绝不直接作为查询条件。
@@ -46,6 +54,7 @@ task_source:
     必须返回真实查询结果，禁止猜测。每个任务必须包含 task_id（事项唯一标识）、title（标题）和 assignee（当前负责人显示名称）。
 
     参考方案字段：配置值为 {{reference_plan_field}}。若配置为具体 Jira 字段（customfield ID 或字段名），读取其内容并在非空时映射为 reference_plan；
+    子任务和父需求的参考方案采用 `子任务字段非空 OR 父需求字段非空` 后置过滤；原生 JQL 不支持父项字段 join 时，不得伪造“父需求的 cf”语法。
     字段未配置、读取失败或值为空时可省略 reference_plan，继续后续流程；不得伪造字段值。
 
     任务获取阶段先读取完整原始需求与全部附件本体；原件保存或 SHA-256 校验失败时，标记 incomplete 并阻断后续 GitNexus 调研和分发。
@@ -83,9 +92,18 @@ task_source:
     调研报告先暂存于 `<root>/.runtime/research/<实际-task-id>-gitnexus.md`。项目和基础分支确定后，separate 和 split 均须先由统一 worktree CLI 创建/复用对应租户 worktree，再写入 launch 输入。
   session_prompt:
     separate: |
-      项目和分支已由任务报告与联合证据确认后，必须先读取并核验 dev-spec-gen 的完整技能正文，
-      再运行其统一 worktree CLI 的 `worktree.py --help`；不得仅依据技能名称或元数据推断用法。
-      必须使用 dev-spec-gen 的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
+      # 任务查询、Jira 归档、调研、路由和 worktree 准备均在当前会话完成；仅最终 launch 阶段使用 Orca 绑定并启动 Claude terminal。
+      # 不通过 Orca 编排创建或打开新的 Agent 会话。
+      dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
+      不得使用 rg、目录扫描或其他方式查找 skill 文件；读取固定 SKILL.md 后，只能通过 dev-spec-gen 提供的 CLI 入口获取其他信息。
+      先运行公开 CLI 的 `--help`，再严格按成功 JSON stdout 中的 `next`、公开路径和交接字段继续；不得猜测参数、读取其他内部文件或执行未由 CLI 返回的命令。
+      工具边界：需要打开 Claude terminal、并发分发或恢复会话时使用 Orca；只需要创建 worktree 或运行 dev-spec-gen CLI 时不使用 Orca；两者都需要时，必须先用 dev-spec-gen 创建/复用 worktree，再用 Orca 绑定该 worktree 启动 terminal。
+      路由确认（项目、租户、基础分支）完成后，必须按以下顺序执行：读取固定的全局 dev-spec-gen/SKILL.md → 运行公开 worktree CLI 的 --help → 调用 worktree CLI → 校验独立纯 JSON status=success → 使用其返回的绝对路径。
+      不得在调用 worktree CLI 前询问、要求用户提供或自行猜测 worktree_path；worktree_path 必须由 dev-spec-gen CLI 创建/复用后返回。
+      Orca 的 ask/orchestration 返回 `Dispatch capability is invalid` 或其他通信失败，只标记为 Orca 编排通信失败，不等于本地 dev-spec-gen worktree CLI 失败；项目、租户、分支已唯一确定时不得因此阻断本地 CLI。
+      只有 dev-spec-gen 技能缺失、CLI 执行失败、输出不是独立纯 JSON、返回路径不是有效 linked worktree，或路由本身无法唯一确定时才暂停。
+      重试时创建新的有效 Orca dispatch，或在当前会话直接执行 Dispatcher 规定的本地 worktree CLI；不得继续使用失效的 dispatch capability。
+      必须使用 dev-spec-gen 公开的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
       仅当 CLI 返回 status=success 的独立纯 JSON stdout 时，才能将其中返回的绝对路径写入 worktree_path；失败输出、混合日志或自行推导的路径均不得使用。
       GitNexus 调研报告必须先从 gitnexus_report_path 读取并校验；报告有效时复用结论并跳过 GitNexus 调研节点。
       separate 终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
@@ -93,9 +111,15 @@ task_source:
       worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发需求编号。
       任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动；这不等同于任务或分发失败，等待补充有效路径或人工处理。
     split: |
+      # 任务查询、Jira 归档、调研、路由和 worktree 准备均在当前会话完成；仅最终 launch 阶段使用 Orca 绑定并启动 Claude terminal。
+      # 不通过 Orca 编排创建或打开新的 Agent 会话。
+      dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
+      不得使用 rg、目录扫描或其他方式查找 skill 文件；读取固定 SKILL.md 后，只能通过 dev-spec-gen 提供的 CLI 入口获取其他信息。
+      先运行公开 CLI 的 `--help`，再严格按成功 JSON stdout 中的 `next`、公开路径和交接字段继续；不得猜测参数、读取其他内部文件或执行未由 CLI 返回的命令。
       当前任务已绑定租户独立 worktree。必须复用该路径，不得新建或推断其他 worktree。
     recovery: |
-      这是恢复会话。先检查已有工作区、分支和产物；确认状态后继续任务，不要重复初始化或覆盖已有成果。
+      这是恢复会话。先通过公开 CLI 检查已有工作区、分支和产物；禁止直接读取、搜索或扫描 dev-spec-gen skill 目录及其内部文件。
+      仅按 CLI 成功 JSON stdout 的公开交接字段继续任务，不要重复初始化或覆盖已有成果。
   max_tasks: 12
 
 interaction:
@@ -106,15 +130,24 @@ interaction:
   allow_other: true
 
 dispatch:
-  agent: "claude"
-  # 可选：跳过工具权限弹窗（如 uv run 确认），避免任务命令被权限确认阻塞。
-  agent_extra_args: ""
+  agent_commands:
+    windows_pwsh: 'pwsh.exe -NoLogo -NoProfile -NoExit -Command "& claude{agent_args}"'
+    windows_powershell: 'powershell.exe -NoLogo -NoProfile -NoExit -Command "& claude{agent_args}"'
+    macos: "/bin/zsh -ilc 'exec claude{agent_args}'"
+    linux: "/bin/bash -ilc 'exec claude{agent_args}'"
+  # 可选：兼容旧配置时使用 dispatch.agent；未配置 agent_commands 时生效。
+  # 跳过 Claude 工具权限弹窗，避免任务命令被权限确认阻塞。
+  agent_extra_args: "--dangerously-skip-permissions"
   skill:
     # 命令模板必须以 /dev-spec-gen 开头；任务上下文字段与命令合并为同一提示词。
     # 不要在模板中追加其他 slash command 或改变 /dev-spec-gen 的开头位置。
     command_templates:
-      separate: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+      # 已确认的 launch 阶段才使用 Orca 绑定 worktree 并启动 Claude terminal；前置任务在当前会话完成。
+      # Windows 优先 pwsh.exe，未安装时回退 powershell.exe；macOS 使用 zsh，Linux 使用 bash。
+      direct: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
+      separate: "/dev-spec-gen {task_url} 当前工作区当前分支 标准开发流程；base_branch={base_branch}；在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
       split: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务 worktree 中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+      proposal: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
   layout:
     group_by: "repository"
     max_panes_per_tab: 4

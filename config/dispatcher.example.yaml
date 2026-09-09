@@ -1,22 +1,75 @@
-# 仅配置不同电脑上的项目根目录与项目相对路径；其余配置由 dispatcher.default.yaml 托管。
 version: 1
 
+# 默认会使用 --dangerously-skip-permissions；用户可在 dispatcher.yaml 中将 dispatch.agent_extra_args 覆盖为空字符串。
+# proposal 的 Jira 节点使用 native_jql_then_parent_post_filter，父需求字段由 Jira 工具读取后再过滤。
 workspace:
-  projects_root: "/path/to/projects"
+  projects_root: "D:/workplace"
+
+  # 用户涉及项目；path 相对 projects_root，description 用于按任务描述自动匹配仓库，
+  # base_branches 是该项目可选基础分支（分支名: 分支描述，描述用于自动匹配）。
+  # CLI 仅使用此列表定位候选仓库。
   projects:
-    example-repository:
-      # 支持相对 projects_root 的路径，也支持越出 projects_root 的绝对仓库路径。
-      path: "example-repository"
-      # 可选：项目描述，用于按任务描述自动匹配仓库。
-      description: "示例业务系统"
-      # 可选：同一任务命中多个租户时，每个租户分别创建 worktree。
-      tenants:
-        example-tenant:
-          slug: "example-tenant"
-      # 可选：项目级分支优先规则；when_all 全部命中时优先指定分支。
+    after:
+      path: "java/9ji/oa-after/oa-after"
+      description: "售后业务系统；九机与九讯云（智乐方/易腾）共用项目时统一使用 SaaS 基线"
       branch_priority:
-        - when_all: ["tenant-a", "tenant-b"]
-          branch: "main"
-      # 基础分支（分支名: 分支描述，描述用于按任务描述自动匹配；纯字符串列表亦可）。
+        - when_all: ["九机", "九讯云"]
+          branch: "origin/release_saas"
+        - when_all: ["九机", "智乐方"]
+          branch: "origin/release_saas"
       base_branches:
-        main: "默认主分支"
+        origin/release_9ji: "九机"
+        origin/release_saas: "九讯云+易腾"
+    order:
+      path: "java/9ji/oa-order/oa-order"
+      description: "订单系统；九机与九讯云（智乐方/易腾）共用项目时统一使用 SaaS 基线"
+      branch_priority:
+        - when_all: ["九机", "九讯云"]
+          branch: "origin/release_saas"
+        - when_all: ["九机", "智乐方"]
+          branch: "origin/release_saas"
+      base_branches:
+        origin/release_9ji: "九机"
+        origin/release_saas: "九讯云+易腾"
+    oanew:
+      path: "C#/oanew"
+      description: "九机 OA 租户项目；与 saasoanew 为同类项目的不同租户拆分，同时命中时各自创建 worktree"
+      tenants:
+        九机:
+          slug: "jiuji"
+      base_branches:
+        master-new: "九机"
+    saasoanew:
+      path: "C#/saasoanew"
+      description: "九讯云（智乐方）与易腾 OA 租户项目；两个租户同时命中时必须分别创建两个 worktree；与 oanew 同时命中也分别创建 worktree"
+      tenants:
+        九讯云:
+          slug: "jiuxunyun"
+        智乐方:
+          slug: "zhilefang"
+        易腾:
+          slug: "yiteng"
+      base_branches:
+        master_depart: "九讯云"
+        master_depart_iteng: "易腾"
+    autotransfer:
+      path: "python/autoTransfer/autoTransfer"
+      description: "自动调拨系统"
+      base_branches:
+        master: "base分支"
+    stock:
+      path: "java/9ji/oa-stock/oa-stock"
+      description: "库存；九机与九讯云（智乐方）共用项目时统一使用 SaaS 基线"
+      branch_priority:
+        - when_all: ["九机", "九讯云"]
+          branch: "origin/release_saas"
+        - when_all: ["九机", "智乐方"]
+          branch: "origin/release_saas"
+      base_branches:
+        origin/release_9ji: "九机"
+        origin/release_saas: "九讯云+易腾"
+    logistic:
+      path: "java/9ji/logistics/logistics"
+      description: "物流"
+      base_branches:
+        master: "base分支"

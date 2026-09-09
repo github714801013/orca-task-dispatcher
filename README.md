@@ -21,6 +21,12 @@ config/dispatcher.yaml          # 用户覆盖配置，已忽略，不提交
 
 用户覆盖按 mapping 递归合并；标量和 `null` 直接覆盖，列表整体替换。显式 `--config <path>` 仍可加载完整旧配置文件。
 
+后续任务分发在当前会话内完成：当前会话直接执行任务查询、Jira 需求归档、调研、路由判断和 worktree 准备，不通过 Orca 编排创建或打开新的 Agent 会话；仅在最终已确认的 `launch` 阶段，才使用 Orca 绑定 worktree 并启动目标 Claude terminal。
+
+`task-source --jql` 传入的内容可能是伪 SQL 或伪 JQL。独立 Jira 节点必须先分析查询语法；识别为伪 JQL 时先转换为当前 Jira 实例支持的原生 JQL，再将转换结果交给 Jira 原生解析器校验，校验通过后才能执行。原生 JQL 也必须经过 Jira 原生解析器校验，任何解析、转换或校验失败都不得执行查询。
+
+`task-source --flow proposal` 用于出具开发方案：独立 Jira 节点先按 dev-spec-gen 规范取得真实 JQL 并归档完整需求/附件，独立调研节点再按同一规范执行 GitNexus 只读调研；路由确认后查找任一基础分支下同名 worktree，不存在才调用 dev-spec-gen CLI，最终发送 `/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}`。Jira 节点输出 `jql_semantics=native_jql_then_parent_post_filter`、`parent_lookup` 和 `post_filter` 交接字段；父需求字段不可用原生 JQL join 伪造。
+
 ```bash
 uv sync
 cp config/dispatcher.example.yaml config/dispatcher.yaml
@@ -31,15 +37,16 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 随后在用户覆盖配置中填写：
 
 - `workspace.projects_root` 和 `workspace.projects`；项目可配置 `description`、`tenants` 与项目级 `branch_priority`。同一 Jira 任务命中多个租户时，每个租户必须输出独立 assignment 和 worktree；分支规则只在所属项目内生效
+- `dispatch.agent_commands`：按平台选择 Claude 启动包装命令。Windows 优先使用可用的 `pwsh.exe`，否则使用 `powershell.exe`；macOS 使用 `/bin/zsh -ilc 'exec claude'`；Linux 使用 `/bin/bash -ilc 'exec claude'`。`dispatch.terminal.shell_commands` 仅用于普通 shell 和 split pane，不控制 separate 布局中的 Claude 启动命令。separate 与 direct 均使用当前工作区当前分支；direct 使用 `development_jira_spec(jira 参考方案驱动流程开发`，并要求全自动执行、无需人员介入；旧配置仍可使用 `dispatch.agent`。
 - `base_branch.options`
 - `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；字段未配置或值为空时可省略 `reference_plan`，不得伪造字段值
-- 需要时的 `dispatch.skill.command_templates`；提示词整体只按该模板渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务信息不下发
+- 需要时的 `dispatch.skill.command_templates`；提示词整体只按该模板渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身；direct 模板额外通过 `{source_task_id}` 下发原始开发子任务编号，缺省时回退到 `{task_id}`，供实际开发任务按需读取子任务中的仓库方案
 
 `config/dispatcher.yaml` 与根目录 `config.yml` 都是本地文件，已被忽略，**不要提交**。不要在配置或任务输入中保存令牌、密码、Cookie、内部域名、内部路径或运行状态。
 
 ## 权限与信任目录
 
-Dispatcher 以 `claude` 启动任务会话，可通过 `dispatch.agent_extra_args` 配置为 `--dangerously-skip-permissions` 跳过工具权限弹窗，避免任务命令被权限确认阻塞。
+Dispatcher 在最终 `launch` 阶段按操作系统选择 `dispatch.agent_commands` 启动 Claude：Windows 优先 `pwsh.exe -NoLogo -NoProfile -NoExit -Command "& claude"`，未安装时使用 `powershell.exe -NoLogo -NoProfile -NoExit -Command "& claude"`；macOS 使用 `/bin/zsh -ilc 'exec claude'`；Linux 使用 `/bin/bash -ilc 'exec claude'`。默认 `dispatch.agent_extra_args` 为 `--dangerously-skip-permissions`，用于跳过 Claude 工具权限弹窗；可在用户配置中覆盖为空字符串或其他参数。旧配置仍可使用 `dispatch.agent`。
 
 首次使用前，需要把项目根目录加入 Claude Code 的信任目录，否则创建 worktree 等命令可能因权限确认无法送达：
 
@@ -99,7 +106,9 @@ GitNexus 调研发生在“实际任务归一化、state 校验”之后和项�
 uv run --project . python scripts/dispatcher.py launch --input tasks.json
 ```
 
-`worktree_path` 仅适用于 `separate` 布局，并且必须是源仓库已登记的 linked worktree；任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动，这不等同于任务或分发失败，等待补充有效路径或人工处理。`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
+`worktree_path` 由 dev-spec-gen 统一 worktree CLI 在路由确认后创建或复用并返回；调用该 CLI 前不得询问、要求用户提供或自行猜测路径。若 Orca orchestration 返回 `Dispatch capability is invalid`，只标记为 Orca 编排通信失败；项目、租户、基础分支已明确时仍应继续本地 dev-spec-gen CLI。只有技能缺失、CLI 执行失败、输出不是独立纯 JSON success、返回路径不是有效 linked worktree，或路由无法唯一确定时才暂停。
+
+`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
 
 同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
