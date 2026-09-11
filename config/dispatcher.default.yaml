@@ -28,7 +28,7 @@ base_branch:
 
 task_source:
   type: "prompt"
-  task_url_template: "https://jira.9ji.com/{task_id}"
+  task_url_template: "https://jira.9ji.com/browse/{task_id}"
   # 可按需在 query 中追加 reference_plan_field 的 IS NOT EMPTY 过滤，只拉取有参考方案的任务。
   query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()"
   # Jira 节点先执行合法基础 JQL，再按 parent key 读取父需求字段并后置过滤；不得伪造父字段 JQL。
