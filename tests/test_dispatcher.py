@@ -34,8 +34,7 @@ task_source:
   query: "status = 待开发"
   fetch_prompt: "按 {{{{query}}}} 查询任务"
   session_prompt:
-    separate: "任务确认后直接创建或复用 worktree，并写入 worktree_path"
-    split: "新建该任务的 worktree"
+    complete: "任务确认后直接创建或复用 worktree，并写入 worktree_path"
     recovery: "这是恢复会话"
   task_url_template: "https://jira.example/{{task_id}}"
   max_tasks: 12
@@ -54,7 +53,7 @@ dispatch:
   skill:
     command_templates:
       direct: "/dev-spec-gen {{task_url}} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{{source_task_id}}；全自动执行，无需人员介入"
-      separate: |
+      complete: |
         /dev-spec-gen {{task_url}} 当前工作区当前分支 标准开发流程；base_branch={{base_branch}}；在当前任务的worktree中进行工作
         - 任务编号：{{task_id}}
         - 任务标题：“{{title}}”
@@ -65,25 +64,8 @@ dispatch:
         - 参考方案：“{{reference_plan}}”
         - GitNexus 调研报告：{{gitnexus_report_path}}（复用该报告并跳过 GitNexus 调研节点）
         - 完整原始需求快照：{{requirement_snapshot_path}}（先读此快照，再按其相对路径读取正文与附件本体）
-      split: |
-        /dev-spec-gen {{task_url}} base_branch={{base_branch}} 新建worktree进行工作
-        - 任务编号：{{task_id}}
-        - 任务标题：“{{title}}”
-        - 任务描述：“{{description}}”
-        - 负责人：“{{assignee}}”
-        - 租户：“{{tenant}}”
-        - 分发标识：{{assignment_id}}
-        - 参考方案：“{{reference_plan}}”
-        - GitNexus 调研报告：{{gitnexus_report_path}}（复用该报告并跳过 GitNexus 调研节点）
-        - 完整原始需求快照：{{requirement_snapshot_path}}（先读此快照，再按其相对路径读取正文与附件本体）
-  layout:
-    group_by: "repository"
-    max_panes_per_tab: 4
-    mode: "split"
+      proposal: "/dev-spec-gen 出具开发方案 {{task_url}} {{requirement_snapshot_path}}"
   terminal:
-    shell_commands:
-      windows: "cmd.exe /d /k"
-      posix: "sh -i"
     read_retry_attempts: 2
     read_retry_delay_ms: 1
     ready_retry_attempts: 3
@@ -97,14 +79,62 @@ dedup:
 """
 
 
-def write_config(root: Path, projects_root: Path, layout_mode: str = "split") -> dispatcher.Config:
+def write_config(root: Path, projects_root: Path) -> dispatcher.Config:
     config_path = root / "config" / "dispatcher.yaml"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
-        CONFIG.replace('mode: "split"', f'mode: "{layout_mode}"').format(projects_root=projects_root.as_posix()),
+        CONFIG.format(projects_root=projects_root.as_posix()),
         encoding="utf-8",
     )
     return dispatcher.load_config(config_path)
+
+
+def worktree_assignment(
+    projects: Path,
+    repository_path: Path,
+    task_id: str,
+    *,
+    branch: str | None = None,
+    dispatch_flow: str = "complete",
+    tenant: str = "legacy",
+    tenant_slug: str = "legacy",
+) -> dispatcher.Assignment:
+    """创建任务工作树与需求快照，返回可直接分发的 assignment。"""
+    worktree_path = projects / f"{repository_path.name}-{task_id}"
+    create_linked_worktree(repository_path, worktree_path)
+    snapshot_path = create_requirement_snapshot(worktree_path, task_id)
+    return dispatcher.Assignment(
+        task=dispatcher.Task(task_id, task_id, f"https://jira.example/{task_id}"),
+        repository="mapped",
+        repository_path=repository_path,
+        base_branch=branch,
+        tenant=tenant,
+        tenant_slug=tenant_slug,
+        worktree_path=worktree_path,
+        requirement_snapshot_path=snapshot_path,
+        dispatch_flow=dispatch_flow,
+    )
+
+
+def flow_worktree_assignment(
+    projects: Path,
+    repository_path: Path,
+    task_id: str,
+    dispatch_flow: str,
+) -> dispatcher.Assignment:
+    """同一任务的不同流程各自使用独立 linked worktree 与需求快照。"""
+    worktree_path = projects / f"{repository_path.name}-{task_id}-{dispatch_flow}"
+    create_linked_worktree(repository_path, worktree_path)
+    snapshot_path = create_requirement_snapshot(worktree_path, task_id)
+    return dispatcher.Assignment(
+        task=dispatcher.Task(task_id, task_id, f"https://jira.example/{task_id}"),
+        repository="mapped",
+        repository_path=repository_path,
+        base_branch=None,
+        worktree_path=worktree_path,
+        requirement_snapshot_path=snapshot_path,
+        dispatch_flow=dispatch_flow,
+    )
 
 
 def assignment(
@@ -114,6 +144,7 @@ def assignment(
     branch: str | None = None,
     worktree_path: Path | None = None,
     dispatch_flow: str = "complete",
+    requirement_snapshot_path: Path | None = None,
 ) -> dispatcher.Assignment:
     return dispatcher.Assignment(
         task=dispatcher.Task(task_id=task_id, title=task_id, task_url=f"https://jira.example/{task_id}"),
@@ -122,6 +153,7 @@ def assignment(
         base_branch=branch,
         worktree_path=worktree_path,
         dispatch_flow=dispatch_flow,
+        requirement_snapshot_path=requirement_snapshot_path,
     )
 
 
@@ -311,25 +343,6 @@ class FakeOrca:
             )
         return handle
 
-    def terminal_split(self, handle: str, direction: str, command: str) -> str:
-        self.operations.append((f"split-{direction}", f"{handle}:{command}"))
-        self._raise_if("split")
-        parent = self.snapshots[handle]
-        created_handle = self._handle()
-        self.snapshots[created_handle] = dispatcher.TerminalSnapshot(
-            handle=created_handle,
-            worktree_id=parent.worktree_id,
-            worktree_path=parent.worktree_path,
-            tab_id=parent.tab_id,
-            leaf_id=f"leaf-{created_handle}",
-            title="Terminal",
-            connected=True,
-            writable=True,
-            agent_identity=None,
-            preview="PS D:\\repo>",
-        )
-        return created_handle
-
     def terminal_rename(self, handle: str, title: str) -> None:
         self.operations.append(("rename", f"{handle}:{title}"))
         self._raise_if("rename")
@@ -355,11 +368,9 @@ class FakeOrca:
         self.operations.append(("wait", f"{handle}:{timeout_ms}"))
         self._raise_if("wait")
         snapshot = self.snapshots.get(handle)
-        if snapshot is not None and snapshot.agent_identity == "claude":
-            if self._wait_timeouts_after_claude_left > 0:
-                self._wait_timeouts_after_claude_left -= 1
-                raise dispatcher.DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
-            return
+        if snapshot is not None and snapshot.agent_identity == "claude" and self._wait_timeouts_after_claude_left > 0:
+            self._wait_timeouts_after_claude_left -= 1
+            raise dispatcher.DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
         if self._wait_timeouts_left > 0:
             self._wait_timeouts_left -= 1
             raise dispatcher.DispatcherError("orca_not_ready", f"Claude terminal 未在 {timeout_ms}ms 内就绪：{handle}")
@@ -453,7 +464,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(result, {
                 "type": "prompt",
                 "fetch_prompt": "按 status = 待开发 查询任务",
-                "session_prompt": "新建该任务的 worktree",
+                "session_prompt": "任务确认后直接创建或复用 worktree，并写入 worktree_path",
                 "task_url_template": "https://jira.example/{task_id}",
                 "max_tasks": 12,
                 "reference_plan_field": "customfield_11103",
@@ -505,7 +516,7 @@ class DispatcherTests(unittest.TestCase):
                 dispatch_flow="proposal",
             )
 
-            command = dispatcher.command_for(config, item, "separate")
+            command = dispatcher.command_for(config, item)
 
             self.assertEqual(command, f"/dev-spec-gen 出具开发方案 https://jira.example/XSWL-1 {snapshot_path.resolve().as_posix()}")
             self.assertNotIn("不应下发", command)
@@ -536,11 +547,11 @@ class DispatcherTests(unittest.TestCase):
                         repository="mapped", repository_path=repository, base_branch=None,
                         source_task_id=source, dispatch_flow="direct",
                     )
-                    command = dispatcher.command_for(config, item, "separate")
+                    command = dispatcher.command_for(config, item)
                     self.assertIn("https://jira.example/PARENT-1", command)
                     self.assertIn(f"当前实际开发任务：{expected}", command)
                     self.assertNotIn("当前实际开发任务", dispatcher.command_for(
-                        config, assignment("PARENT-1", "mapped", repository), "separate",
+                        config, assignment("PARENT-1", "mapped", repository),
                     ))
 
     def test_task_source_rejects_unknown_prompt_variable(self) -> None:
@@ -866,14 +877,14 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("status=success", session_prompt)
         self.assertNotIn("jira.9ji.com", prompt)
 
-    def test_requirement_snapshot_is_optional_for_legacy_direct_launch(self) -> None:
+    def test_requirement_snapshot_is_required_for_direct_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
             worktree_path = projects / "repo-a-XSWL-1"
             create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
             item = dispatcher.Assignment(
                 task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
                 repository="mapped",
@@ -882,9 +893,29 @@ class DispatcherTests(unittest.TestCase):
                 tenant="legacy",
                 tenant_slug="legacy",
                 worktree_path=worktree_path,
+                dispatch_flow="direct",
             )
+            repositories = {"mapped": dispatcher.Repository("mapped", repository_path)}
 
-            dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "requirement_snapshot_path 是必填项"):
+                dispatcher.validate_assignment(config, item, repositories)
+
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
+            dispatcher.validate_assignment(
+                config,
+                dispatcher.Assignment(
+                    task=item.task,
+                    repository=item.repository,
+                    repository_path=repository_path,
+                    base_branch=None,
+                    tenant="legacy",
+                    tenant_slug="legacy",
+                    worktree_path=worktree_path,
+                    requirement_snapshot_path=snapshot_path,
+                    dispatch_flow="direct",
+                ),
+                repositories,
+            )
 
     def test_requirement_snapshot_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -899,7 +930,7 @@ class DispatcherTests(unittest.TestCase):
             target.write_text("# 完整需求\nsnapshot_status: complete\n附件完整性: complete\n", encoding="utf-8")
             link = snapshot_root / "link.md"
             link.symlink_to(target)
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
             item = dispatcher.Assignment(
                 task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
                 repository="mapped",
@@ -920,7 +951,7 @@ class DispatcherTests(unittest.TestCase):
             worktree_path = projects / "repo-a-XSWL-1"
             create_linked_worktree(repository_path, worktree_path)
             snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
             item = dispatcher.Assignment(
                 task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1", "描述正文由快照承载"),
                 repository="mapped",
@@ -931,7 +962,7 @@ class DispatcherTests(unittest.TestCase):
             )
 
             dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
-            command = dispatcher.command_for(config, item, "separate")
+            command = dispatcher.command_for(config, item)
             self.assertIn("完整原始需求快照", command)
             self.assertNotIn("描述正文由快照承载", command)
 
@@ -944,7 +975,7 @@ class DispatcherTests(unittest.TestCase):
                 snapshot_path.read_text(encoding="utf-8").replace("snapshot_status: complete", "snapshot_status: incomplete"),
                 encoding="utf-8",
             )
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "未标记为完整"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -959,7 +990,7 @@ class DispatcherTests(unittest.TestCase):
                 manifest_path.read_text(encoding="utf-8").replace('"status": "complete"', '"status": "incomplete"'),
                 encoding="utf-8",
             )
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件清单未标记为完整"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -971,7 +1002,7 @@ class DispatcherTests(unittest.TestCase):
             repository_path, worktree_path, _, item = make_snapshot_assignment(projects)
             attachment_path = worktree_path / "docs" / "engineering" / "attachments" / "XSWL-1" / "001-requirement.txt"
             attachment_path.write_text("被篡改的附件内容\n", encoding="utf-8")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件完整性校验失败"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -985,7 +1016,7 @@ class DispatcherTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["attachments"][0]["size"] -= 1
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件完整性校验失败"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -996,7 +1027,7 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path, worktree_path, _, item = make_snapshot_assignment(projects)
             (worktree_path / "docs" / "engineering" / "attachments" / "XSWL-1" / "001-requirement.txt").unlink()
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件文件不存在或越出归档目录"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -1013,7 +1044,7 @@ class DispatcherTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件清单必须位于任务附件目录"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -1034,7 +1065,7 @@ class DispatcherTests(unittest.TestCase):
                 "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
             })
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件文件必须是现有普通文件"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
@@ -1173,19 +1204,26 @@ class DispatcherTests(unittest.TestCase):
     def test_decide_cli_preserves_direct_flow_and_source_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            repository = root / "projects" / "repo-a"
-            (repository / ".git").mkdir(parents=True)
-            write_config(root, root / "projects")
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            worktree_path = projects / "repo-a-CW-7622"
+            create_linked_worktree(repository, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "CW-7622")
+            write_config(root, projects)
             arguments = dispatcher.build_parser().parse_args([
                 "--config", str(root / "config" / "dispatcher.yaml"), "decide",
                 "--task-id", "CW-7622", "--source-task-id", "CW-7624",
                 "--title", "测试任务", "--task-url", "https://jira.example/CW-7622", "--repository", "mapped",
                 "--base-branch", "origin/release", "--dispatch-flow", "direct",
+                "--worktree-path", worktree_path.resolve().as_posix(),
+                "--requirement-snapshot-path", snapshot_path.resolve().as_posix(),
             ])
             result = dispatcher.execute(arguments)
             selected = result["launch_input"]["tasks"][0]
             self.assertEqual(selected["dispatch_flow"], "direct")
             self.assertEqual(selected["source_task_id"], "CW-7624")
+            self.assertEqual(selected["worktree_path"], worktree_path.resolve().as_posix())
+            self.assertEqual(selected["requirement_snapshot_path"], snapshot_path.resolve().as_posix())
             self.assertEqual(result["tasks"], result["launch_input"]["tasks"])
             self.assertFalse((root / ".runtime" / "state.json").exists())
 
@@ -1208,7 +1246,9 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             config = write_config(root, projects)
             path = root / "decision.json"
             path.write_text(json.dumps({"version": 1, "tasks": [{
@@ -1224,12 +1264,15 @@ class DispatcherTests(unittest.TestCase):
                 "parent_task_id": "XSWL-1",
                 "parent_assignee": "父任务负责人",
                 "reference_plan": "参考方案",
+                "worktree_path": worktree_path.resolve().as_posix(),
+                "requirement_snapshot_path": snapshot_path.resolve().as_posix(),
             }]}), encoding="utf-8")
 
             result = dispatcher.decide(config, path)
 
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["tasks"][0]["repository_path"], repository_path.resolve().as_posix())
+            self.assertEqual(result["tasks"][0]["worktree_path"], worktree_path.resolve().as_posix())
             self.assertEqual(result["tasks"][0]["source_task_id"], "XSWL-2")
             self.assertEqual(result["launch_input"], {"tasks": result["tasks"]})
             self.assertFalse((root / ".runtime" / "state.json").exists())
@@ -1258,7 +1301,9 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             config = write_config(root, projects)
             path = root / "decision.json"
             path.write_text(json.dumps({"version": 1, "tasks": [
@@ -1268,6 +1313,8 @@ class DispatcherTests(unittest.TestCase):
                     "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped",
                     "base_branch": "origin/release",
+                    "worktree_path": worktree_path.as_posix(),
+                    "requirement_snapshot_path": snapshot_path.as_posix(),
                 },
                 {
                     "task_id": "XSWL-2",
@@ -1364,17 +1411,15 @@ class DispatcherTests(unittest.TestCase):
         self.assertFalse(dispatcher.detect_claude_authorization_prompt("No, exit\n继续\n继续\n继续\nYes, I accept"))
         self.assertFalse(dispatcher.detect_claude_authorization_prompt("No, exit\nYes, I Accept"))
 
-    def test_separate_launch_accepts_exact_claude_authorization_prompt(self) -> None:
+    def test_independent_terminal_launch_accepts_exact_claude_authorization_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
-            fake_orca = FakeOrca({worktree_path: "repo-worktree"}, authorization_prompt_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, authorization_prompt_count=1)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -1388,16 +1433,14 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(
-                {worktree_path: "repo-worktree"},
+                {repository_path: "repo-mapped"},
                 authorization_prompt_count=1,
                 authorization_stays_visible=True,
             )
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -1497,10 +1540,10 @@ class DispatcherTests(unittest.TestCase):
     def test_command_rejects_unsafe_base_branch(self) -> None:
         config = dispatcher.Config(
             root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
+            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
             task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
             task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"separate": "/dev-spec-gen {task_url} base_branch={base_branch}", "split": "/dev-spec-gen {task_url}"},
+            command_templates={"complete": "/dev-spec-gen {task_url} base_branch={base_branch}"},
         )
         item = dispatcher.Assignment(
             task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
@@ -1510,7 +1553,7 @@ class DispatcherTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(dispatcher.DispatcherError, "base_branch 包含不支持的命令字符"):
-            dispatcher.command_for(config, item, "separate")
+            dispatcher.command_for(config, item)
 
     def test_command_template_accepts_task_context_placeholders(self) -> None:
         dispatcher.validate_command_template("/dev-spec-gen {task_url} {title} {requirement_snapshot_path}")
@@ -1526,10 +1569,10 @@ class DispatcherTests(unittest.TestCase):
     def test_command_omits_source_and_parent_task_info(self) -> None:
         config = dispatcher.Config(
             root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
+            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
             task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
             task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"separate": "/dev-spec-gen {task_url}\n- 任务编号：{task_id}\n- 任务标题：“{title}”", "split": "/dev-spec-gen {task_url}"},
+            command_templates={"complete": "/dev-spec-gen {task_url}\n- 任务编号：{task_id}\n- 任务标题：“{title}”"},
         )
         item = dispatcher.Assignment(
             task=dispatcher.Task("XSWL-1", "产品需求标题", "https://jira.example/XSWL-1"),
@@ -1542,7 +1585,7 @@ class DispatcherTests(unittest.TestCase):
             parent_assignee="李飞",
         )
 
-        command = dispatcher.command_for(config, item, "separate")
+        command = dispatcher.command_for(config, item)
 
         self.assertIn("- 任务编号：XSWL-1", command)
         self.assertIn("产品需求标题", command)
@@ -1555,14 +1598,14 @@ class DispatcherTests(unittest.TestCase):
     def test_command_rejects_invalid_template(self) -> None:
         config = dispatcher.Config(
             root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, max_panes=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, shell_command="cmd.exe /d /k", agent_extra_args="", state_file=Path("state.json"),
+            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
             task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
             task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"separate": "/dev-spec-gen {task_url", "split": "/dev-spec-gen {task_url}"},
+            command_templates={"complete": "/dev-spec-gen {task_url"},
         )
 
         with self.assertRaisesRegex(dispatcher.DispatcherError, "模板格式不合法"):
-            dispatcher.validate_command_template(config.command_templates["separate"])
+            dispatcher.validate_command_template(config.command_templates["complete"])
 
     def test_discovery_uses_only_explicit_projects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1680,6 +1723,60 @@ class DispatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(dispatcher.DispatcherError, "必须是非空字符串"):
                 dispatcher.load_config(config_path)
 
+    def test_legacy_layout_config_is_ignored_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.format(projects_root=projects.as_posix()).replace(
+                    "  terminal:\n",
+                    (
+                        "  layout:\n"
+                        "    group_by: repository\n"
+                        "    max_panes_per_tab: 4\n"
+                        "    mode: separate\n"
+                        "  terminal:\n"
+                        "    shell_commands:\n"
+                        "      windows: \"cmd.exe /d /k\"\n"
+                        "      posix: \"sh -i\"\n"
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            config = dispatcher.load_config(config_path)
+            result = dispatcher.execute(dispatcher.build_parser().parse_args([
+                "--config", str(config_path), "validate",
+            ]))
+
+            self.assertTrue(any("dispatch.layout" in warning for warning in config.deprecation_warnings))
+            self.assertTrue(any("shell_commands" in warning for warning in config.deprecation_warnings))
+            self.assertTrue(any("dispatch.layout" in warning for warning in result["config"]["deprecation_warnings"]))
+            self.assertEqual(sorted(config.command_templates), ["complete", "direct", "proposal"])
+
+    def test_legacy_split_section_in_session_prompt_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace(
+                    '    recovery: "这是恢复会话"',
+                    '    split: "旧会话说明"\n    recovery: "这是恢复会话"',
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+
+            config = dispatcher.load_config(config_path)
+
+            self.assertTrue(any("session_prompt.split" in warning for warning in config.deprecation_warnings))
+            self.assertIn("worktree_path", config.session_prompt)
+
     def test_snapshot_rejects_invalid_task_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
@@ -1695,12 +1792,18 @@ class DispatcherTests(unittest.TestCase):
             repository = dispatcher.Repository("repo", repository_path)
             store = dispatcher.StateStore(state_file)
             items = tuple(
-                assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
+                assignment(
+                    "XSWL-1",
+                    "repo",
+                    repository_path,
+                    worktree_path=repository_path.parent / f"repo-XSWL-1-{flow}",
+                    dispatch_flow=flow,
+                )
                 for flow in ("direct", "complete", "proposal")
             )
 
-            for index, item in enumerate(items):
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), index)
+            for item in items:
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             state = store.snapshot()
             self.assertEqual(set(state["tasks"]), {
@@ -1713,6 +1816,10 @@ class DispatcherTests(unittest.TestCase):
                 ["launching", "launching", "launching"],
             )
             self.assertEqual({item["assignment_id"] for item in state["tasks"].values()}, {"XSWL-1"})
+            self.assertEqual(
+                {item["tab_title"] for item in state["tasks"].values()},
+                {"repo-XSWL-1-direct", "repo-XSWL-1-complete", "repo-XSWL-1-proposal"},
+            )
 
     def test_state_key_parser_rejects_malformed_canonical_key(self) -> None:
         with self.assertRaisesRegex(dispatcher.DispatcherError, "状态键格式"):
@@ -1732,22 +1839,27 @@ class DispatcherTests(unittest.TestCase):
                 base_branch=None,
                 tenant="九机",
                 tenant_slug="jiuji",
+                worktree_path=repository_path.parent / "repo-XSWL-1-jiuji",
                 dispatch_flow="direct",
             )
 
-            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             key = dispatcher.state_key_for("XSWL-1", "jiuji", "direct")
             self.assertEqual(set(store.snapshot()["tasks"]), {key})
             self.assertEqual(store.status("XSWL-1", "jiuji", "direct"), "launching")
             self.assertEqual(store.snapshot()["tasks"][key]["assignment_id"], "XSWL-1::jiuji")
+            self.assertEqual(store.snapshot()["tasks"][key]["tab_title"], "repo-XSWL-1-jiuji")
 
     def test_decide_accepts_same_task_in_different_flows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            items = tuple(
+                flow_worktree_assignment(projects, repository_path, "XSWL-1", flow)
+                for flow in ("direct", "complete", "proposal")
+            )
             config = write_config(root, projects)
             path = root / "decision.json"
             path.write_text(json.dumps({"version": 1, "tasks": [
@@ -1757,9 +1869,11 @@ class DispatcherTests(unittest.TestCase):
                     "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped",
                     "base_branch": "origin/release",
-                    "dispatch_flow": flow,
+                    "dispatch_flow": item.dispatch_flow,
+                    "worktree_path": item.worktree_path.resolve().as_posix(),
+                    "requirement_snapshot_path": item.requirement_snapshot_path.resolve().as_posix(),
                 }
-                for flow in ("direct", "complete", "proposal")
+                for item in items
             ]}), encoding="utf-8")
 
             result = dispatcher.decide(config, path)
@@ -1769,20 +1883,23 @@ class DispatcherTests(unittest.TestCase):
                 {item["dispatch_flow"] for item in result["tasks"]},
                 {"direct", "complete", "proposal"},
             )
+            self.assertEqual(
+                {item["worktree_path"] for item in result["tasks"]},
+                {item.worktree_path.resolve().as_posix() for item in items},
+            )
 
     def test_launcher_accepts_same_task_in_different_flows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            items = tuple(
+                flow_worktree_assignment(projects, repository_path, "XSWL-1", flow)
+                for flow in ("direct", "complete", "proposal")
+            )
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(
-                assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
-                for flow in ("direct", "complete", "proposal")
-            )
 
             result = dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
 
@@ -1848,12 +1965,45 @@ class DispatcherTests(unittest.TestCase):
             repository_path = projects / "repo-a"
             worktree_path = projects / "repo-a-XSWL-1"
             create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace(
+                    'base_branches: ["origin/release"]',
+                    '''tenants:
+        tenant-a:
+          slug: "tenant-a"
+        tenant-b:
+          slug: "tenant-b"
+      base_branches: ["origin/release"]''',
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+            config = dispatcher.load_config(config_path)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            first = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
-            second = assignment("XSWL-2", "mapped", repository_path, worktree_path=worktree_path)
+            first = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
+                repository="mapped",
+                repository_path=repository_path,
+                base_branch=None,
+                tenant="tenant-a",
+                tenant_slug="tenant-a",
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
+            )
             dispatcher.launch(config, (first,), store, fake_orca, force_unlock=False)
+            second = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
+                repository="mapped",
+                repository_path=repository_path,
+                base_branch=None,
+                tenant="tenant-b",
+                tenant_slug="tenant-b",
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
+            )
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "不能共享 worktree_path"):
                 dispatcher.launch(config, (second,), store, fake_orca, force_unlock=False)
@@ -1864,11 +2014,17 @@ class DispatcherTests(unittest.TestCase):
             repository_path = Path(temporary) / "repo"
             repository = dispatcher.Repository("repo", repository_path)
             items = tuple(
-                assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
+                assignment(
+                    "XSWL-1",
+                    "repo",
+                    repository_path,
+                    worktree_path=repository_path.parent / f"repo-XSWL-1-{flow}",
+                    dispatch_flow=flow,
+                )
                 for flow in ("direct", "complete")
             )
-            for index, item in enumerate(items):
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), index)
+            for item in items:
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             self.assertTrue(store.reset("XSWL-1", force_unlock=False, dispatch_flow="direct"))
             self.assertIsNone(store.status("XSWL-1", dispatch_flow="direct"))
@@ -1880,8 +2036,14 @@ class DispatcherTests(unittest.TestCase):
             repository_path = Path(temporary) / "repo"
             repository = dispatcher.Repository("repo", repository_path)
             for flow in ("direct", "complete"):
-                item = assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
+                item = assignment(
+                    "XSWL-1",
+                    "repo",
+                    repository_path,
+                    worktree_path=repository_path.parent / f"repo-XSWL-1-{flow}",
+                    dispatch_flow=flow,
+                )
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "多个流程"):
                 store.reset("XSWL-1", force_unlock=False)
@@ -1915,15 +2077,13 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
-            store = dispatcher.StateStore(config.state_file)
-            fake_orca = FakeOrca({repository_path: "repo-mapped"})
             items = tuple(
-                assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path, dispatch_flow=flow)
+                flow_worktree_assignment(projects, repository_path, "XSWL-1", flow)
                 for flow in ("direct", "complete")
             )
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
             dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
             complete_key = dispatcher.state_key_for("XSWL-1", "legacy", "complete")
             complete_before = dict(store.snapshot()["tasks"][complete_key])
@@ -1944,39 +2104,45 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
             self.assertEqual(store.snapshot()["tasks"][complete_key], complete_before)
 
-    def test_recover_split_uses_resolved_parent_alias(self) -> None:
+    def test_recover_marks_legacy_split_state_for_manual_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
             (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
+            dispatcher.atomic_write_json(config.state_file, {
+                "version": 1,
+                "tasks": {"XSWL-1": {
+                    "task_id": "XSWL-1",
+                    "repository": "mapped",
+                    "repository_path": repository_path.resolve().as_posix(),
+                    "worktree_path": worktree_path.resolve().as_posix(),
+                    "tab_title": worktree_path.name,
+                    "task_url": "https://jira.example/XSWL-1",
+                    "title": "XSWL-1",
+                    "status": "launching",
+                    "layout": "split",
+                    "dispatch_flow": "complete",
+                }},
+            })
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(
-                assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
-                for flow in ("direct", "complete")
-            )
-            dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
-            state = store.snapshot()
-            tasks = state["tasks"]
-            assert isinstance(tasks, dict)
-            direct_key = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
-            state_with_alias = {**state, "tasks": {**tasks, "XSWL-1": dict(tasks[direct_key])}}
-            dispatcher.atomic_write_json(store.state_file, state_with_alias)
-            fake_orca.snapshots.pop("term-2")
 
-            result = dispatcher.recover(
-                config,
-                store,
-                fake_orca,
-                task_id="XSWL-1",
-                dispatch_flow="complete",
-                force_unlock=False,
-            )
+            result = dispatcher.recover(config, store, fake_orca, task_id="XSWL-1", force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "recovered")
-            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
+            self.assertEqual(result["results"], [{
+                "task_id": "XSWL-1",
+                "tenant": "legacy",
+                "tenant_slug": "legacy",
+                "assignment_id": "XSWL-1",
+                "dispatch_flow": "complete",
+                "status": "requires_manual_reset",
+            }])
+            self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
+            self.assertIn("recovery_metadata_missing", store.history_file.read_text(encoding="utf-8"))
+            self.assertEqual([operation for operation, _ in fake_orca.operations if operation == "create"], [])
 
     def test_decide_rejects_same_task_and_flow_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2003,21 +2169,31 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            items = tuple(
+                flow_worktree_assignment(projects, repository_path, "XSWL-1", flow)
+                for flow in ("direct", "complete")
+            )
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
-            repository = dispatcher.Repository("mapped", repository_path)
-            for flow in ("direct", "complete"):
-                item = assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), 0)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
+            fake_orca.snapshots.clear()
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "多个流程"):
                 dispatcher.recover(config, store, FakeOrca(), task_id="XSWL-1", force_unlock=False)
+            result = dispatcher.recover(
+                config, store, fake_orca, task_id="XSWL-1", dispatch_flow="direct", force_unlock=False
+            )
+
+            self.assertEqual([item["dispatch_flow"] for item in result["results"]], ["direct"])
+            self.assertEqual([item["status"] for item in result["results"]], ["recovered"])
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "dispatched")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
+            creates = [value for operation, value in fake_orca.operations if operation == "create"]
+            self.assertEqual(len(creates), 3)
             self.assertEqual(
-                dispatcher.recover(
-                    config, store, FakeOrca(), task_id="XSWL-1", dispatch_flow="direct", force_unlock=False
-                ),
-                {"results": []},
+                creates[-1],
+                f"path:{items[0].worktree_path.resolve().as_posix()}:{items[0].worktree_path.name}:claude",
             )
 
     def test_state_cli_filters_flow_and_preserves_storage(self) -> None:
@@ -2028,9 +2204,15 @@ class DispatcherTests(unittest.TestCase):
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             repository = dispatcher.Repository("mapped", projects / "repo-a")
-            for index, flow in enumerate(("direct", "complete")):
-                item = assignment("XSWL-1", "mapped", repository.path, dispatch_flow=flow)
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), index)
+            for flow in ("direct", "complete"):
+                item = assignment(
+                    "XSWL-1",
+                    "mapped",
+                    repository.path,
+                    worktree_path=projects / f"repo-a-XSWL-1-{flow}",
+                    dispatch_flow=flow,
+                )
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
             before = store.state_file.read_text(encoding="utf-8")
 
             arguments = dispatcher.build_parser().parse_args([
@@ -2052,9 +2234,15 @@ class DispatcherTests(unittest.TestCase):
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             repository = dispatcher.Repository("mapped", projects / "repo-a")
-            for index, flow in enumerate(("direct", "complete")):
-                item = assignment("XSWL-1", "mapped", repository.path, dispatch_flow=flow)
-                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), index)
+            for flow in ("direct", "complete"):
+                item = assignment(
+                    "XSWL-1",
+                    "mapped",
+                    repository.path,
+                    worktree_path=projects / f"repo-a-XSWL-1-{flow}",
+                    dispatch_flow=flow,
+                )
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             arguments = dispatcher.build_parser().parse_args([
                 "--config", str(root / "config" / "dispatcher.yaml"),
@@ -2079,29 +2267,34 @@ class DispatcherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / ".runtime" / "state.json"
             store = dispatcher.StateStore(path)
-            item = assignment("XSWL-1", "repo", Path(temporary) / "repo")
+            item = assignment(
+                "XSWL-1",
+                "repo",
+                Path(temporary) / "repo",
+                worktree_path=Path(temporary) / "repo-XSWL-1",
+            )
 
             repository = dispatcher.Repository("repo", item.repository_path)
-            plan = dispatcher.TerminalPlan(repository, (item,), "repo.XSWL-1", "separate")
+            plan = dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name)
             snapshot = dispatcher.TerminalSnapshot(
                 handle="term-1",
-                worktree_id=f"repo::{item.repository_path.resolve().as_posix()}",
-                worktree_path=item.repository_path,
+                worktree_id=f"repo::{item.worktree_path.resolve().as_posix()}",
+                worktree_path=item.worktree_path,
                 tab_id="tab-1",
                 leaf_id="leaf-1",
-                title="repo.XSWL-1",
+                title=item.worktree_path.name,
                 connected=True,
                 writable=True,
                 agent_identity="claude",
                 preview="",
             )
-            record = dispatcher.TerminalRecord(item, "term-1", "repo.XSWL-1", "separate", 0, snapshot)
+            record = dispatcher.TerminalRecord(item, "term-1", item.worktree_path.name, snapshot)
 
-            store.mark_launching(item, plan, 0)
+            store.mark_launching(item, plan)
             self.assertEqual(store.status("XSWL-1"), "launching")
             self.assertTrue(store.reset("XSWL-1", force_unlock=False))
             self.assertIsNone(store.status("XSWL-1"))
-            store.mark_launching(item, plan, 0)
+            store.mark_launching(item, plan)
             store.mark_dispatched(record)
             self.assertEqual(store.status("XSWL-1"), "dispatched")
             with self.assertRaisesRegex(dispatcher.DispatcherError, "仅允许复位 launching"):
@@ -2275,11 +2468,23 @@ class DispatcherTests(unittest.TestCase):
     def test_state_view_keeps_multiple_flows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
-            item = assignment("XSWL-1", "repo", Path(temporary) / "repo", dispatch_flow="direct")
+            item = assignment(
+                "XSWL-1",
+                "repo",
+                Path(temporary) / "repo",
+                worktree_path=Path(temporary) / "repo-XSWL-1-direct",
+                dispatch_flow="direct",
+            )
             repository = dispatcher.Repository("repo", item.repository_path)
-            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
-            item = assignment("XSWL-1", "repo", Path(temporary) / "repo", dispatch_flow="complete")
-            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 1)
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
+            item = assignment(
+                "XSWL-1",
+                "repo",
+                Path(temporary) / "repo",
+                worktree_path=Path(temporary) / "repo-XSWL-1-complete",
+                dispatch_flow="complete",
+            )
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), item.worktree_path.name))
 
             direct = store.state_view("direct")
             all_flows = store.state_view()
@@ -2294,46 +2499,68 @@ class DispatcherTests(unittest.TestCase):
         arguments = dispatcher.build_parser().parse_args(["reset", "XSWL-1"])
         self.assertFalse(arguments.force)
 
-    def test_planner_keeps_repositories_separate_and_limits_panes(self) -> None:
+    def test_planner_creates_one_independent_terminal_per_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             first = dispatcher.Repository("first", root / "first")
             second = dispatcher.Repository("second", root / "second")
             assignments = tuple(
-                [assignment(f"A-{index}", "first", first.path) for index in range(5)]
-                + [assignment("B-1", "second", second.path)]
+                [assignment(f"A-{index}", "first", first.path, worktree_path=root / "worktrees" / f"A-{index}") for index in range(5)]
+                + [assignment("B-1", "second", second.path, worktree_path=root / "worktrees" / "B-1")]
             )
 
-            plans = dispatcher.build_terminal_plans(assignments, {"first": first, "second": second}, 4)
+            plans = dispatcher.build_terminal_plans(assignments, {"first": first, "second": second})
 
-            self.assertEqual([[item.task.task_id for item in plan.assignments] for plan in plans], [
-                ["A-0", "A-1", "A-2", "A-3"],
-                ["A-4"],
-                ["B-1"],
-            ])
+            self.assertEqual(
+                [[item.task.task_id for item in plan.assignments] for plan in plans],
+                [["A-0"], ["A-1"], ["A-2"], ["A-3"], ["A-4"], ["B-1"]],
+            )
+            self.assertEqual(
+                [plan.tab_title for plan in plans],
+                [f"A-{index}" for index in range(5)] + ["B-1"],
+            )
+            self.assertEqual([plan.repository.name for plan in plans], ["first"] * 5 + ["second"])
 
-    def test_launcher_creates_all_panes_before_waiting_and_sending(self) -> None:
+    def test_launcher_creates_all_terminals_before_waiting_and_sending(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            assignments = tuple(
+                worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(4)
+            )
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            assignments = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(4))
 
             result = dispatcher.launch(config, assignments, store, fake_orca, force_unlock=False)
 
-            self.assertEqual([item[0] for item in fake_orca.operations], [
-                "status", "repo-list", "create", "show", "split-horizontal", "show", "split-vertical", "show",
-                "split-vertical", "show", "wait", "show", "send", "wait", "show", "wait", "show", "send",
-                "wait", "show", "wait", "show", "send", "wait", "show", "wait", "show", "send", "wait", "show",
+            operations = [item[0] for item in fake_orca.operations]
+            self.assertEqual(operations, [
+                "status", "repo-list",
+                "worktree-list", "repo-add", "worktree-resolve", "create", "show",
+                "worktree-list", "repo-add", "worktree-resolve", "create", "show",
+                "worktree-list", "repo-add", "worktree-resolve", "create", "show",
+                "worktree-list", "repo-add", "worktree-resolve", "create", "show",
+                "wait", "show", "wait", "show", "wait", "show", "wait", "show",
                 "send", "worktree-status", "send", "worktree-status",
                 "send", "worktree-status", "send", "worktree-status",
             ])
+            self.assertEqual(
+                [value for operation, value in fake_orca.operations if operation == "create"],
+                [
+                    f"id:repo-{item.worktree_path.name}::{item.worktree_path.resolve().as_posix()}"
+                    f":{item.worktree_path.name}:claude"
+                    for item in assignments
+                ],
+            )
+            self.assertFalse(any(operation.startswith("split-") for operation in operations))
             self.assertEqual([item["status"] for item in result["results"]], ["dispatched"] * 4)
-            self.assertEqual([plan["task_ids"] for plan in result["plans"]], [[f"XSWL-{index}" for index in range(4)]])
+            self.assertEqual([plan["task_ids"] for plan in result["plans"]], [[f"XSWL-{index}"] for index in range(4)])
+            self.assertEqual(
+                [plan["tab_title"] for plan in result["plans"]],
+                [item.worktree_path.name for item in assignments],
+            )
             self.assertTrue(all(store.status(f"XSWL-{index}") == "dispatched" for index in range(4)))
             current_run = json.loads(store.current_run_file.read_text(encoding="utf-8"))
             self.assertEqual([item["task_id"] for item in current_run["tasks"]], [f"XSWL-{index}" for index in range(4)])
@@ -2344,18 +2571,17 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca()
-            item = assignment("XSWL-1", "mapped", repository_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             expected_path = os.path.normcase(os.path.normpath(str(repository_path.resolve())))
             self.assertEqual([item[0] for item in fake_orca.operations], [
-                "status", "repo-list", "repo-add", "repo-list", "create", "show",
-                "wait", "show", "send", "wait", "show", "send", "worktree-status",
+                "status", "repo-list", "repo-add", "repo-list", "worktree-list", "repo-add", "worktree-resolve",
+                "create", "show", "wait", "show", "send", "worktree-status",
             ])
             self.assertIn(("repo-add", expected_path), fake_orca.operations)
             self.assertEqual(result["results"][0]["status"], "dispatched")
@@ -2366,11 +2592,20 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             (projects / "repo-a" / ".git").mkdir(parents=True)
             repository_path = projects / "nested" / "custom-service"
-            (repository_path / ".git").mkdir(parents=True)
+            worktree_path = projects / "custom-service-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-custom"})
-            item = assignment("XSWL-1", "custom-service", repository_path)
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "XSWL-1", "https://jira.example/XSWL-1"),
+                repository="custom-service",
+                repository_path=repository_path,
+                base_branch=None,
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
+            )
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2382,11 +2617,20 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            item = assignment("XSWL-1", "mapped", repository_path, "origin/release")
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "XSWL-1", "https://jira.example/XSWL-1"),
+                repository="mapped",
+                repository_path=repository_path,
+                base_branch="origin/release",
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
+            )
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2401,7 +2645,9 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
@@ -2411,6 +2657,8 @@ class DispatcherTests(unittest.TestCase):
                 repository_path=repository_path,
                 base_branch=None,
                 reference_plan="参考方案内容",
+                worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
             )
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
@@ -2424,11 +2672,10 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            item = assignment("XSWL-1", "mapped", repository_path)
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2464,10 +2711,11 @@ class DispatcherTests(unittest.TestCase):
             repository_path = projects / "repo-a"
             worktree_path = projects / "repo-a-XSWL-1"
             create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
             report_path = worktree_path / "docs" / "engineering" / "research" / "XSWL-1-gitnexus.md"
             report_path.parent.mkdir(parents=True)
             report_path.write_text("# 调研报告\n", encoding="utf-8")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({worktree_path: "repo-worktree"})
             item = dispatcher.Assignment(
@@ -2476,6 +2724,7 @@ class DispatcherTests(unittest.TestCase):
                 repository_path=repository_path,
                 base_branch=None,
                 worktree_path=worktree_path,
+                requirement_snapshot_path=snapshot_path,
                 assignee="测试负责人",
                 gitnexus_report_path=report_path,
             )
@@ -2483,7 +2732,8 @@ class DispatcherTests(unittest.TestCase):
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             task_command = next(value for operation, value in fake_orca.operations if operation == "send" and value.startswith("/dev-spec-gen"))
-            self.assertIn("- 任务描述：“任务描述”", task_command)
+            self.assertNotIn("任务描述", task_command)
+            self.assertIn(f"- 完整原始需求快照：{snapshot_path.resolve().as_posix()}", task_command)
             self.assertIn("- 负责人：“测试负责人”", task_command)
             self.assertIn(f"- GitNexus 调研报告：{report_path.resolve().as_posix()}（复用该报告并跳过 GitNexus 调研节点）", task_command)
             state = dispatcher.read_json_object(config.state_file, {})["tasks"][dispatcher.state_key_for("XSWL-1")]
@@ -2500,7 +2750,7 @@ class DispatcherTests(unittest.TestCase):
             create_linked_worktree(repository_path, worktree_path)
             outside_report = root / "report.md"
             outside_report.write_text("# 调研报告\n", encoding="utf-8")
-            config = write_config(root, projects, layout_mode="separate")
+            config = write_config(root, projects)
             item = dispatcher.Assignment(
                 task=dispatcher.Task("XSWL-1", "测试任务", "https://jira.example/XSWL-1"),
                 repository="mapped",
@@ -2528,39 +2778,51 @@ class DispatcherTests(unittest.TestCase):
                 })
 
     def test_terminal_failures_require_manual_reset(self) -> None:
-        for failure, task_count, affected_task_id in (
-            ("create", 1, "XSWL-0"),
-            ("wait", 1, "XSWL-0"),
-            ("send", 1, "XSWL-0"),
-            ("show", 1, "XSWL-0"),
-            ("split", 2, "XSWL-1"),
+        for failure, task_count, affected_task_id, orca_options in (
+            ("create", 1, "XSWL-0", {}),
+            ("wait", 1, "XSWL-0", {}),
+            ("send", 1, "XSWL-0", {}),
+            ("show", 1, "XSWL-0", {}),
+            # 独立终端：首个任务的终端创建重试耗尽后失败，不影响后续任务
+            (None, 2, "XSWL-0", {"create_timeout_count": 4}),
         ):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(failure=failure, task_count=task_count), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 projects = root / "projects"
                 repository_path = projects / "repo-a"
-                (repository_path / ".git").mkdir(parents=True)
+                items = tuple(
+                    worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(task_count)
+                )
                 config = write_config(root, projects)
                 store = dispatcher.StateStore(config.state_file)
-                fake_orca = FakeOrca({repository_path: "repo-mapped"}, failure=failure)
-                items = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(task_count))
+                fake_orca = FakeOrca({repository_path: "repo-mapped"}, failure=failure, **orca_options)
 
                 result = dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
 
                 statuses = {item["task_id"]: item["status"] for item in result["results"]}
                 self.assertEqual(statuses[affected_task_id], "requires_manual_reset")
                 self.assertEqual(store.status(affected_task_id), "requires_manual_reset")
+                self.assertEqual(
+                    {task_id: status for task_id, status in statuses.items() if task_id != affected_task_id},
+                    {
+                        f"XSWL-{index}": "dispatched"
+                        for index in range(task_count)
+                        if f"XSWL-{index}" != affected_task_id
+                    },
+                )
 
     def test_launch_retries_ready_wait_after_timeout(self) -> None:
-        for wait_timeout_count, after_claude_count, expected_waits, expected_claude_sends in (
-            (2, 0, 4, 1),  # 纯等待重试：超时耗尽后重新等待成功，不重发命令
-            (2, 2, 6, 2),  # 第二段就绪超时：重发 agent 命令后重新等待成功
+        for wait_timeout_count, after_claude_count, expected_waits in (
+            (2, 0, ["term-1:120000", "term-1:120000", "term-1:240000"]),
+            (0, 4, ["term-1:120000", "term-1:120000", "term-1:240000", "term-1:240000", "term-1:360000"]),
         ):
-            with self.subTest(wait_timeout_count=wait_timeout_count), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(
+                wait_timeout_count=wait_timeout_count, after_claude_count=after_claude_count
+            ), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 projects = root / "projects"
                 repository_path = projects / "repo-a"
-                (repository_path / ".git").mkdir(parents=True)
+                item = worktree_assignment(projects, repository_path, "XSWL-1")
                 config = write_config(root, projects)
                 store = dispatcher.StateStore(config.state_file)
                 fake_orca = FakeOrca(
@@ -2568,43 +2830,46 @@ class DispatcherTests(unittest.TestCase):
                     wait_timeout_count=wait_timeout_count,
                     wait_timeout_after_claude_count=after_claude_count,
                 )
-                item = assignment("XSWL-1", "mapped", repository_path)
 
                 result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
                 self.assertEqual(result["results"][0]["status"], "dispatched")
-                waits = [value for operation, value in fake_orca.operations if operation == "wait"]
-                self.assertEqual(len(waits), expected_waits)
-                sends = [value for operation, value in fake_orca.operations if operation == "send"]
-                self.assertEqual(sends.count("claude"), expected_claude_sends)
+                self.assertEqual(
+                    [value for operation, value in fake_orca.operations if operation == "wait"],
+                    expected_waits,
+                )
+                self.assertFalse(
+                    any(value == "claude" for operation, value in fake_orca.operations if operation == "send")
+                )
 
     def test_launch_retries_send_after_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"}, send_timeout_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "dispatched")
             sends = [value for operation, value in fake_orca.operations if operation == "send"]
-            self.assertEqual(sends[:2], ["claude", "claude"])
+            self.assertEqual(len(sends), 2)
+            self.assertEqual(sends[0], sends[1])
+            self.assertTrue(sends[0].startswith("/dev-spec-gen"))
 
     def test_launch_retries_when_session_has_no_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
-            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path)
+            # 创建校验 1 次 + 第一轮就绪检测 1 次返回空会话，重新等待后检测到内容
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=2)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2612,34 +2877,36 @@ class DispatcherTests(unittest.TestCase):
             waits = [value for operation, value in fake_orca.operations if operation == "wait"]
             self.assertEqual(len(waits), 2)
 
-    def test_launch_resends_agent_when_claude_session_empty(self) -> None:
+    def test_launch_rewaits_without_resending_agent_when_claude_session_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
-            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_after_claude_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path)
+            # 创建校验 1 次 + 第一轮就绪检测 1 次返回空会话：等待重试期间不重发任何 agent 命令
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_after_claude_count=2)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "dispatched")
             sends = [value for operation, value in fake_orca.operations if operation == "send"]
-            self.assertEqual(sends.count("claude"), 2)
+            self.assertEqual(sends.count("claude"), 0)
+            self.assertEqual(sum(value.startswith("/dev-spec-gen") for value in sends), 1)
+            waits = [value for operation, value in fake_orca.operations if operation == "wait"]
+            self.assertEqual(len(waits), 2)
 
     def test_launch_fails_when_session_stays_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             # 创建验证 1 次 + 每轮就绪检测(ready_retry_attempts+1=4 轮)均返回空会话
             fake_orca = FakeOrca({repository_path: "repo-mapped"}, show_empty_count=5)
-            item = assignment("XSWL-1", "mapped", repository_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2650,12 +2917,11 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             # 前 5 次 wait 失败：120s×2、240s×2 耗尽后 360s 轮第一次失败第二次成功
             fake_orca = FakeOrca({repository_path: "repo-mapped"}, wait_timeout_count=5)
-            item = assignment("XSWL-1", "mapped", repository_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2665,24 +2931,18 @@ class DispatcherTests(unittest.TestCase):
                 "term-1:120000", "term-1:120000",
                 "term-1:240000", "term-1:240000",
                 "term-1:360000", "term-1:360000",
-                "term-1:120000",
             ])
 
-    def test_separate_layout_creates_independent_task_tabs(self) -> None:
+    def test_independent_terminals_use_task_worktree_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_paths = tuple(projects / f"repo-a-XSWL-{index}" for index in range(2))
-            create_linked_worktree(repository_path, worktree_paths[0])
-            create_linked_worktree(repository_path, worktree_paths[1])
-            config = write_config(root, projects, layout_mode="separate")
+            items = tuple(worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(2))
+            worktree_paths = tuple(item.worktree_path for item in items)
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca()
-            items = tuple(
-                assignment(f"XSWL-{index}", "mapped", repository_path, worktree_path=worktree_paths[index])
-                for index in range(2)
-            )
 
             result = dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
 
@@ -2695,7 +2955,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertFalse(any(value == "claude" for operation, value in fake_orca.operations if operation == "send"))
             state = store.snapshot()["tasks"]
             first = state[dispatcher.state_key_for("XSWL-0")]
-            self.assertEqual(first["layout"], "separate")
+            self.assertNotIn("layout", first)
             self.assertEqual(first["tab_title"], worktree_paths[0].name)
             self.assertEqual(first["repository_path"], worktree_paths[0].resolve().as_posix())
             self.assertEqual(first["source_repository_path"], repository_path.resolve().as_posix())
@@ -2706,17 +2966,16 @@ class DispatcherTests(unittest.TestCase):
                 [worktree_paths[0].resolve().as_posix(), worktree_paths[1].resolve().as_posix()],
             )
 
-    def test_separate_layout_retries_terminal_create_after_handle_timeout(self) -> None:
+    def test_independent_terminal_create_retries_after_handle_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            worktree_path = item.worktree_path
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(create_timeout_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
@@ -2738,12 +2997,10 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(create_side_effect_timeout_count=1)
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2756,12 +3013,10 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(create_timeout_count=3)
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2781,29 +3036,25 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(create_timeout_count=4)
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 4)
 
-    def test_separate_layout_does_not_retry_other_create_failures(self) -> None:
+    def test_independent_terminal_does_not_retry_other_create_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca(failure="create")
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
@@ -2818,18 +3069,12 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"}, failure="workspace-status")
 
-            result = dispatcher.launch(
-                config,
-                (assignment("XSWL-1", "mapped", repository_path),),
-                store,
-                fake_orca,
-                force_unlock=False,
-            )
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             task_result = result["results"][0]
             self.assertEqual(task_result["status"], "dispatched")
@@ -2837,7 +3082,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(store.status("XSWL-1"), "dispatched")
             self.assertEqual(
                 [value for operation, value in fake_orca.operations if operation == "worktree-status"],
-                [repository_path.resolve().as_posix()],
+                [item.worktree_path.resolve().as_posix()],
             )
             self.assertIn("workspace_status_failed", store.history_file.read_text(encoding="utf-8"))
 
@@ -2858,44 +3103,47 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(assignments[0].worktree_path, Path("D:/repo-a-task"))
 
-    def test_split_layout_groups_project_tasks_in_source_repository(self) -> None:
+    def test_independent_terminals_do_not_share_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            items = tuple(worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(2))
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(2))
 
             dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
 
-            create = next(value for operation, value in fake_orca.operations if operation == "create")
             self.assertEqual(
-                create,
-                f"path:{repository_path.resolve().as_posix()}:mapped.tab1:cmd.exe /d /k",
+                [value for operation, value in fake_orca.operations if operation == "create"],
+                [
+                    f"id:repo-{item.worktree_path.name}::{item.worktree_path.resolve().as_posix()}"
+                    f":{item.worktree_path.name}:claude"
+                    for item in items
+                ],
             )
-            self.assertIn(("split-horizontal", "term-1:cmd.exe /d /k"), fake_orca.operations)
+            self.assertFalse(any(operation.startswith("split-") for operation, _ in fake_orca.operations))
             self.assertFalse(any(operation == "rename" for operation, _ in fake_orca.operations))
             state = store.snapshot()["tasks"]
             first = state[dispatcher.state_key_for("XSWL-0")]
             second = state[dispatcher.state_key_for("XSWL-1")]
-            self.assertEqual(first["tab_title"], "mapped.tab1")
-            self.assertEqual(second["tab_title"], "mapped.tab1")
-            self.assertEqual(first["tab_id"], second["tab_id"])
+            self.assertEqual(first["tab_title"], items[0].worktree_path.name)
+            self.assertEqual(second["tab_title"], items[1].worktree_path.name)
+            self.assertNotEqual(first["tab_id"], second["tab_id"])
+            self.assertEqual(first["worktree_path"], items[0].worktree_path.resolve().as_posix())
+            self.assertEqual(second["worktree_path"], items[1].worktree_path.resolve().as_posix())
 
-    def test_recover_reuses_restored_claude_pane_without_resending_task(self) -> None:
+    def test_recover_reuses_restored_claude_terminal_without_resending_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            worktree_path = item.worktree_path
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
             fake_orca.restore_handle("term-1", "term-restored")
             send_count = sum(1 for operation, _ in fake_orca.operations if operation == "send")
@@ -2918,17 +3166,15 @@ class DispatcherTests(unittest.TestCase):
                 [worktree_path.resolve().as_posix(), worktree_path.resolve().as_posix()],
             )
 
-    def test_recover_marks_nonwritable_claude_pane_for_manual_reset(self) -> None:
+    def test_recover_marks_nonwritable_claude_terminal_for_manual_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca()
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
             snapshot = fake_orca.snapshots["term-1"]
             fake_orca.snapshots["term-1"] = dispatcher.TerminalSnapshot(
@@ -2950,12 +3196,10 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
             fake_orca.restore_handle("term-1", "term-restored", agent_identity=None, preview="PS D:\\repo>")
 
@@ -2967,17 +3211,16 @@ class DispatcherTests(unittest.TestCase):
             self.assertTrue(any("这是恢复会话" in value for value in sends))
             self.assertEqual(store.status("XSWL-1"), "dispatched")
 
-    def test_recover_recreates_missing_separate_pane(self) -> None:
+    def test_recover_recreates_missing_independent_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            create_linked_worktree(repository_path, worktree_path)
-            config = write_config(root, projects, layout_mode="separate")
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            worktree_path = item.worktree_path
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            item = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
             fake_orca.snapshots.clear()
 
@@ -2998,12 +3241,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             dispatcher.atomic_write_json(config.state_file, {
                 "version": 1,
                 "tasks": {
-                    "XSWL-1::jiuji": {"repository": "mapped", "status": "launching", "layout": "separate"},
+                    "XSWL-1::jiuji": {"repository": "mapped", "status": "launching"},
                 },
             })
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
@@ -3015,7 +3258,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(result["results"], [])
             self.assertEqual(store.status("XSWL-1", "jiuji"), "launching")
 
-    def test_recover_tenant_task_with_slug_recreates_pane_with_snapshot(self) -> None:
+    def test_recover_tenant_task_with_slug_recreates_terminal_with_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
@@ -3027,7 +3270,6 @@ class DispatcherTests(unittest.TestCase):
             config_path.parent.mkdir(parents=True)
             config_path.write_text(
                 CONFIG
-                .replace('mode: "split"', 'mode: "separate"')
                 .replace('base_branches: ["origin/release"]', '''tenants:
         九机:
           slug: "jiuji"
@@ -3058,71 +3300,85 @@ class DispatcherTests(unittest.TestCase):
             self.assertTrue(any("这是恢复会话" in value for value in sends))
             self.assertTrue(any("完整原始需求快照" in value for value in sends))
 
-    def test_recover_recreates_missing_first_split_child(self) -> None:
+    def test_recover_recreates_missing_first_independent_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            items = tuple(worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(2))
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(2))
             dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
-            fake_orca.snapshots.pop("term-2")
+            fake_orca.snapshots.pop("term-1")
 
             result = dispatcher.recover(config, store, fake_orca, task_id=None, force_unlock=False)
 
-            self.assertEqual([item["status"] for item in result["results"]], ["native_recovered", "recovered"])
-            self.assertIn(("split-horizontal", "term-1:cmd.exe /d /k"), fake_orca.operations)
-            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 1)
+            self.assertEqual([item["status"] for item in result["results"]], ["recovered", "native_recovered"])
+            creates = [value for operation, value in fake_orca.operations if operation == "create"]
+            self.assertEqual(len(creates), 3)
+            self.assertEqual(
+                creates[-1],
+                f"path:{items[0].worktree_path.resolve().as_posix()}:{items[0].worktree_path.name}:claude",
+            )
+            self.assertEqual(result["results"][0]["terminal_handle"], "term-3")
+            self.assertEqual(store.status("XSWL-0"), "dispatched")
+            self.assertEqual(store.status("XSWL-1"), "dispatched")
 
-    def test_recover_recreates_missing_later_split_child(self) -> None:
+    def test_recover_recreates_missing_later_independent_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            items = tuple(worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(3))
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(3))
             dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
             fake_orca.snapshots.pop("term-3")
 
             result = dispatcher.recover(config, store, fake_orca, task_id=None, force_unlock=False)
 
-            self.assertEqual([item["status"] for item in result["results"]], ["native_recovered", "native_recovered", "recovered"])
-            self.assertIn(("split-vertical", "term-2:cmd.exe /d /k"), fake_orca.operations)
-            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 1)
+            self.assertEqual(
+                [item["status"] for item in result["results"]],
+                ["native_recovered", "native_recovered", "recovered"],
+            )
+            creates = [value for operation, value in fake_orca.operations if operation == "create"]
+            self.assertEqual(len(creates), 4)
+            self.assertEqual(
+                creates[-1],
+                f"path:{items[2].worktree_path.resolve().as_posix()}:{items[2].worktree_path.name}:claude",
+            )
+            self.assertEqual(result["results"][2]["terminal_handle"], "term-4")
 
-    def test_recover_stops_when_required_split_parent_is_missing(self) -> None:
+    def test_recover_marks_task_with_missing_worktree_for_manual_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            (repository_path / ".git").mkdir(parents=True)
-            config = write_config(root, projects, layout_mode="split")
+            items = tuple(worktree_assignment(projects, repository_path, f"XSWL-{index}") for index in range(2))
+            config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
-            items = tuple(assignment(f"XSWL-{index}", "mapped", repository_path) for index in range(3))
             dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
-            fake_orca.snapshots.pop("term-2")
-            fake_orca.snapshots.pop("term-3")
-            split_count = sum(1 for operation, _ in fake_orca.operations if operation == "split-vertical")
+            items[1].worktree_path.rename(items[1].worktree_path.with_name("repo-a-XSWL-1-moved"))
+            create_count = sum(1 for operation, _ in fake_orca.operations if operation == "create")
 
-            result = dispatcher.recover(config, store, fake_orca, task_id="XSWL-2", force_unlock=False)
+            result = dispatcher.recover(config, store, fake_orca, task_id="XSWL-1", force_unlock=False)
 
             self.assertEqual(result["results"], [{
-                "task_id": "XSWL-2",
+                "task_id": "XSWL-1",
                 "tenant": "legacy",
                 "tenant_slug": "legacy",
-                "assignment_id": "XSWL-2",
+                "assignment_id": "XSWL-1",
                 "dispatch_flow": "complete",
                 "status": "requires_manual_reset",
             }])
-            self.assertEqual(store.status("XSWL-2"), "requires_manual_reset")
-            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "split-vertical"), split_count)
+            self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
+            self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), create_count)
+            history = store.history_file.read_text(encoding="utf-8")
+            self.assertIn('"task": "XSWL-1"', history)
+            self.assertIn('"result": "requires_manual_reset"', history)
 
     def test_recover_marks_legacy_dispatched_state_for_manual_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

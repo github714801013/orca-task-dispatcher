@@ -37,7 +37,7 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 随后在用户覆盖配置中填写：
 
 - `workspace.projects_root` 和 `workspace.projects`；项目可配置 `description`、`tenants` 与项目级 `branch_priority`。同一 Jira 任务命中多个租户时，每个租户必须输出独立 assignment 和 worktree；分支规则只在所属项目内生效
-- `dispatch.agent_commands`：按平台选择 Claude 启动包装命令。Windows 优先使用可用的 `pwsh.exe`，否则使用 `powershell.exe`；macOS 使用 `/bin/zsh -ilc 'exec claude'`；Linux 使用 `/bin/bash -ilc 'exec claude'`。`dispatch.terminal.shell_commands` 仅用于普通 shell 和 split pane，不控制 separate 布局中的 Claude 启动命令。separate 与 direct 均使用当前工作区当前分支；direct 使用 `development_jira_spec(jira 参考方案驱动流程开发`，并要求全自动执行、无需人员介入；旧配置仍可使用 `dispatch.agent`。
+- `dispatch.agent_commands`：按平台选择 Claude 启动包装命令。Windows 优先使用可用的 `pwsh.exe`，否则使用 `powershell.exe`；macOS 使用 `/bin/zsh -ilc 'exec claude'`；Linux 使用 `/bin/bash -ilc 'exec claude'`。每个任务都在独立 worktree 的独立 tab 中启动该命令，不存在 pane 或普通 shell 会话。direct 与 complete 均使用当前工作区当前分支；direct 使用 `development_jira_spec(jira 参考方案驱动流程开发`，并要求全自动执行、无需人员介入；旧配置仍可使用 `dispatch.agent`。
 - `base_branch.options`
 - `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；字段未配置或值为空时可省略 `reference_plan`，不得伪造字段值
 - 需要时的 `dispatch.skill.command_templates`；提示词整体只按该模板渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身；direct 模板额外通过 `{source_task_id}` 下发原始开发子任务编号，缺省时回退到 `{task_id}`，供实际开发任务按需读取子任务中的仓库方案
@@ -112,24 +112,24 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 
 `worktree_path` 由 dev-spec-gen 统一 worktree CLI 在路由确认后创建或复用并返回；调用该 CLI 前不得询问、要求用户提供或自行猜测路径。若 Orca orchestration 返回 `Dispatch capability is invalid`，只标记为 Orca 编排通信失败；项目、租户、基础分支已明确时仍应继续本地 dev-spec-gen CLI。只有技能缺失、CLI 执行失败、输出不是独立纯 JSON success、返回路径不是有效 linked worktree，或路由无法唯一确定时才暂停。
 
-`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。不同 `dispatch_flow` 可共享该 worktree 或 terminal，但各自使用独立内部状态 key；同一流程重复分发仍会被拒绝。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
+每个任务都必须提供 `worktree_path` 与 `requirement_snapshot_path`：前者是 dev-spec-gen 统一 worktree CLI 创建或复用的独立 linked worktree 绝对路径（不得等于源仓库、必须位于 `workspace.projects_root` 内），后者是通过完整性校验的原始需求快照。不同 `dispatch_flow` 可共享该 worktree 或 terminal，但各自使用独立内部状态 key；同一流程重复分发仍会被拒绝。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；任务描述不内联进命令，只传递快照路径。
 
 同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；同一任务/租户下的 `direct`、`complete`、`proposal` 则共享对外 `assignment_id`，但使用独立内部状态 identity（`<task_id>::<tenant_slug>::flow::<dispatch_flow>`），可并发分发并共享 worktree/terminal。`state`、`recover`、`reset` 均支持 `--dispatch-flow <direct|complete|proposal>`；省略时仅在唯一流程匹配时兼容，多流程会报歧义。旧状态缺少流程字段时仅按 `complete` 解释。`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
-`decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。指定 `tenant` 的租户任务还必须提供各自 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
+`decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。所有任务都必须提供 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
 
-## 布局与状态
+## 分发与状态
 
-- `separate`：每项任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
-- `split`：同一项目、同一租户的任务可在一个 tab 的 pane 中聚合；每条租户 assignment 仍必须绑定各自的 linked worktree，不能因 task_id 相同而共享工作树。
+- 每个任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
+- 不存在布局配置与 pane 聚合：`dispatch.layout.*`、`dispatch.terminal.shell_commands`、`command_templates.split` 已失效，配置中残留这些字段会被忽略，并在 `validate` 结果的 `config.deprecation_warnings` 中列出。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
 - Claude Code TUI 仅在 preview 同时出现明确的 `No, exit` 与 `Yes, I accept` 授权选项时，自动提交一次 `Yes, I accept`；授权界面未消失、终端状态无法确认或发送失败时停止并进入 `requires_manual_reset`。未知登录、更新或其他确认界面绝不自动操作。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。
 - 就绪等待（`tui-idle`，首轮超时 `ready_timeout_ms`，默认 120s，重试逐轮递增至 360s 上限）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
 - `dispatched` 任务会按 `task_id`、`tenant_slug` 与 `dispatch_flow` 三元组跳过，避免同一流程重复发送；不同流程不互相阻塞。为保护整体 `state.json` 的读改写，Dispatcher 仍保留全局运行锁，跨进程状态写入会串行，但不会合并不同流程状态。
-- `launching` 或 `requires_manual_reset` 不会在普通 `launch` 中自动重试。separate 的 `launching` 任务可由 `recover` 按 worktree 路径和唯一标题查找并安全接管；split 的 `launching` 仍需人工复位。确认终端与任务状态后，使用 `reset <task_id>` 清除本地状态；复位 `dispatched` 状态需要明确传入 `--force`。
-- 使用 `recover` 可恢复已分发任务，以及进程中断后尚未发送任务的 separate `launching` 会话；它不会对 split `launching` 或其他状态不确定的任务自动重发。
+- `launching` 或 `requires_manual_reset` 不会在普通 `launch` 中自动重试。`launching` 任务可由 `recover` 按 worktree 路径和唯一标题查找并安全接管。确认终端与任务状态后，使用 `reset <task_id>` 清除本地状态；复位 `dispatched` 状态需要明确传入 `--force`。
+- 使用 `recover` 可恢复已分发任务，以及进程中断后尚未发送任务的 `launching` 会话；它不会对其他状态不确定的任务自动重发。历史 `layout: split` 状态已失效，`recover` 会将其标记为 `requires_manual_reset`，要求人工确认终端与工作目录后复位。
 
 ```bash
 uv run --project . python scripts/dispatcher.py recover
@@ -142,7 +142,7 @@ uv run --project . python scripts/dispatcher.py reset TASK-123 --force --dispatc
 
 - 仅将已确认的任务输入交给 `launch`；不要猜测任务 ID、标题、仓库或路径。
 - 分支名和任务 ID 会被限制为安全字符；任务标题仅按数据处理，不作为 shell 命令执行。
-- Orca 的创建操作不自动重试（仅对 separate 布局的 terminal handle 等待超时先查找唯一已有终端，确认不存在时才自动重建最多三次）；多匹配、查询失败和 split 布局的句柄不确定均需人工复位，因为无法确认副作用是否已经发生。
+- Orca 的创建操作不自动重试（仅对 terminal handle 等待超时先查找唯一已有终端，确认不存在时才自动重建最多三次）；多匹配或查询失败均需人工复位，因为无法确认副作用是否已经发生。
 - Git Bash/MSYS 环境下，Dispatcher 会仅对 Orca CLI 子进程关闭路径参数转换，保证 slash command 和 URL 原样送达终端。
 
 ## 开发与验证

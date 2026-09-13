@@ -85,13 +85,13 @@ task_source:
     例如 XSWL-28372（谢熊坤）归一化到 XSWL-26585，参考方案明确谢熊坤负责 C# oanew、吴遥遥负责 Java stock，可作为唯一锁定 oanew/master-new 的强路由证据；
     这是组合证据示例，不得硬编码任务编号。参考方案缺失时仍可依据其他证据联合决策；只有证据缺失、冲突或无法唯一映射时，才暂停当前任务并继续其他任务。
 
-    同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），每条都必须提供各自 worktree_path；split 不再通过共享源仓库 pane 隐式创建租户工作树。
+    同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），每条都必须提供各自 worktree_path。
     项目和租户确定、worktree 创建后，必须将每个临时需求归档复制到该 worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`。
     最终将需求 Markdown 的绝对路径写入 requirement_snapshot_path；下游先读此文件，再按其相对路径读取附件本体。
     租户任务缺失 worktree_path 或 requirement_snapshot_path，或快照/附件清单未标记 complete、附件大小与 SHA-256 不一致时，`dispatcher.py decide` 对该任务返回 needs_confirmation。
-    调研报告先暂存于 `<root>/.runtime/research/<实际-task-id>-gitnexus.md`。项目和基础分支确定后，separate 和 split 均须先由统一 worktree CLI 创建/复用对应租户 worktree，再写入 launch 输入。
+    调研报告先暂存于 `<root>/.runtime/research/<实际-task-id>-gitnexus.md`。项目和基础分支确定后，必须先由统一 worktree CLI 创建/复用对应 worktree，再写入 launch 输入。
   session_prompt:
-    separate: |
+    complete: |
       # 任务查询、Jira 归档、调研、路由和 worktree 准备均在当前会话完成；仅最终 launch 阶段使用 Orca 绑定并启动 Claude terminal。
       # 不通过 Orca 编排创建或打开新的 Agent 会话。
       dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
@@ -106,17 +106,10 @@ task_source:
       必须使用 dev-spec-gen 公开的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
       仅当 CLI 返回 status=success 的独立纯 JSON stdout 时，才能将其中返回的绝对路径写入 worktree_path；失败输出、混合日志或自行推导的路径均不得使用。
       GitNexus 调研报告必须先从 gitnexus_report_path 读取并校验；报告有效时复用结论并跳过 GitNexus 调研节点。
-      separate 终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
+      终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
       只有确认不存在时才允许重建。多匹配、查询失败或无法确认时停止并等待人工复位，不得猜测或重复发送任务。
       worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发需求编号。
       任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动；这不等同于任务或分发失败，等待补充有效路径或人工处理。
-    split: |
-      # 任务查询、Jira 归档、调研、路由和 worktree 准备均在当前会话完成；仅最终 launch 阶段使用 Orca 绑定并启动 Claude terminal。
-      # 不通过 Orca 编排创建或打开新的 Agent 会话。
-      dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
-      不得使用 rg、目录扫描或其他方式查找 skill 文件；读取固定 SKILL.md 后，只能通过 dev-spec-gen 提供的 CLI 入口获取其他信息。
-      先运行公开 CLI 的 `--help`，再严格按成功 JSON stdout 中的 `next`、公开路径和交接字段继续；不得猜测参数、读取其他内部文件或执行未由 CLI 返回的命令。
-      当前任务已绑定租户独立 worktree。必须复用该路径，不得新建或推断其他 worktree。
     recovery: |
       这是恢复会话。先通过公开 CLI 检查已有工作区、分支和产物；禁止直接读取、搜索或扫描 dev-spec-gen skill 目录及其内部文件。
       仅按 CLI 成功 JSON stdout 的公开交接字段继续任务，不要重复初始化或覆盖已有成果。
@@ -145,17 +138,9 @@ dispatch:
       # 已确认的 launch 阶段才使用 Orca 绑定 worktree 并启动 Claude terminal；前置任务在当前会话完成。
       # Windows 优先 pwsh.exe，未安装时回退 powershell.exe；macOS 使用 zsh，Linux 使用 bash。
       direct: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
-      separate: "/dev-spec-gen {task_url} 当前工作区当前分支 development_proposal_delivery；base_branch={base_branch}；在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
-      split: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务 worktree 中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+      complete: "/dev-spec-gen {task_url} 工作区: 当前工作区当前分支 流程: development_proposal_delivery 调研: 无需调研直接澄清；base_branch={base_branch}；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
       proposal: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
-  layout:
-    group_by: "repository"
-    max_panes_per_tab: 4
-    mode: "separate"
   terminal:
-    shell_commands:
-      windows: "cmd.exe /d /k"
-      posix: "sh -i"
     read_retry_attempts: 2
     read_retry_delay_ms: 500
     # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。

@@ -18,7 +18,6 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -345,7 +344,6 @@ class TerminalPlan:
     repository: Repository
     assignments: tuple[Assignment, ...]
     tab_title: str
-    layout_mode: str
 
 
 @dataclass(frozen=True)
@@ -384,8 +382,6 @@ class TerminalRecord:
     assignment: Assignment
     handle: str
     tab_title: str
-    layout_mode: str
-    pane_index: int
     snapshot: TerminalSnapshot
 
 
@@ -407,13 +403,11 @@ class Config:
     validate_branch: bool
     max_tasks: int
     max_agents: int
-    max_panes: int
     ready_timeout_ms: int
     read_retry_attempts: int
     read_retry_delay_ms: int
     ready_retry_attempts: int
     send_retry_attempts: int
-    shell_command: str
     agent_extra_args: str
     state_file: Path
     task_url_template: str
@@ -424,9 +418,9 @@ class Config:
     command_templates: Mapping[str, str]
     reference_plan_field: str | None = None
     task_source_flows: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
-    layout_mode: str = "split"
     session_prompt: str = ""
     recovery_session_prompt: str = ""
+    deprecation_warnings: tuple[str, ...] = ()
 
     @property
     def runtime_dir(self) -> Path:
@@ -573,6 +567,40 @@ def require_branch_priority(value: Any, field: str) -> tuple[Mapping[str, object
     return tuple(rules)
 
 
+def session_prompt_for(session_prompt: Mapping[str, Any]) -> str:
+    """取唯一的完整开发会话说明；兼容旧 session_prompt.separate 键。"""
+    for key in ("complete", "separate"):
+        value = session_prompt.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise DispatcherError("invalid_config", "task_source.session_prompt 缺少完整开发会话说明（complete）")
+
+
+def deprecation_warnings_for(root_data: Mapping[str, Any]) -> tuple[str, ...]:
+    """列出已失效但仍被忽略的旧配置字段。"""
+    warnings: list[str] = []
+    dispatch = root_data.get("dispatch")
+    if isinstance(dispatch, Mapping):
+        if isinstance(dispatch.get("layout"), Mapping):
+            warnings.append("dispatch.layout 已失效并被忽略：分发固定为每个任务独立终端")
+        terminal = dispatch.get("terminal")
+        if isinstance(terminal, Mapping) and "shell_commands" in terminal:
+            warnings.append("dispatch.terminal.shell_commands 已失效并被忽略：不再创建普通 shell pane")
+        skill = dispatch.get("skill")
+        if isinstance(skill, Mapping):
+            templates = skill.get("command_templates")
+            if isinstance(templates, Mapping) and "split" in templates:
+                warnings.append("dispatch.skill.command_templates.split 已失效并被忽略")
+            if isinstance(templates, Mapping) and "separate" in templates:
+                warnings.append("dispatch.skill.command_templates.separate 已更名为 complete")
+    task_source = root_data.get("task_source")
+    if isinstance(task_source, Mapping):
+        session_prompt = task_source.get("session_prompt")
+        if isinstance(session_prompt, Mapping) and "split" in session_prompt:
+            warnings.append("task_source.session_prompt.split 已失效并被忽略")
+    return tuple(warnings)
+
+
 def load_config(config_file: Path | None = None) -> Config:
     resolved_config_file = resolve_config_path(config_file)
     root_data = config_layers(resolved_config_file)
@@ -583,7 +611,6 @@ def load_config(config_file: Path | None = None) -> Config:
     interaction = require_mapping(root_data.get("interaction"), "interaction")
     dispatch = require_mapping(root_data.get("dispatch"), "dispatch")
     skill = require_mapping(dispatch.get("skill"), "dispatch.skill")
-    layout = require_mapping(dispatch.get("layout"), "dispatch.layout")
     terminal = require_mapping(dispatch.get("terminal"), "dispatch.terminal")
     concurrency = require_mapping(dispatch.get("concurrency"), "dispatch.concurrency")
     dedup = require_mapping(root_data.get("dedup"), "dedup")
@@ -633,21 +660,12 @@ def load_config(config_file: Path | None = None) -> Config:
     require_text(interaction.get("repository_selection"), "interaction.repository_selection")
     require_text(interaction.get("base_branch_selection"), "interaction.base_branch_selection")
     require_integer(interaction.get("ask_batch_size"), "interaction.ask_batch_size", 1, 4)
-    if require_text(layout.get("group_by"), "dispatch.layout.group_by") != "repository":
-        raise DispatcherError("invalid_config", "dispatch.layout.group_by 必须为 repository")
-    layout_mode = require_text(layout.get("mode"), "dispatch.layout.mode")
-    if layout_mode not in {"split", "separate"}:
-        raise DispatcherError("invalid_config", "dispatch.layout.mode 必须为 split 或 separate")
     if not require_bool(dedup.get("enabled"), "dedup.enabled"):
         raise DispatcherError("invalid_config", "dedup.enabled 必须为 true")
 
     task_url_template = require_text(task_source.get("task_url_template"), "task_source.task_url_template")
     task_url_for(task_url_template, "template-check")
     command_templates = require_mapping(skill.get("command_templates"), "dispatch.skill.command_templates")
-    template_values = MappingProxyType({
-        mode: require_text(command_templates.get(mode), f"dispatch.skill.command_templates.{mode}")
-        for mode in ("separate", "split")
-    })
     direct_template = require_text(
         command_templates.get("direct", "/dev-spec-gen {task_url}"),
         "dispatch.skill.command_templates.direct",
@@ -656,12 +674,14 @@ def load_config(config_file: Path | None = None) -> Config:
         command_templates.get("proposal", "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"),
         "dispatch.skill.command_templates.proposal",
     )
-    for template in (*template_values.values(), direct_template, proposal_template):
+    complete_template = command_templates.get("complete")
+    if complete_template is None:
+        complete_template = command_templates.get("separate")
+    complete_template = require_text(complete_template, "dispatch.skill.command_templates.complete")
+    deprecation_warnings = deprecation_warnings_for(root_data)
+    for template in (complete_template, direct_template, proposal_template):
         validate_command_template(template)
 
-    shell_commands = require_mapping(terminal.get("shell_commands"), "dispatch.terminal.shell_commands")
-    shell_platform = "windows" if os.name == "nt" else "posix"
-    shell_command = require_text(shell_commands.get(shell_platform), f"dispatch.terminal.shell_commands.{shell_platform}")
     agent_extra_args = dispatch.get("agent_extra_args")
     if agent_extra_args is None:
         agent_extra_args = ""
@@ -688,13 +708,11 @@ def load_config(config_file: Path | None = None) -> Config:
         validate_branch=require_bool(base_branch.get("validate"), "base_branch.validate"),
         max_tasks=require_integer(task_source.get("max_tasks"), "task_source.max_tasks", 1, 12),
         max_agents=require_integer(concurrency.get("max_agents"), "dispatch.concurrency.max_agents", 1, 12),
-        max_panes=require_integer(layout.get("max_panes_per_tab"), "dispatch.layout.max_panes_per_tab", 1, 4),
         ready_timeout_ms=require_integer(terminal.get("ready_timeout_ms"), "dispatch.terminal.ready_timeout_ms", 1_000, READY_TIMEOUT_MS_MAX),
         read_retry_attempts=require_integer(terminal.get("read_retry_attempts"), "dispatch.terminal.read_retry_attempts", 1, 3),
         read_retry_delay_ms=require_integer(terminal.get("read_retry_delay_ms"), "dispatch.terminal.read_retry_delay_ms", 0, 5_000),
         ready_retry_attempts=require_integer(terminal.get("ready_retry_attempts", 1), "dispatch.terminal.ready_retry_attempts", 0, 3),
         send_retry_attempts=require_integer(terminal.get("send_retry_attempts", 1), "dispatch.terminal.send_retry_attempts", 0, 3),
-        shell_command=shell_command,
         agent_extra_args=agent_extra_args,
         state_file=relative_to_root(root, dedup.get("state_file"), "dedup.state_file"),
         task_url_template=task_url_template,
@@ -707,10 +725,14 @@ def load_config(config_file: Path | None = None) -> Config:
             for name, value in task_source_flows.items()
         }),
         agent_command=agent_command,
-        command_templates=MappingProxyType({**template_values, "direct": direct_template, "proposal": proposal_template}),
-        layout_mode=layout_mode,
-        session_prompt=require_text(session_prompt.get(layout_mode), f"task_source.session_prompt.{layout_mode}"),
+        command_templates=MappingProxyType({
+            "complete": complete_template,
+            "direct": direct_template,
+            "proposal": proposal_template,
+        }),
+        session_prompt=session_prompt_for(session_prompt),
         recovery_session_prompt=recovery_session_prompt,
+        deprecation_warnings=deprecation_warnings,
     )
 
 
@@ -996,24 +1018,22 @@ def validate_assignment(config: Config, assignment: Assignment, repositories: Ma
     expected_task_url = task_url_for(config.task_url_template, assignment.task.task_id)
     if assignment.task.task_url != expected_task_url:
         raise DispatcherError("invalid_input", "task_url 必须由 task_url_template 生成")
-    if assignment.worktree_path is not None:
-        worktree = assignment.worktree_path.resolve()
-        if (
-            not is_within(worktree, config.projects_root)
-            or not worktree.is_dir()
-            or not (worktree / ".git").exists()
-            or not is_linked_worktree(repository, worktree)
-        ):
-            raise DispatcherError("invalid_input", "worktree_path 必须是源仓库的可用 Git worktree")
-        if worktree == repository.path:
-            raise DispatcherError("invalid_input", "worktree_path 不能等于源仓库路径")
-    elif config.layout_mode == "separate" or assignment.tenant_slug != "legacy":
-        raise DispatcherError("invalid_input", "独立租户 assignment 要求主 Agent 提供 worktree_path")
+    if assignment.worktree_path is None:
+        raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
+    worktree = assignment.worktree_path.resolve()
+    if (
+        not is_within(worktree, config.projects_root)
+        or not worktree.is_dir()
+        or not (worktree / ".git").exists()
+        or not is_linked_worktree(repository, worktree)
+    ):
+        raise DispatcherError("invalid_input", "worktree_path 必须是源仓库的可用 Git worktree")
+    if worktree == repository.path:
+        raise DispatcherError("invalid_input", "worktree_path 不能等于源仓库路径")
     validate_gitnexus_report_path(config, assignment)
-    if assignment.requirement_snapshot_path is not None:
-        validate_requirement_snapshot_path(config, assignment)
-    elif assignment.tenant_slug != "legacy":
+    if assignment.requirement_snapshot_path is None:
         raise DispatcherError("invalid_input", "requirement_snapshot_path 是必填项")
+    validate_requirement_snapshot_path(config, assignment)
     if assignment.base_branch is None:
         return
     if assignment.base_branch not in config.branches_for(repository.name):
@@ -1056,48 +1076,29 @@ def validate_state_worktree_ownership(
             raise DispatcherError("invalid_input", "任务工作区已由其他任务分配占用，不能共享 worktree_path")
 
 
-def chunked(values: tuple[Assignment, ...], size: int) -> Iterable[tuple[Assignment, ...]]:
-    iterator = iter(values)
-    while chunk := tuple(islice(iterator, size)):
-        yield chunk
-
-
 def terminal_repositories(plans: Iterable[TerminalPlan]) -> tuple[Repository, ...]:
     repositories: OrderedDict[Path, Repository] = OrderedDict()
     for plan in plans:
         repositories.setdefault(plan.repository.path.resolve(), plan.repository)
     return tuple(repositories.values())
 
+
 def build_terminal_plans(
     assignments: Iterable[Assignment],
     repositories: Mapping[str, Repository],
-    max_panes: int,
-    layout_mode: str = "split",
 ) -> tuple[TerminalPlan, ...]:
-    grouped: OrderedDict[tuple[str, str], list[Assignment]] = OrderedDict()
+    """每个任务分配生成一个独立终端；不再存在布局维度或 pane 聚合。"""
+    plans: list[TerminalPlan] = []
     for assignment in assignments:
         validate_assignment_path(assignment, repositories)
-        grouped.setdefault((assignment.repository, assignment.tenant_slug), []).append(assignment)
-
-    plans: list[TerminalPlan] = []
-    for (repository_name, tenant_slug), values in grouped.items():
-        chunks = (
-            ((assignment,) for assignment in values)
-            if layout_mode == "separate" or any(assignment.worktree_path is not None for assignment in values)
-            else chunked(tuple(values), max_panes)
-        )
-        for tab_index, chunk in enumerate(chunks, start=1):
-            tab_title = (
-                chunk[0].worktree_path.resolve().name
-                if chunk[0].worktree_path is not None
-                else f"{repository_name}{f'.{tenant_slug}' if tenant_slug != 'legacy' else ''}.tab{tab_index}"
-            )
-            plans.append(TerminalPlan(
-                repository=repositories[repository_name],
-                assignments=chunk,
-                tab_title=tab_title,
-                layout_mode=layout_mode,
-            ))
+        worktree_path = assignment.worktree_path
+        if worktree_path is None:
+            raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
+        plans.append(TerminalPlan(
+            repository=repositories[assignment.repository],
+            assignments=(assignment,),
+            tab_title=worktree_path.resolve().name,
+        ))
     return tuple(plans)
 
 
@@ -1331,22 +1332,21 @@ class StateStore:
             },
         }
 
-    def mark_launching(self, assignment: Assignment, plan: TerminalPlan, pane_index: int) -> None:
+    def mark_launching(self, assignment: Assignment, plan: TerminalPlan) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
+        worktree_path = assignment.worktree_path
+        if worktree_path is None:
+            raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
         state_key = state_key_for(assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow)
         next_tasks = {
             **tasks,
             state_key: {
                 "task_id": assignment.task.task_id,
                 "repository": assignment.repository,
-                "repository_path": (
-                    assignment.worktree_path.resolve().as_posix()
-                    if plan.layout_mode == "separate" and assignment.worktree_path is not None
-                    else plan.repository.path.as_posix()
-                ),
-                "worktree_path": assignment.worktree_path.resolve().as_posix() if assignment.worktree_path else None,
+                "repository_path": worktree_path.resolve().as_posix(),
+                "worktree_path": worktree_path.resolve().as_posix(),
                 "source_repository_path": assignment.repository_path.resolve().as_posix(),
                 "base_branch": assignment.base_branch,
                 "tenant": assignment.tenant,
@@ -1364,9 +1364,7 @@ class StateStore:
                 "gitnexus_report_path": assignment.gitnexus_report_path.as_posix() if assignment.gitnexus_report_path else None,
                 "requirement_snapshot_path": assignment.requirement_snapshot_path.as_posix() if assignment.requirement_snapshot_path else None,
                 "dispatch_flow": assignment.dispatch_flow,
-                "layout": plan.layout_mode,
                 "tab_title": plan.tab_title,
-                "pane_index": pane_index,
                 "status": "launching",
                 "dispatch_state": "pending",
                 "updated_at": utc_now(),
@@ -1722,19 +1720,6 @@ class OrcaClient:
         )
         return self._handle(result)
 
-    def terminal_split(self, handle: str, direction: str, command: str) -> str:
-        result = self._call(
-            "terminal",
-            "split",
-            "--terminal",
-            handle,
-            "--direction",
-            direction,
-            "--command",
-            command,
-        )
-        return self._handle(result)
-
     def terminal_rename(self, handle: str, title: str) -> None:
         self._call("terminal", "rename", "--terminal", handle, "--title", title)
 
@@ -1839,8 +1824,14 @@ def task_context_values(assignment: Assignment) -> Mapping[str, str]:
     }
 
 
-def command_for(config: Config, assignment: Assignment, layout_mode: str = "split", recovery: bool = False) -> str:
-    template_key = "proposal" if assignment.dispatch_flow == "proposal" else "direct" if assignment.dispatch_flow == "direct" else layout_mode
+def command_for(config: Config, assignment: Assignment, recovery: bool = False) -> str:
+    template_key = (
+        "proposal"
+        if assignment.dispatch_flow == "proposal"
+        else "direct"
+        if assignment.dispatch_flow == "direct"
+        else "complete"
+    )
     template = config.command_templates.get(template_key)
     if template is None:
         raise DispatcherError("invalid_config", f"未配置 {template_key} 分发命令模板")
@@ -2049,36 +2040,6 @@ def set_worktree_in_progress_safely(
     return None
 
 
-def split_parent_snapshot(
-    entries: Iterable[StateEntry],
-    snapshots: Iterable[TerminalSnapshot],
-    recovered_snapshots: Mapping[str, TerminalSnapshot],
-    tab_id: object,
-    pane_index: int,
-) -> TerminalSnapshot:
-    parent_index = 0 if pane_index == 1 else 1
-    parents = tuple(
-        entry
-        for entry in entries
-        if entry.value.get("status") == "dispatched"
-        and entry.value.get("layout") == "split"
-        and entry.value.get("tab_id") == tab_id
-        and entry.value.get("pane_index") == parent_index
-    )
-    if len(parents) != 1:
-        raise DispatcherError("recovery_parent_missing", "缺少唯一可用的 split 父 pane")
-    parent_entry = parents[0]
-    parent = recovered_snapshots.get(parent_entry.state_key)
-    if parent is None:
-        matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, parent_entry.value))
-        if len(matches) != 1:
-            raise DispatcherError("recovery_parent_missing", "缺少唯一可用的 split 父 pane")
-        parent = matches[0]
-    if not parent.connected or not parent.writable:
-        raise DispatcherError("recovery_parent_missing", "split 父 pane 不可写")
-    return parent
-
-
 def agent_command_for(config: Config, resume: bool = False) -> str:
     arguments = " ".join(
         value for value in (config.agent_extra_args.strip(), "--continue" if resume else "") if value
@@ -2173,7 +2134,7 @@ def resolve_assignment_worktree(
 ) -> OrcaWorktree:
     worktree_path = assignment.worktree_path
     if worktree_path is None:
-        raise DispatcherError("invalid_input", "separate 布局要求主 Agent 提供 worktree_path")
+        raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
     resolved = worktree_path.resolve()
     for worktree in retry_read(config, orca.worktree_list):
         if worktree.path == resolved:
@@ -2248,7 +2209,7 @@ def launch(
 
         retry_read(config, orca.status)
         repository_ids = retry_read(config, orca.repo_ids)
-        plans = build_terminal_plans(selected, repositories, config.max_panes, config.layout_mode)
+        plans = build_terminal_plans(selected, repositories)
         terminal_repositories_to_register = terminal_repositories(plans)
         registered_repositories = False
         for repository in terminal_repositories_to_register:
@@ -2270,20 +2231,7 @@ def launch(
         records: list[TerminalRecord] = []
         worktree_cache: dict[str, OrcaWorktree] = {}
         for plan in plans:
-            handles: dict[int, str] = {}
             for index, assignment in enumerate(plan.assignments):
-                is_split = plan.layout_mode == "split" and index > 0
-                parent_handle = handles.get(0 if index == 1 else 1) if is_split else None
-                if is_split and parent_handle is None:
-                    results.append(assignment_result(
-                        assignment,
-                        "failed_create",
-                        message="前置 pane 创建失败，未创建 terminal",
-                    ))
-                    append_history_safely(store, assignment_history(
-                        assignment, "failed", reason="terminal_precondition"
-                    ))
-                    continue
                 try:
                     terminal_worktree: OrcaWorktree | None = None
                     if assignment.worktree_path is not None:
@@ -2307,36 +2255,25 @@ def launch(
                     ))
                     continue
                 try:
-                    store.mark_launching(assignment, plan, index)
+                    store.mark_launching(assignment, plan)
                 except DispatcherError as error:
                     results.append(assignment_result(
                         assignment, "failed_state", message=error.message
                     ))
                     continue
                 try:
-                    if not is_split:
-                        if terminal_worktree is not None:
-                            handle = create_terminal_with_retry(
-                                orca,
-                                config,
-                                Repository(name=plan.repository.name, path=terminal_worktree.path),
-                                terminal_worktree.selector,
-                                plan.tab_title,
-                                agent_command_for(config),
-                            )
-                        else:
-                            handle = orca.terminal_create(
-                                f"path:{plan.repository.path.as_posix()}",
-                                plan.tab_title,
-                                config.shell_command,
-                            )
-                    elif index == 1:
-                        handle = orca.terminal_split(parent_handle, "horizontal", config.shell_command)
-                    else:
-                        handle = orca.terminal_split(parent_handle, "vertical", config.shell_command)
+                    if terminal_worktree is None:
+                        raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
+                    handle = create_terminal_with_retry(
+                        orca,
+                        config,
+                        Repository(name=plan.repository.name, path=terminal_worktree.path),
+                        terminal_worktree.selector,
+                        plan.tab_title,
+                        agent_command_for(config),
+                    )
                     snapshot = retry_read(config, lambda: orca.terminal_show(handle))
-                    if terminal_worktree is not None:
-                        validate_terminal_snapshot(snapshot, terminal_worktree)
+                    validate_terminal_snapshot(snapshot, terminal_worktree)
                 except DispatcherError as error:
                     results.append(assignment_result(
                         assignment,
@@ -2350,23 +2287,17 @@ def launch(
                     if state_error:
                         results[-1]["state_error"] = state_error
                     continue
-                handles[index] = handle
                 records.append(TerminalRecord(
                     assignment=assignment,
                     handle=handle,
                     tab_title=plan.tab_title,
-                    layout_mode=plan.layout_mode,
-                    pane_index=index,
                     snapshot=snapshot,
                 ))
 
         ready: list[TerminalRecord] = []
         for record in records:
             try:
-                if record.layout_mode == "separate":
-                    retry_ready_wait(orca, record.handle, config)
-                else:
-                    bootstrap_agent(orca, record.handle, config)
+                retry_ready_wait(orca, record.handle, config)
                 ready.append(record)
             except DispatcherError as error:
                 results.append(assignment_result(
@@ -2388,7 +2319,7 @@ def launch(
         for record in ready:
             assignment = record.assignment
             try:
-                retry_send(orca, record.handle, config, command_for(config, assignment, record.layout_mode))
+                retry_send(orca, record.handle, config, command_for(config, assignment))
             except DispatcherError as error:
                 results.append(assignment_result(
                     assignment,
@@ -2475,7 +2406,6 @@ def launch(
                     for assignment in plan.assignments
                 ],
                 "tab_title": plan.tab_title,
-                "layout": plan.layout_mode,
             }
             for plan in plans
         ],
@@ -2509,7 +2439,7 @@ def state_entry_history(entry: StateEntry, result: str, **extra: object) -> dict
 
 def recovery_assignment(entry: StateEntry) -> Assignment:
     value = entry.value
-    required_fields = ("repository", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index")
+    required_fields = ("repository", "worktree_path", "task_url", "title", "tab_title")
     if any(field not in value for field in required_fields):
         raise DispatcherError("recovery_metadata_missing", "任务缺少恢复所需元数据")
     if value.get("status") == "dispatched" and any(field not in value for field in ("tab_id", "leaf_id")):
@@ -2534,7 +2464,7 @@ def recovery_assignment(entry: StateEntry) -> Assignment:
         "gitnexus_report_path": value.get("gitnexus_report_path"),
         "requirement_snapshot_path": value.get("requirement_snapshot_path"),
         "dispatch_flow": value.get("dispatch_flow", entry.dispatch_flow),
-        "worktree_path": value.get("worktree_path") if value.get("layout") == "separate" else None,
+        "worktree_path": value.get("worktree_path"),
     })
 
 
@@ -2600,7 +2530,6 @@ def recover(
             entry
             for entry in selected
             if entry.value.get("status") in {"dispatched", "launching"}
-            and (entry.value.get("status") == "dispatched" or entry.value.get("layout") == "separate")
         )
         if not selected:
             return {"results": []}
@@ -2614,33 +2543,29 @@ def recover(
             value = entry.value
             try:
                 assignment = recovery_assignment(entry)
-                layout_mode = require_text(value.get("layout"), "恢复布局")
-                if layout_mode not in {"split", "separate"}:
-                    raise DispatcherError("recovery_metadata_missing", "任务恢复布局不受支持")
-                pane_index = value.get("pane_index")
-                if not isinstance(pane_index, int) or isinstance(pane_index, bool) or pane_index < 0:
-                    raise DispatcherError("recovery_metadata_missing", "任务 pane_index 不合法")
+                if value.get("layout") == "split":
+                    raise DispatcherError(
+                        "recovery_metadata_missing",
+                        "历史 split 布局状态已失效，请确认终端与工作目录后人工复位",
+                    )
                 source_repository = repository_from_path(
                     assignment.repository,
                     assignment.repository_path,
                     config.projects_root,
                 )
                 validate_gitnexus_report_path(config, assignment)
-                if assignment.requirement_snapshot_path is not None or assignment.tenant_slug != "legacy":
+                if assignment.requirement_snapshot_path is not None:
                     validate_requirement_snapshot_path(config, assignment)
-                if layout_mode == "separate":
-                    worktree_path = assignment.worktree_path
-                    if (
-                        worktree_path is None
-                        or not is_within(worktree_path.resolve(), config.projects_root)
-                        or not worktree_path.is_dir()
-                        or not (worktree_path / ".git").exists()
-                        or not is_linked_worktree(source_repository, worktree_path)
-                    ):
-                        raise DispatcherError("recovery_metadata_missing", "任务 worktree 元数据不合法")
-                    repository = Repository(name=source_repository.name, path=worktree_path.resolve())
-                else:
-                    repository = source_repository
+                worktree_path = assignment.worktree_path
+                if (
+                    worktree_path is None
+                    or not is_within(worktree_path.resolve(), config.projects_root)
+                    or not worktree_path.is_dir()
+                    or not (worktree_path / ".git").exists()
+                    or not is_linked_worktree(source_repository, worktree_path)
+                ):
+                    raise DispatcherError("recovery_metadata_missing", "任务 worktree 元数据不合法")
+                repository = Repository(name=source_repository.name, path=worktree_path.resolve())
                 repository_key = os.path.normcase(os.path.normpath(str(repository.path.resolve())))
                 if repository_key not in repository_ids:
                     orca.repo_add(repository)
@@ -2664,7 +2589,7 @@ def recover(
                 continue
 
             matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, value))
-            if value.get("status") == "launching" and layout_mode == "separate":
+            if value.get("status") == "launching":
                 matches = tuple(
                     snapshot
                     for snapshot in snapshots
@@ -2676,7 +2601,7 @@ def recover(
                         if not snapshot.connected or not snapshot.writable:
                             raise DispatcherError("terminal_state_unverified", "无法确认 launching 终端处于可发送任务状态")
                         retry_ready_wait(orca, snapshot.handle, config)
-                        retry_send(orca, snapshot.handle, config, command_for(config, assignment, layout_mode, recovery=True))
+                        retry_send(orca, snapshot.handle, config, command_for(config, assignment, recovery=True))
                         store.mark_recovered(stored_task_id, snapshot, "handle_recovered")
                     except DispatcherError as error:
                         store.mark_requires_manual_reset(stored_task_id, error.code)
@@ -2719,7 +2644,7 @@ def recover(
                 if is_resumable_shell(snapshot):
                     try:
                         bootstrap_agent(orca, snapshot.handle, config, resume=True)
-                        retry_send(orca, snapshot.handle, config, command_for(config, assignment, layout_mode, recovery=True))
+                        retry_send(orca, snapshot.handle, config, command_for(config, assignment, recovery=True))
                         store.mark_recovered(stored_task_id, snapshot, "recovered")
                     except DispatcherError as error:
                         store.mark_requires_manual_reset(stored_task_id, error.code)
@@ -2758,37 +2683,17 @@ def recover(
 
             try:
                 tab_title = require_text(value.get("tab_title"), "恢复 tab_title")
-                if layout_mode == "split" and pane_index > 0:
-                    parent = split_parent_snapshot(
-                        entries,
-                        snapshots,
-                        recovered_snapshots,
-                        value.get("tab_id"),
-                        pane_index,
-                    )
-                    direction = "horizontal" if pane_index == 1 else "vertical"
-                    handle = orca.terminal_split(parent.handle, direction, config.shell_command)
-                elif layout_mode == "separate":
-                    handle = create_terminal_with_retry(
-                        orca,
-                        config,
-                        repository,
-                        f"path:{repository.path.as_posix()}",
-                        tab_title,
-                        agent_command_for(config),
-                    )
-                else:
-                    handle = orca.terminal_create(
-                        f"path:{repository.path.as_posix()}",
-                        tab_title,
-                        config.shell_command,
-                    )
+                handle = create_terminal_with_retry(
+                    orca,
+                    config,
+                    repository,
+                    f"path:{repository.path.as_posix()}",
+                    tab_title,
+                    agent_command_for(config),
+                )
                 snapshot = retry_read(config, lambda: orca.terminal_show(handle))
-                if layout_mode == "separate":
-                    retry_ready_wait(orca, handle, config)
-                else:
-                    bootstrap_agent(orca, handle, config, resume=True)
-                retry_send(orca, handle, config, command_for(config, assignment, layout_mode, recovery=True))
+                retry_ready_wait(orca, handle, config)
+                retry_send(orca, handle, config, command_for(config, assignment, recovery=True))
                 store.mark_recovered(stored_task_id, snapshot, "recreated")
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
@@ -3047,25 +2952,32 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
             "repository_path": repository.path.as_posix(),
             "base_branch": branch,
         })
-        if assignment.tenant_slug != "legacy":
-            snapshot_error: str | None = None
-            if assignment.worktree_path is None:
-                snapshot_error = "独立租户 assignment 要求提供 worktree_path"
-            elif assignment.requirement_snapshot_path is None:
-                snapshot_error = "requirement_snapshot_path 是必填项"
-            else:
-                try:
-                    validate_requirement_snapshot_path(config, assignment)
-                except DispatcherError as error:
-                    snapshot_error = error.message
-            if snapshot_error:
-                results.append(decision_result(
-                    identity,
-                    "needs_confirmation",
-                    reason=snapshot_error,
-                    candidates={"repositories": [repository.to_dict()], "base_branches": branches},
-                ))
-                continue
+        if assignment.worktree_path is None:
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="每个任务都必须提供独立 worktree_path",
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
+            continue
+        if assignment.requirement_snapshot_path is None:
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="requirement_snapshot_path 是必填项",
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
+            continue
+        try:
+            validate_requirement_snapshot_path(config, assignment)
+        except DispatcherError as error:
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason=error.message,
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
+            continue
         normalized = assignment.to_dict()
         results.append(decision_result(identity, "selected", assignment=normalized))
         selected.append(normalized)
@@ -3162,9 +3074,8 @@ def config_summary(config: Config) -> dict[str, object]:
         "projects_root": config.projects_root.as_posix(),
         "max_tasks": config.max_tasks,
         "max_agents": config.max_agents,
-        "layout": config.layout_mode,
-        "max_panes_per_tab": config.max_panes,
         "state_file": config.state_file.as_posix(),
+        "deprecation_warnings": list(config.deprecation_warnings),
     }
 
 
@@ -3222,7 +3133,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  repository（必填，字符串）：仓库名，来自 repos 输出\n"
             "  repository_path（必填，字符串）：仓库绝对路径\n"
             "  base_branch（可选，字符串或 null）：基础分支，须在仓库白名单且存在\n"
-            "  worktree_path（可选，字符串或 null）：仅 separate 布局必填，须为源仓库已登记的 linked worktree 绝对路径；split 布局不接受\n"
+            "  worktree_path（必填，字符串）：源仓库已登记的 linked worktree 绝对路径；每个任务都必须独立提供\n"
             "  reference_plan（可选，字符串或 null）：参考方案文本，非空时随任务信息发送给下游会话\n"
             "  assignee（可选，字符串或 null）：Jira 当前负责人显示名称，作为项目定位与任务上下文证据\n"
             "  tenant（可选，字符串）：租户显示名称；同一 task_id 的不同租户可分别分发\n"
@@ -3232,8 +3143,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  source_assignee（可选，字符串或 null）：归一化前开发子任务的 Jira 负责人\n"
             "  parent_task_id（可选，字符串或 null）：关联父产品需求编号\n"
             "  parent_assignee（可选，字符串或 null）：父产品需求负责人，仅作上下文\n"
-            "  requirement_snapshot_path（可选，字符串或 null）：已校验的完整原始需求快照绝对路径，随任务上下文发送以复用正文与附件本体；缺失视为分发前置未完成，必须阻断该任务\n"
-            "separate 布局的 worktree 由 dev-spec-gen 统一 worktree CLI 创建或复用独立 linked worktree。"
+            "  requirement_snapshot_path（必填，字符串）：已校验的完整原始需求快照绝对路径，随任务上下文发送以复用正文与附件本体；缺失或不完整必须阻断该任务\n"
+            "每个任务都在独立 linked worktree 中启动独立终端；worktree 由 dev-spec-gen 统一 worktree CLI 创建或复用。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
