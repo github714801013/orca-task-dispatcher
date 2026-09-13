@@ -157,6 +157,48 @@ class Task:
         )
 
 
+def require_dispatch_flow(value: Any, field: str = "dispatch_flow") -> str:
+    dispatch_flow = require_text(value, field)
+    if dispatch_flow not in DISPATCH_FLOWS:
+        raise DispatcherError("invalid_input", "dispatch_flow 必须是 direct、complete 或 proposal")
+    return dispatch_flow
+
+
+def legacy_state_key(task_id: str, tenant_slug: str = "legacy") -> str:
+    task = require_task_id(task_id)
+    tenant = require_tenant_slug(tenant_slug)
+    return task if tenant == "legacy" else f"{task}::{tenant}"
+
+
+def canonical_state_key(task_id: str, tenant_slug: str = "legacy", dispatch_flow: str = "complete") -> str:
+    return f"{require_task_id(task_id)}::{require_tenant_slug(tenant_slug)}::flow::{require_dispatch_flow(dispatch_flow)}"
+
+
+def state_key_for(task_id: str, tenant_slug: str = "legacy", dispatch_flow: str = "complete") -> str:
+    return canonical_state_key(task_id, tenant_slug, dispatch_flow)
+
+
+def parse_state_key(state_key: str) -> tuple[str, str, str | None]:
+    parts = state_key.split("::")
+    if len(parts) == 1:
+        return require_task_id(parts[0]), "legacy", None
+    if len(parts) == 2:
+        return require_task_id(parts[0]), require_tenant_slug(parts[1]), None
+    if len(parts) == 4 and parts[2] == "flow":
+        return require_task_id(parts[0]), require_tenant_slug(parts[1]), require_dispatch_flow(parts[3])
+    raise DispatcherError("state_unreadable", "state.json 状态键格式不受支持")
+
+
+@dataclass(frozen=True)
+class StateEntry:
+    state_key: str
+    value: Mapping[str, object]
+    task_id: str
+    tenant_slug: str
+    dispatch_flow: str
+    assignment_id: str
+
+
 @dataclass(frozen=True)
 class Repository:
     name: str
@@ -249,9 +291,7 @@ class Assignment:
         snapshot_value = requirement_snapshot_path.strip() if isinstance(requirement_snapshot_path, str) else None
         if snapshot_value is not None and not Path(snapshot_value).is_absolute():
             raise DispatcherError("invalid_input", "requirement_snapshot_path 必须是绝对路径")
-        dispatch_flow = require_text(value.get("dispatch_flow", "complete"), "dispatch_flow")
-        if dispatch_flow not in DISPATCH_FLOWS:
-            raise DispatcherError("invalid_input", "dispatch_flow 必须是 direct、complete 或 proposal")
+        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", "complete"))
         return cls(
             task=Task.from_dict(value),
             repository=require_text(value.get("repository"), "repository"),
@@ -410,8 +450,37 @@ def skill_root_from_config(config_file: Path) -> Path:
     return config_file.parent.parent.resolve()
 
 
+CONFIG_DIR_ENVIRONMENT = "ORCA_DISPATCHER_CONFIG_DIR"
+
+
 def config_path_from_script() -> Path:
     return Path(__file__).resolve().parents[1] / "config" / "dispatcher.yaml"
+
+
+def config_path_from_environment() -> Path | None:
+    directory = os.environ.get(CONFIG_DIR_ENVIRONMENT, "").strip()
+    return Path(directory) / "dispatcher.yaml" if directory else None
+
+
+def resolve_config_path(config_file: Path | None) -> Path:
+    if config_file is not None:
+        return config_file
+    environment_path = config_path_from_environment()
+    if environment_path is not None and not environment_path.parent.is_dir():
+        return config_default_path_from_script()
+    return environment_path or config_path_from_script()
+
+
+def config_root_path(config_file: Path | None, resolved_config_file: Path) -> Path:
+    if config_file is None and not resolved_config_file.is_file():
+        return config_path_from_script()
+    return resolved_config_file
+
+
+def child_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop(CONFIG_DIR_ENVIRONMENT, None)
+    return environment
 
 
 def config_default_path_from_script() -> Path:
@@ -432,25 +501,36 @@ def merge_config_values(base: Any, override: Any, path: tuple[str, ...] = ()) ->
     return override
 
 
-def read_config_yaml(config_file: Path, *, required: bool) -> Mapping[str, Any] | None:
+def read_config_yaml(
+    config_file: Path,
+    *,
+    required: bool,
+    error_label: str | None = None,
+) -> Mapping[str, Any] | None:
+    target = error_label or str(config_file)
     try:
         raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
     except FileNotFoundError:
         if not required:
             return None
-        raise DispatcherError("config_unreadable", f"无法读取配置：{config_file}")
+        raise DispatcherError("config_unreadable", f"无法读取配置：{target}")
     except OSError as error:
-        raise DispatcherError("config_unreadable", f"无法读取配置：{config_file}") from error
+        raise DispatcherError("config_unreadable", f"无法读取配置：{target}") from error
+    except UnicodeError as error:
+        raise DispatcherError("invalid_config", f"配置文件编码错误：{target}") from error
     except yaml.YAMLError as error:
-        raise DispatcherError("invalid_config", f"YAML 格式错误：{error}") from error
+        message = f"YAML 格式错误：{error_label or '配置文件'}"
+        raise DispatcherError("invalid_config", message) from error
     return require_mapping(raw, "配置根")
 
 
 def config_layers(config_file: Path | None) -> Mapping[str, Any]:
     default_file = config_default_path_from_script()
     default = read_config_yaml(default_file, required=False)
-    user_file = config_file or config_path_from_script()
-    user = read_config_yaml(user_file, required=False)
+    user_file = resolve_config_path(config_file)
+    environment_path = config_path_from_environment()
+    user_label = "客户 dispatcher.yaml" if user_file == environment_path else None
+    user = read_config_yaml(user_file, required=False, error_label=user_label)
     if default is None and user is None:
         raise DispatcherError("config_unreadable", f"默认配置不存在：{default_file}")
     if default is None:
@@ -493,8 +573,9 @@ def require_branch_priority(value: Any, field: str) -> tuple[Mapping[str, object
     return tuple(rules)
 
 
-def load_config(config_file: Path) -> Config:
-    root_data = config_layers(config_file)
+def load_config(config_file: Path | None = None) -> Config:
+    resolved_config_file = resolve_config_path(config_file)
+    root_data = config_layers(resolved_config_file)
 
     workspace = require_mapping(root_data.get("workspace"), "workspace")
     base_branch = require_mapping(root_data.get("base_branch"), "base_branch")
@@ -507,7 +588,7 @@ def load_config(config_file: Path) -> Config:
     concurrency = require_mapping(dispatch.get("concurrency"), "dispatch.concurrency")
     dedup = require_mapping(root_data.get("dedup"), "dedup")
 
-    root = skill_root_from_config(config_file)
+    root = skill_root_from_config(config_root_path(config_file, resolved_config_file))
     projects_root = Path(require_text(workspace.get("projects_root"), "workspace.projects_root")).resolve()
     if not projects_root.is_dir():
         raise DispatcherError("invalid_config", f"projects_root 不存在：{projects_root}")
@@ -758,6 +839,7 @@ def git_common_dir(path: Path) -> Path | None:
             encoding="utf-8",
             errors="replace",
             check=False,
+            env=child_environment(),
         )
     except OSError:
         return None
@@ -778,6 +860,7 @@ def is_linked_worktree(repository: Repository, worktree: Path) -> bool:
             encoding="utf-8",
             errors="replace",
             check=False,
+            env=child_environment(),
         )
     except OSError:
         return False
@@ -797,6 +880,7 @@ def branch_exists(repository: Repository, branch: str) -> bool:
         encoding="utf-8",
         errors="replace",
         check=False,
+        env=child_environment(),
     )
     return completed.returncode == 0
 
@@ -938,6 +1022,40 @@ def validate_assignment(config: Config, assignment: Assignment, repositories: Ma
         raise DispatcherError("branch_not_found", f"{assignment.base_branch} 在 {repository.name} 中不存在")
 
 
+def validate_assignment_worktrees(assignments: Iterable[Assignment]) -> None:
+    assignments_by_worktree: dict[str, str] = {}
+    for assignment in assignments:
+        if assignment.worktree_path is None:
+            continue
+        worktree_key = os.path.normcase(os.path.normpath(str(assignment.worktree_path.resolve())))
+        assignment_id = assignments_by_worktree.get(worktree_key)
+        if assignment_id is not None and assignment_id != assignment.assignment_id:
+            raise DispatcherError("invalid_input", "不同任务分配不能共享 worktree_path")
+        assignments_by_worktree[worktree_key] = assignment.assignment_id
+
+
+def validate_state_worktree_ownership(
+    store: StateStore,
+    assignments: Iterable[Assignment],
+) -> None:
+    state = store.snapshot()
+    tasks = state["tasks"]
+    assert isinstance(tasks, dict)
+    owners_by_worktree: dict[str, set[str]] = {}
+    for entry in store._resolved_entries(tasks):
+        worktree_path = entry.value.get("worktree_path")
+        if not isinstance(worktree_path, str):
+            continue
+        worktree_key = os.path.normcase(os.path.normpath(str(Path(worktree_path).resolve())))
+        owners_by_worktree.setdefault(worktree_key, set()).add(entry.assignment_id)
+    for assignment in assignments:
+        if assignment.worktree_path is None:
+            continue
+        worktree_key = os.path.normcase(os.path.normpath(str(assignment.worktree_path.resolve())))
+        if any(owner != assignment.assignment_id for owner in owners_by_worktree.get(worktree_key, set())):
+            raise DispatcherError("invalid_input", "任务工作区已由其他任务分配占用，不能共享 worktree_path")
+
+
 def chunked(values: tuple[Assignment, ...], size: int) -> Iterable[tuple[Assignment, ...]]:
     iterator = iter(values)
     while chunk := tuple(islice(iterator, size)):
@@ -1062,21 +1180,166 @@ class StateStore:
             raise DispatcherError("state_unreadable", "state.json 任务记录格式不受支持")
         return state
 
-    def status(self, task_id: str, tenant_slug: str = "legacy") -> str | None:
+    def _entry(self, state_key: str, value: Mapping[str, object]) -> StateEntry:
+        try:
+            key_task_id, key_tenant_slug, key_flow = parse_state_key(state_key)
+            value_task_id = value.get("task_id")
+            task_id = require_task_id(value_task_id) if value_task_id is not None else key_task_id
+            value_tenant_slug = value.get("tenant_slug")
+            tenant_slug = (
+                require_tenant_slug(value_tenant_slug)
+                if value_tenant_slug is not None
+                else key_tenant_slug
+            )
+            value_flow = value.get("dispatch_flow")
+            dispatch_flow = (
+                require_dispatch_flow(value_flow, "state.dispatch_flow")
+                if value_flow is not None
+                else key_flow or "complete"
+            )
+        except DispatcherError as error:
+            raise DispatcherError("state_unreadable", "state.json 任务 identity 不受支持") from error
+        if task_id != key_task_id or tenant_slug != key_tenant_slug or (key_flow is not None and dispatch_flow != key_flow):
+            raise DispatcherError("state_unreadable", "state.json 任务 identity 与状态键不一致")
+        assignment_id = legacy_state_key(task_id, tenant_slug)
+        stored_assignment_id = value.get("assignment_id")
+        if stored_assignment_id is not None and stored_assignment_id != assignment_id:
+            raise DispatcherError("state_unreadable", "state.json assignment_id 与状态键不一致")
+        return StateEntry(state_key, value, task_id, tenant_slug, dispatch_flow, assignment_id)
+
+    def _entries(self, tasks: Mapping[str, object]) -> tuple[StateEntry, ...]:
+        return tuple(
+            self._entry(state_key, value)
+            for state_key, value in tasks.items()
+            if isinstance(value, Mapping)
+        )
+
+    @staticmethod
+    def _state_values_equivalent(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+        ignored = {"task_id", "tenant_slug", "assignment_id", "dispatch_flow", "state_key", "updated_at", "dispatched_at"}
+        return {
+            key: value for key, value in left.items() if key not in ignored
+        } == {
+            key: value for key, value in right.items() if key not in ignored
+        }
+
+    @classmethod
+    def _choose_entry(cls, entries: tuple[StateEntry, ...]) -> StateEntry | None:
+        if not entries:
+            return None
+        if len(entries) == 1:
+            return entries[0]
+        canonical = state_key_for(entries[0].task_id, entries[0].tenant_slug, entries[0].dispatch_flow)
+        canonical_entry = next((entry for entry in entries if entry.state_key == canonical), None)
+        if canonical_entry is not None and all(
+            cls._state_values_equivalent(entry.value, canonical_entry.value) for entry in entries
+        ):
+            return canonical_entry
+        raise DispatcherError("state_conflict", "同一任务流程存在冲突的新旧状态，请人工复位")
+
+    def _resolved_entries(self, tasks: Mapping[str, object]) -> tuple[StateEntry, ...]:
+        grouped: dict[tuple[str, str, str], list[StateEntry]] = {}
+        for entry in self._entries(tasks):
+            grouped.setdefault((entry.task_id, entry.tenant_slug, entry.dispatch_flow), []).append(entry)
+        return tuple(
+            entry
+            for values in grouped.values()
+            for entry in (self._choose_entry(tuple(values)),)
+            if entry is not None
+        )
+
+    def resolve_entry(
+        self,
+        tasks: Mapping[str, object],
+        task_id: str,
+        tenant_slug: str | None = "legacy",
+        dispatch_flow: str | None = None,
+    ) -> StateEntry | None:
+        task = require_task_id(task_id)
+        tenant = require_tenant_slug(tenant_slug) if tenant_slug is not None else None
+        flow = require_dispatch_flow(dispatch_flow) if dispatch_flow is not None else None
+        entries = tuple(
+            entry
+            for entry in self._entries(tasks)
+            if entry.task_id == task
+            and (tenant is None or entry.tenant_slug == tenant)
+            and (flow is None or entry.dispatch_flow == flow)
+        )
+        if tenant is None and any(entry.tenant_slug != "legacy" for entry in entries):
+            raise DispatcherError("assignment_ambiguous", f"任务 {task} 存在租户状态，请指定 --tenant-slug")
+        if flow is not None:
+            tenant_matches = {entry.tenant_slug for entry in entries}
+            if len(tenant_matches) > 1:
+                raise DispatcherError("assignment_ambiguous", f"任务 {task} 存在多个租户状态，请指定 --tenant-slug")
+            return self._choose_entry(entries)
+        by_identity: dict[tuple[str, str], list[StateEntry]] = {}
+        for entry in entries:
+            by_identity.setdefault((entry.tenant_slug, entry.dispatch_flow), []).append(entry)
+        if tenant is not None:
+            if len(by_identity) > 1:
+                raise DispatcherError("assignment_ambiguous", f"任务 {task}/{tenant} 存在多个流程状态，请使用 --dispatch-flow")
+        elif len(by_identity) > 1:
+            if len({entry.tenant_slug for entry in entries}) == 1:
+                raise DispatcherError("assignment_ambiguous", f"任务 {task} 存在多个流程状态，请使用 --dispatch-flow")
+            raise DispatcherError("assignment_ambiguous", f"任务 {task} 存在多个租户或流程状态，请指定筛选条件")
+        return self._choose_entry(tuple(next(iter(by_identity.values()), ())))
+
+    def _matching_entries(
+        self,
+        tasks: Mapping[str, object],
+        entry: StateEntry,
+    ) -> tuple[StateEntry, ...]:
+        return tuple(
+            candidate
+            for candidate in self._entries(tasks)
+            if (
+                candidate.task_id == entry.task_id
+                and candidate.tenant_slug == entry.tenant_slug
+                and candidate.dispatch_flow == entry.dispatch_flow
+            )
+        )
+
+    def status(self, task_id: str, tenant_slug: str = "legacy", dispatch_flow: str | None = "complete") -> str | None:
         tasks = self.snapshot()["tasks"]
         assert isinstance(tasks, dict)
-        key = task_id if tenant_slug == "legacy" else f"{task_id}::{tenant_slug}"
-        value = tasks.get(key)
-        return value.get("status") if isinstance(value, dict) and isinstance(value.get("status"), str) else None
+        entry = self.resolve_entry(tasks, task_id, tenant_slug, dispatch_flow)
+        if entry is None:
+            return None
+        status = entry.value.get("status")
+        return status if isinstance(status, str) else None
+
+    def state_view(self, dispatch_flow: str | None = None) -> dict[str, object]:
+        flow = require_dispatch_flow(dispatch_flow) if dispatch_flow is not None else None
+        state = self.snapshot()
+        tasks = state["tasks"]
+        assert isinstance(tasks, dict)
+        entries = self._resolved_entries(tasks)
+        return {
+            "version": 1,
+            "tasks": {
+                entry.state_key: {
+                    **entry.value,
+                    "task_id": entry.task_id,
+                    "tenant": entry.value.get("tenant", entry.tenant_slug),
+                    "tenant_slug": entry.tenant_slug,
+                    "assignment_id": entry.assignment_id,
+                    "dispatch_flow": entry.dispatch_flow,
+                    "state_key": entry.state_key,
+                }
+                for entry in entries
+                if flow is None or entry.dispatch_flow == flow
+            },
+        }
 
     def mark_launching(self, assignment: Assignment, plan: TerminalPlan, pane_index: int) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
-        state_key = assignment.assignment_id
+        state_key = state_key_for(assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow)
         next_tasks = {
             **tasks,
             state_key: {
+                "task_id": assignment.task.task_id,
                 "repository": assignment.repository,
                 "repository_path": (
                     assignment.worktree_path.resolve().as_posix()
@@ -1115,14 +1378,23 @@ class StateStore:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
-        existing = tasks.get(record.assignment.assignment_id)
+        state_key = state_key_for(
+            record.assignment.task.task_id,
+            record.assignment.tenant_slug,
+            record.assignment.dispatch_flow,
+        )
+        existing = tasks.get(state_key)
         if not isinstance(existing, Mapping):
             raise DispatcherError("state_unreadable", "任务启动状态缺失")
         snapshot = record.snapshot
         next_tasks = {
             **tasks,
-            record.assignment.assignment_id: {
+            state_key: {
                 **existing,
+                "task_id": record.assignment.task.task_id,
+                "tenant_slug": record.assignment.tenant_slug,
+                "assignment_id": record.assignment.assignment_id,
+                "dispatch_flow": record.assignment.dispatch_flow,
                 "status": "dispatched",
                 "terminal_handle": record.handle,
                 "worktree_path": snapshot.worktree_path.as_posix(),
@@ -1136,20 +1408,32 @@ class StateStore:
         }
         atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
 
-    def mark_recovered(self, task_id: str, snapshot: TerminalSnapshot, result: str) -> None:
+    def mark_recovered(self, state_key: str, snapshot: TerminalSnapshot, result: str) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
-        existing = tasks.get(task_id)
+        existing = tasks.get(state_key)
         if not isinstance(existing, Mapping):
             raise DispatcherError("state_unreadable", "待恢复任务状态缺失")
-        previous_history = existing.get("recovery_history")
+        raw_entry = self._entry(state_key, existing)
+        entry = self.resolve_entry(
+            tasks,
+            raw_entry.task_id,
+            raw_entry.tenant_slug,
+            raw_entry.dispatch_flow,
+        )
+        if entry is None:
+            raise DispatcherError("state_unreadable", "待恢复任务状态缺失")
+        previous_history = entry.value.get("recovery_history")
         history = list(previous_history) if isinstance(previous_history, list) else []
         event = {"at": utc_now(), "result": result, "terminal_handle": snapshot.handle}
-        next_tasks = {
-            **tasks,
-            task_id: {
-                **existing,
+        updated = {
+            candidate.state_key: {
+                **candidate.value,
+                "task_id": entry.task_id,
+                "tenant_slug": entry.tenant_slug,
+                "assignment_id": entry.assignment_id,
+                "dispatch_flow": entry.dispatch_flow,
                 "status": "dispatched",
                 "terminal_handle": snapshot.handle,
                 "worktree_path": snapshot.worktree_path.as_posix(),
@@ -1158,44 +1442,71 @@ class StateStore:
                 "terminal_title": snapshot.title,
                 "updated_at": event["at"],
                 "recovery_history": [*history, event],
-            },
+            }
+            for candidate in self._matching_entries(tasks, entry)
         }
-        atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
+        atomic_write_json(self.state_file, {"version": 1, "tasks": {**tasks, **updated}})
 
-    def mark_requires_manual_reset(self, assignment_id: str, reason: str, tenant_slug: str = "legacy") -> None:
+    def mark_requires_manual_reset(
+        self,
+        assignment: Assignment | str,
+        reason: str,
+        tenant_slug: str = "legacy",
+        dispatch_flow: str = "complete",
+    ) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
-        state_key = assignment_id if "::" in assignment_id or tenant_slug == "legacy" else f"{assignment_id}::{tenant_slug}"
-        existing = tasks.get(state_key)
-        if not isinstance(existing, Mapping):
+        if isinstance(assignment, Assignment):
+            entry = self.resolve_entry(
+                tasks,
+                assignment.task.task_id,
+                assignment.tenant_slug,
+                assignment.dispatch_flow,
+            )
+        elif assignment in tasks and isinstance(tasks[assignment], Mapping):
+            entry = self._entry(assignment, tasks[assignment])
+        else:
+            entry = self.resolve_entry(tasks, assignment, tenant_slug, dispatch_flow)
+        if entry is None:
             raise DispatcherError("state_unreadable", "待恢复任务状态缺失")
-        previous_history = existing.get("recovery_history")
-        history = list(previous_history) if isinstance(previous_history, list) else []
+        entry = self.resolve_entry(
+            tasks,
+            entry.task_id,
+            entry.tenant_slug,
+            entry.dispatch_flow,
+        )
+        if entry is None:
+            raise DispatcherError("state_unreadable", "待恢复任务状态缺失")
         event = {"at": utc_now(), "result": "requires_manual_reset", "reason": reason}
-        next_tasks = {
-            **tasks,
-            state_key: {
-                **existing,
+        updated = {}
+        for candidate in self._matching_entries(tasks, entry):
+            previous_history = candidate.value.get("recovery_history")
+            history = list(previous_history) if isinstance(previous_history, list) else []
+            updated[candidate.state_key] = {
+                **candidate.value,
                 "status": "requires_manual_reset",
                 "updated_at": event["at"],
                 "recovery_history": [*history, event],
-            },
-        }
-        atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
+            }
+        atomic_write_json(self.state_file, {"version": 1, "tasks": {**tasks, **updated}})
 
-    def reset(self, task_id: str, force_unlock: bool, force: bool = False, tenant_slug: str | None = None) -> bool:
+    def reset_entry(
+        self,
+        task_id: str,
+        force_unlock: bool,
+        force: bool = False,
+        tenant_slug: str | None = None,
+        dispatch_flow: str | None = None,
+    ) -> StateEntry | None:
         with self.launch_lock(force_unlock):
             state = self.snapshot()
             tasks = state["tasks"]
             assert isinstance(tasks, dict)
-            state_key = task_id if tenant_slug is None else f"{task_id}::{require_tenant_slug(tenant_slug)}"
-            if state_key not in tasks:
-                return False
-            task = tasks[state_key]
-            if not isinstance(task, Mapping):
-                raise DispatcherError("reset_not_allowed", "任务状态格式不合法")
-            status = task.get("status")
+            entry = self.resolve_entry(tasks, task_id, tenant_slug, dispatch_flow)
+            if entry is None:
+                return None
+            status = entry.value.get("status")
             if status in {"launching", "requires_manual_reset"}:
                 pass
             elif status == "dispatched" and force:
@@ -1205,9 +1516,24 @@ class StateStore:
                     "reset_not_allowed",
                     "仅允许复位 launching 或 requires_manual_reset 状态；复位 dispatched 状态需使用 --force",
                 )
-            next_tasks = {key: value for key, value in tasks.items() if key != state_key}
+            matching_keys = {
+                candidate.state_key for candidate in self._matching_entries(tasks, entry)
+            }
+            next_tasks = {
+                key: value for key, value in tasks.items() if key not in matching_keys
+            }
             atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
-            return True
+            return entry
+
+    def reset(
+        self,
+        task_id: str,
+        force_unlock: bool,
+        force: bool = False,
+        tenant_slug: str | None = None,
+        dispatch_flow: str | None = None,
+    ) -> bool:
+        return self.reset_entry(task_id, force_unlock, force, tenant_slug, dispatch_flow) is not None
 
     def write_current_run(self, value: Mapping[str, object]) -> None:
         atomic_write_json(self.current_run_file, value)
@@ -1222,6 +1548,7 @@ class StateStore:
 
     @contextmanager
     def launch_lock(self, force_unlock: bool) -> Iterator[None]:
+        # ponytail：state.json 是整文件读改写；保留全局锁，未来改为事务化状态存储后再支持跨进程按流程并行写入。
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
         if self.lock_file.exists():
@@ -1275,7 +1602,7 @@ class OrcaClient:
         allow_nonzero: bool = False,
         timeout_seconds: float = ORCA_COMMAND_TIMEOUT_SECONDS,
     ) -> Mapping[str, Any]:
-        child_env = os.environ.copy()
+        child_env = child_environment()
         child_env.update({
             "MSYS_NO_PATHCONV": "1",
             "MSYS2_ARG_CONV_EXCL": "*",
@@ -1665,9 +1992,32 @@ def bootstrap_agent(orca: OrcaClient, handle: str, config: Config, resume: bool 
     retry_ready_wait(orca, handle, config, resend_command=command)
 
 
+def assignment_result(assignment: Assignment, status: str, **extra: object) -> dict[str, object]:
+    return {
+        "task_id": assignment.task.task_id,
+        "tenant": assignment.tenant,
+        "tenant_slug": assignment.tenant_slug,
+        "assignment_id": assignment.assignment_id,
+        "dispatch_flow": assignment.dispatch_flow,
+        "status": status,
+        **extra,
+    }
+
+
+def assignment_history(assignment: Assignment, result: str, **extra: object) -> dict[str, object]:
+    return {
+        "task": assignment.task.task_id,
+        "tenant_slug": assignment.tenant_slug,
+        "assignment_id": assignment.assignment_id,
+        "dispatch_flow": assignment.dispatch_flow,
+        "result": result,
+        **extra,
+    }
+
+
 def mark_manual_reset_safely(store: StateStore, assignment: Assignment, reason: str) -> str | None:
     try:
-        store.mark_requires_manual_reset(assignment.assignment_id, reason)
+        store.mark_requires_manual_reset(assignment, reason)
     except DispatcherError as error:
         return error.message
     return None
@@ -1683,24 +2033,24 @@ def append_history_safely(store: StateStore, value: Mapping[str, object]) -> str
 def set_worktree_in_progress_safely(
     orca: OrcaClient,
     store: StateStore,
-    task_id: str,
+    assignment: Assignment,
     snapshot: TerminalSnapshot,
 ) -> str | None:
     try:
         orca.worktree_set_in_progress(snapshot.worktree_path)
     except DispatcherError as error:
-        append_history_safely(store, {
-            "task": task_id,
-            "terminal_handle": snapshot.handle,
-            "result": "workspace_status_failed",
-            "reason": error.message,
-        })
+        append_history_safely(store, assignment_history(
+            assignment,
+            "workspace_status_failed",
+            terminal_handle=snapshot.handle,
+            reason=error.message,
+        ))
         return error.message
     return None
 
 
 def split_parent_snapshot(
-    tasks: Mapping[str, object],
+    entries: Iterable[StateEntry],
     snapshots: Iterable[TerminalSnapshot],
     recovered_snapshots: Mapping[str, TerminalSnapshot],
     tab_id: object,
@@ -1708,20 +2058,19 @@ def split_parent_snapshot(
 ) -> TerminalSnapshot:
     parent_index = 0 if pane_index == 1 else 1
     parents = tuple(
-        (stored_task_id, value)
-        for stored_task_id, value in tasks.items()
-        if isinstance(value, Mapping)
-        and value.get("status") == "dispatched"
-        and value.get("layout") == "split"
-        and value.get("tab_id") == tab_id
-        and value.get("pane_index") == parent_index
+        entry
+        for entry in entries
+        if entry.value.get("status") == "dispatched"
+        and entry.value.get("layout") == "split"
+        and entry.value.get("tab_id") == tab_id
+        and entry.value.get("pane_index") == parent_index
     )
     if len(parents) != 1:
         raise DispatcherError("recovery_parent_missing", "缺少唯一可用的 split 父 pane")
-    parent_task_id, parent_value = parents[0]
-    parent = recovered_snapshots.get(parent_task_id)
+    parent_entry = parents[0]
+    parent = recovered_snapshots.get(parent_entry.state_key)
     if parent is None:
-        matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, parent_value))
+        matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, parent_entry.value))
         if len(matches) != 1:
             raise DispatcherError("recovery_parent_missing", "缺少唯一可用的 split 父 pane")
         parent = matches[0]
@@ -1850,20 +2199,30 @@ def launch(
     orca: OrcaClient,
     force_unlock: bool,
 ) -> dict[str, object]:
-    task_ids = [assignment.assignment_id for assignment in assignments]
+    task_ids = [
+        (assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow)
+        for assignment in assignments
+    ]
     if len(task_ids) != len(set(task_ids)):
-        raise DispatcherError("invalid_input", "同一输入中不能包含重复 task_id 与 tenant 组合")
+        raise DispatcherError("invalid_input", "同一输入中不能包含重复 task_id、tenant 和 dispatch_flow")
 
     repositories = repositories_for_assignments(config, assignments)
     for assignment in assignments:
         validate_assignment(config, assignment, repositories)
+    validate_assignment_worktrees(assignments)
 
     with store.launch_lock(force_unlock):
-        dispatched = tuple(assignment for assignment in assignments if store.status(assignment.task.task_id, assignment.tenant_slug) == "dispatched")
+        validate_state_worktree_ownership(store, assignments)
+        dispatched = tuple(
+            assignment
+            for assignment in assignments
+            if store.status(assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow) == "dispatched"
+        )
         uncertain = tuple(
             assignment
             for assignment in assignments
-            if store.status(assignment.task.task_id, assignment.tenant_slug) in {"launching", "requires_manual_reset"}
+            if store.status(assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow)
+            in {"launching", "requires_manual_reset"}
         )
         eligible = tuple(
             assignment
@@ -1874,15 +2233,16 @@ def launch(
         selected = eligible[:capacity]
         ignored = eligible[capacity:]
         results: list[dict[str, object]] = [
-            {"task_id": assignment.task.task_id, "tenant": assignment.tenant, "assignment_id": assignment.assignment_id, "status": "skipped_dispatched"} for assignment in dispatched
+            assignment_result(assignment, "skipped_dispatched") for assignment in dispatched
         ] + [
-            {"task_id": assignment.task.task_id, "tenant": assignment.tenant, "assignment_id": assignment.assignment_id, "status": "requires_manual_reset"} for assignment in uncertain
+            assignment_result(assignment, "requires_manual_reset") for assignment in uncertain
         ]
 
         if not selected:
             return {
                 "results": results,
                 "ignored_task_ids": [assignment.task.task_id for assignment in ignored],
+                "ignored_assignments": [assignment_result(assignment, "ignored") for assignment in ignored],
                 "plans": [],
             }
 
@@ -1915,17 +2275,20 @@ def launch(
                 is_split = plan.layout_mode == "split" and index > 0
                 parent_handle = handles.get(0 if index == 1 else 1) if is_split else None
                 if is_split and parent_handle is None:
-                    results.append({
-                        "task_id": assignment.task.task_id,
-                        "status": "failed_create",
-                        "message": "前置 pane 创建失败，未创建 terminal",
-                    })
-                    append_history_safely(store, {"task": assignment.task.task_id, "result": "failed", "reason": "terminal_precondition"})
+                    results.append(assignment_result(
+                        assignment,
+                        "failed_create",
+                        message="前置 pane 创建失败，未创建 terminal",
+                    ))
+                    append_history_safely(store, assignment_history(
+                        assignment, "failed", reason="terminal_precondition"
+                    ))
                     continue
                 try:
                     terminal_worktree: OrcaWorktree | None = None
                     if assignment.worktree_path is not None:
-                        terminal_worktree = worktree_cache.get(assignment.assignment_id)
+                        worktree_key = os.path.normcase(os.path.normpath(str(assignment.worktree_path.resolve())))
+                        terminal_worktree = worktree_cache.get(worktree_key)
                         if terminal_worktree is None:
                             terminal_worktree = resolve_assignment_worktree(
                                 orca,
@@ -1934,19 +2297,21 @@ def launch(
                                 assignment,
                                 repository_ids,
                             )
-                            worktree_cache[assignment.assignment_id] = terminal_worktree
+                            worktree_cache[worktree_key] = terminal_worktree
                 except DispatcherError as error:
-                    results.append({
-                        "task_id": assignment.task.task_id,
-                        "status": "failed_worktree",
-                        "message": error.message,
-                    })
-                    append_history_safely(store, {"task": assignment.task.task_id, "result": "failed", "reason": error.code})
+                    results.append(assignment_result(
+                        assignment, "failed_worktree", message=error.message
+                    ))
+                    append_history_safely(store, assignment_history(
+                        assignment, "failed", reason=error.code
+                    ))
                     continue
                 try:
                     store.mark_launching(assignment, plan, index)
                 except DispatcherError as error:
-                    results.append({"task_id": assignment.task.task_id, "status": "failed_state", "message": error.message})
+                    results.append(assignment_result(
+                        assignment, "failed_state", message=error.message
+                    ))
                     continue
                 try:
                     if not is_split:
@@ -1973,12 +2338,14 @@ def launch(
                     if terminal_worktree is not None:
                         validate_terminal_snapshot(snapshot, terminal_worktree)
                 except DispatcherError as error:
-                    results.append({
-                        "task_id": assignment.task.task_id,
-                        "status": "requires_manual_reset",
-                        "message": error.message,
-                    })
-                    append_history_safely(store, {"task": assignment.task.task_id, "result": "requires_manual_reset", "reason": "terminal_create"})
+                    results.append(assignment_result(
+                        assignment,
+                        "requires_manual_reset",
+                        message=error.message,
+                    ))
+                    append_history_safely(store, assignment_history(
+                        assignment, "requires_manual_reset", reason="terminal_create"
+                    ))
                     state_error = mark_manual_reset_safely(store, assignment, "terminal_create")
                     if state_error:
                         results[-1]["state_error"] = state_error
@@ -2002,18 +2369,18 @@ def launch(
                     bootstrap_agent(orca, record.handle, config)
                 ready.append(record)
             except DispatcherError as error:
-                results.append({
-                    "task_id": record.assignment.task.task_id,
-                    "status": "requires_manual_reset",
-                    "message": error.message,
-                    "terminal_handle": record.handle,
-                })
-                append_history_safely(store, {
-                    "task": record.assignment.task.task_id,
-                    "terminal_handle": record.handle,
-                    "result": "requires_manual_reset",
-                    "reason": "agent_ready",
-                })
+                results.append(assignment_result(
+                    record.assignment,
+                    "requires_manual_reset",
+                    message=error.message,
+                    terminal_handle=record.handle,
+                ))
+                append_history_safely(store, assignment_history(
+                    record.assignment,
+                    "requires_manual_reset",
+                    terminal_handle=record.handle,
+                    reason="agent_ready",
+                ))
                 state_error = mark_manual_reset_safely(store, record.assignment, "agent_ready")
                 if state_error:
                     results[-1]["state_error"] = state_error
@@ -2023,18 +2390,18 @@ def launch(
             try:
                 retry_send(orca, record.handle, config, command_for(config, assignment, record.layout_mode))
             except DispatcherError as error:
-                results.append({
-                    "task_id": assignment.task.task_id,
-                    "status": "requires_manual_reset",
-                    "message": error.message,
-                    "terminal_handle": record.handle,
-                })
-                append_history_safely(store, {
-                    "task": assignment.task.task_id,
-                    "terminal_handle": record.handle,
-                    "result": "requires_manual_reset",
-                    "reason": "terminal_send",
-                })
+                results.append(assignment_result(
+                    assignment,
+                    "requires_manual_reset",
+                    message=error.message,
+                    terminal_handle=record.handle,
+                ))
+                append_history_safely(store, assignment_history(
+                    assignment,
+                    "requires_manual_reset",
+                    terminal_handle=record.handle,
+                    reason="terminal_send",
+                ))
                 state_error = mark_manual_reset_safely(store, assignment, "terminal_send")
                 if state_error:
                     results[-1]["state_error"] = state_error
@@ -2042,42 +2409,42 @@ def launch(
             try:
                 store.mark_dispatched(record)
             except DispatcherError as error:
-                results.append({
-                    "task_id": assignment.task.task_id,
-                    "status": "requires_manual_reset",
-                    "message": error.message,
-                    "terminal_handle": record.handle,
-                })
-                append_history_safely(store, {
-                    "task": assignment.task.task_id,
-                    "terminal_handle": record.handle,
-                    "result": "uncertain",
-                    "reason": "state_write_after_send",
-                })
+                results.append(assignment_result(
+                    assignment,
+                    "requires_manual_reset",
+                    message=error.message,
+                    terminal_handle=record.handle,
+                ))
+                append_history_safely(store, assignment_history(
+                    assignment,
+                    "uncertain",
+                    terminal_handle=record.handle,
+                    reason="state_write_after_send",
+                ))
                 state_error = mark_manual_reset_safely(store, assignment, "state_write_after_send")
                 if state_error:
                     results[-1]["state_error"] = state_error
                 continue
-            result = {
-                "task_id": assignment.task.task_id,
-                "status": "dispatched",
-                "terminal_handle": record.handle,
-            }
+            result = assignment_result(
+                assignment,
+                "dispatched",
+                terminal_handle=record.handle,
+            )
             workspace_status_error = set_worktree_in_progress_safely(
                 orca,
                 store,
-                assignment.task.task_id,
+                assignment,
                 record.snapshot,
             )
             if workspace_status_error:
                 result["workspace_status_error"] = workspace_status_error
             results.append(result)
-            append_history_safely(store, {
-                "task": assignment.task.task_id,
-                "repo": assignment.repository,
-                "terminal_handle": record.handle,
-                "result": "dispatched",
-            })
+            append_history_safely(store, assignment_history(
+                assignment,
+                "dispatched",
+                repo=assignment.repository,
+                terminal_handle=record.handle,
+            ))
 
         current_run = {
             "tasks": [assignment.to_dict() for assignment in selected],
@@ -2093,10 +2460,20 @@ def launch(
     return {
         "results": results,
         "ignored_task_ids": [assignment.task.task_id for assignment in ignored],
+        "ignored_assignments": [assignment_result(assignment, "ignored") for assignment in ignored],
         "plans": [
             {
                 "repository": plan.repository.to_dict(),
                 "task_ids": [assignment.task.task_id for assignment in plan.assignments],
+                "assignments": [
+                    {
+                        "task_id": assignment.task.task_id,
+                        "tenant_slug": assignment.tenant_slug,
+                        "assignment_id": assignment.assignment_id,
+                        "dispatch_flow": assignment.dispatch_flow,
+                    }
+                    for assignment in plan.assignments
+                ],
                 "tab_title": plan.tab_title,
                 "layout": plan.layout_mode,
             }
@@ -2106,7 +2483,32 @@ def launch(
     }
 
 
-def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
+def state_entry_result(entry: StateEntry, status: str, **extra: object) -> dict[str, object]:
+    return {
+        "task_id": entry.task_id,
+        "tenant": entry.value.get("tenant", entry.tenant_slug),
+        "tenant_slug": entry.tenant_slug,
+        "assignment_id": entry.assignment_id,
+        "dispatch_flow": entry.dispatch_flow,
+        "status": status,
+        **extra,
+    }
+
+
+def state_entry_history(entry: StateEntry, result: str, **extra: object) -> dict[str, object]:
+    return {
+        "task": entry.task_id,
+        "tenant_slug": entry.tenant_slug,
+        "assignment_id": entry.assignment_id,
+        "dispatch_flow": entry.dispatch_flow,
+        "state_key": entry.state_key,
+        "result": result,
+        **extra,
+    }
+
+
+def recovery_assignment(entry: StateEntry) -> Assignment:
+    value = entry.value
     required_fields = ("repository", "worktree_path", "task_url", "title", "layout", "tab_title", "pane_index")
     if any(field not in value for field in required_fields):
         raise DispatcherError("recovery_metadata_missing", "任务缺少恢复所需元数据")
@@ -2114,7 +2516,7 @@ def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
         raise DispatcherError("recovery_metadata_missing", "已分发任务缺少终端身份元数据")
     repository_path = value.get("source_repository_path", value.get("repository_path"))
     return Assignment.from_dict({
-        "task_id": value.get("task_id", task_id.partition("::")[0]),
+        "task_id": value.get("task_id", entry.task_id),
         "title": value.get("title"),
         "description": value.get("description", ""),
         "task_url": value.get("task_url"),
@@ -2127,11 +2529,11 @@ def recovery_assignment(task_id: str, value: Mapping[str, Any]) -> Assignment:
         "source_assignee": value.get("source_assignee"),
         "parent_task_id": value.get("parent_task_id"),
         "parent_assignee": value.get("parent_assignee"),
-        "tenant": value.get("tenant", "legacy"),
-        "tenant_slug": value.get("tenant_slug", "legacy"),
+        "tenant": value.get("tenant", entry.tenant_slug),
+        "tenant_slug": value.get("tenant_slug", entry.tenant_slug),
         "gitnexus_report_path": value.get("gitnexus_report_path"),
         "requirement_snapshot_path": value.get("requirement_snapshot_path"),
-        "dispatch_flow": value.get("dispatch_flow", "complete"),
+        "dispatch_flow": value.get("dispatch_flow", entry.dispatch_flow),
         "worktree_path": value.get("worktree_path") if value.get("layout") == "separate" else None,
     })
 
@@ -2156,32 +2558,50 @@ def recover(
     task_id: str | None,
     force_unlock: bool,
     tenant_slug: str | None = None,
+    dispatch_flow: str | None = None,
 ) -> dict[str, object]:
     with store.launch_lock(force_unlock):
         state = store.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
-        state_key: str | None = None
+        entries = store._resolved_entries(tasks)
         if task_id is not None:
-            if tenant_slug is not None:
-                state_key = f"{task_id}::{require_tenant_slug(tenant_slug)}"
-            elif task_id in tasks:
-                state_key = task_id
-            elif any(key.startswith(f"{task_id}::") for key in tasks):
+            task = require_task_id(task_id)
+            candidates = tuple(entry for entry in entries if entry.task_id == task)
+            if tenant_slug is None:
+                tenant_slugs = {entry.tenant_slug for entry in candidates}
+                if tenant_slugs and tenant_slugs != {"legacy"}:
+                    raise DispatcherError(
+                        "assignment_ambiguous",
+                        f"任务 {task} 存在多个租户状态，恢复时必须使用 --tenant-slug",
+                    )
+            else:
+                tenant = require_tenant_slug(tenant_slug)
+                candidates = tuple(entry for entry in candidates if entry.tenant_slug == tenant)
+            if dispatch_flow is not None:
+                flow = require_dispatch_flow(dispatch_flow)
+                candidates = tuple(entry for entry in candidates if entry.dispatch_flow == flow)
+            elif len({entry.dispatch_flow for entry in candidates}) > 1:
                 raise DispatcherError(
                     "assignment_ambiguous",
-                    f"任务 {task_id} 存在多个租户状态，恢复时必须使用 --tenant-slug",
+                    f"任务 {task} 存在多个流程状态，恢复时必须使用 --dispatch-flow",
                 )
-            else:
-                state_key = task_id
-        selected = [
-            (stored_task_id, value)
-            for stored_task_id, value in tasks.items()
-            if (state_key is None or stored_task_id == state_key)
-            and isinstance(value, Mapping)
-            and value.get("status") in {"dispatched", "launching"}
-            and (value.get("status") == "dispatched" or value.get("layout") == "separate")
-        ]
+            selected = candidates
+        else:
+            tenant = require_tenant_slug(tenant_slug) if tenant_slug is not None else None
+            flow = require_dispatch_flow(dispatch_flow) if dispatch_flow is not None else None
+            selected = tuple(
+                entry
+                for entry in entries
+                if (tenant is None or entry.tenant_slug == tenant)
+                and (flow is None or entry.dispatch_flow == flow)
+            )
+        selected = tuple(
+            entry
+            for entry in selected
+            if entry.value.get("status") in {"dispatched", "launching"}
+            and (entry.value.get("status") == "dispatched" or entry.value.get("layout") == "separate")
+        )
         if not selected:
             return {"results": []}
 
@@ -2189,9 +2609,11 @@ def recover(
         repository_ids = retry_read(config, orca.repo_ids)
         results: list[dict[str, object]] = []
         recovered_snapshots: dict[str, TerminalSnapshot] = {}
-        for stored_task_id, value in selected:
+        for entry in selected:
+            stored_task_id = entry.state_key
+            value = entry.value
             try:
-                assignment = recovery_assignment(stored_task_id, value)
+                assignment = recovery_assignment(entry)
                 layout_mode = require_text(value.get("layout"), "恢复布局")
                 if layout_mode not in {"split", "separate"}:
                     raise DispatcherError("recovery_metadata_missing", "任务恢复布局不受支持")
@@ -2225,16 +2647,20 @@ def recover(
                     repository_ids[repository_key] = "registered"
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
-                append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
-                results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason=error.code
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
 
             try:
                 snapshots = retry_read(config, lambda: orca.terminal_list(repository))
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
-                append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
-                results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason=error.code
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
 
             matches = tuple(snapshot for snapshot in snapshots if snapshot_matches_state(snapshot, value))
@@ -2254,14 +2680,20 @@ def recover(
                         store.mark_recovered(stored_task_id, snapshot, "handle_recovered")
                     except DispatcherError as error:
                         store.mark_requires_manual_reset(stored_task_id, error.code)
-                        append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
-                        results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                        append_history_safely(store, state_entry_history(
+                            entry, "requires_manual_reset", reason=error.code
+                        ))
+                        results.append(state_entry_result(entry, "requires_manual_reset"))
                         continue
-                    result = {"task_id": stored_task_id, "status": "recovered", "terminal_handle": snapshot.handle}
-                    workspace_status_error = set_worktree_in_progress_safely(orca, store, stored_task_id, snapshot)
+                    result = state_entry_result(
+                        entry, "recovered", terminal_handle=snapshot.handle
+                    )
+                    workspace_status_error = set_worktree_in_progress_safely(orca, store, assignment, snapshot)
                     if workspace_status_error:
                         result["workspace_status_error"] = workspace_status_error
-                    append_history_safely(store, {"task": stored_task_id, "result": "handle_recovered", "terminal_handle": snapshot.handle})
+                    append_history_safely(store, state_entry_history(
+                        entry, "handle_recovered", terminal_handle=snapshot.handle
+                    ))
                     results.append(result)
                     continue
             if len(matches) == 1:
@@ -2273,11 +2705,15 @@ def recover(
                 ):
                     store.mark_recovered(stored_task_id, snapshot, "native_recovered")
                     recovered_snapshots[stored_task_id] = snapshot
-                    result = {"task_id": stored_task_id, "status": "native_recovered", "terminal_handle": snapshot.handle}
-                    workspace_status_error = set_worktree_in_progress_safely(orca, store, stored_task_id, snapshot)
+                    result = state_entry_result(
+                        entry, "native_recovered", terminal_handle=snapshot.handle
+                    )
+                    workspace_status_error = set_worktree_in_progress_safely(orca, store, assignment, snapshot)
                     if workspace_status_error:
                         result["workspace_status_error"] = workspace_status_error
-                    append_history_safely(store, {"task": stored_task_id, "result": "native_recovered", "terminal_handle": snapshot.handle})
+                    append_history_safely(store, state_entry_history(
+                        entry, "native_recovered", terminal_handle=snapshot.handle
+                    ))
                     results.append(result)
                     continue
                 if is_resumable_shell(snapshot):
@@ -2287,34 +2723,44 @@ def recover(
                         store.mark_recovered(stored_task_id, snapshot, "recovered")
                     except DispatcherError as error:
                         store.mark_requires_manual_reset(stored_task_id, error.code)
-                        append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
-                        results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                        append_history_safely(store, state_entry_history(
+                            entry, "requires_manual_reset", reason=error.code
+                        ))
+                        results.append(state_entry_result(entry, "requires_manual_reset"))
                         continue
-                    append_history_safely(store, {"task": stored_task_id, "result": "recovered", "terminal_handle": snapshot.handle})
+                    append_history_safely(store, state_entry_history(
+                        entry, "recovered", terminal_handle=snapshot.handle
+                    ))
                     recovered_snapshots[stored_task_id] = snapshot
-                    result = {"task_id": stored_task_id, "status": "recovered", "terminal_handle": snapshot.handle}
-                    workspace_status_error = set_worktree_in_progress_safely(orca, store, stored_task_id, snapshot)
+                    result = state_entry_result(
+                        entry, "recovered", terminal_handle=snapshot.handle
+                    )
+                    workspace_status_error = set_worktree_in_progress_safely(orca, store, assignment, snapshot)
                     if workspace_status_error:
                         result["workspace_status_error"] = workspace_status_error
                     results.append(result)
                     continue
 
                 store.mark_requires_manual_reset(stored_task_id, "terminal_state_unverified")
-                append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": "terminal_state_unverified"})
-                results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason="terminal_state_unverified"
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
 
             if len(matches) > 1:
                 store.mark_requires_manual_reset(stored_task_id, "terminal_identity_ambiguous")
-                append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": "terminal_identity_ambiguous"})
-                results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason="terminal_identity_ambiguous"
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
 
             try:
                 tab_title = require_text(value.get("tab_title"), "恢复 tab_title")
                 if layout_mode == "split" and pane_index > 0:
                     parent = split_parent_snapshot(
-                        tasks,
+                        entries,
                         snapshots,
                         recovered_snapshots,
                         value.get("tab_id"),
@@ -2346,15 +2792,19 @@ def recover(
                 store.mark_recovered(stored_task_id, snapshot, "recreated")
             except DispatcherError as error:
                 store.mark_requires_manual_reset(stored_task_id, error.code)
-                append_history_safely(store, {"task": stored_task_id, "result": "requires_manual_reset", "reason": error.code})
-                results.append({"task_id": stored_task_id, "status": "requires_manual_reset"})
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason=error.code
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
             recovered_snapshots[stored_task_id] = snapshot
-            result = {"task_id": stored_task_id, "status": "recovered", "terminal_handle": snapshot.handle}
-            workspace_status_error = set_worktree_in_progress_safely(orca, store, stored_task_id, snapshot)
+            result = state_entry_result(entry, "recovered", terminal_handle=snapshot.handle)
+            workspace_status_error = set_worktree_in_progress_safely(orca, store, assignment, snapshot)
             if workspace_status_error:
                 result["workspace_status_error"] = workspace_status_error
-            append_history_safely(store, {"task": stored_task_id, "result": "recovered", "terminal_handle": snapshot.handle})
+            append_history_safely(store, state_entry_history(
+                entry, "recovered", terminal_handle=snapshot.handle
+            ))
             results.append(result)
 
     return {"results": results}
@@ -2392,7 +2842,7 @@ def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
         "dispatch_flow", "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_path",
     }
     values: list[Mapping[str, Any]] = []
-    task_ids: set[tuple[str, str]] = set()
+    task_ids: set[tuple[str, str, str]] = set()
     for item in tasks:
         if not isinstance(item, Mapping):
             raise DispatcherError("invalid_input", "tasks 每项必须是对象")
@@ -2404,9 +2854,9 @@ def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
         tenant = item.get("tenant")
         if tenant_slug == "legacy" and isinstance(tenant, str) and tenant.strip() != "legacy":
             raise DispatcherError("invalid_input", "已指定 tenant 时不能使用保留 tenant_slug：legacy")
-        identity = (task_id, tenant_slug)
+        identity = (task_id, tenant_slug, require_dispatch_flow(item.get("dispatch_flow", "complete")))
         if identity in task_ids:
-            raise DispatcherError("invalid_input", f"任务 ID 与租户重复：{task_id}/{tenant_slug}")
+            raise DispatcherError("invalid_input", f"任务 ID、租户和流程重复：{task_id}/{tenant_slug}")
         task_ids.add(identity)
         values.append(item)
     return tuple(values)
@@ -2453,6 +2903,10 @@ def decision_branch_candidates(config: Config, repository: Repository) -> list[d
     ]
 
 
+def decision_result(identity: Mapping[str, object], status: str, **extra: object) -> dict[str, object]:
+    return {**identity, "status": status, **extra}
+
+
 def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict[str, object]:
     """校验外部调研后的显式路由，不执行语义匹配或任何外部调用。"""
     repositories = repositories_by_name(config)
@@ -2467,6 +2921,16 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
     selected: list[dict[str, object]] = []
     for value in values:
         task = Task.from_dict(value)
+        tenant = require_optional_text(value.get("tenant"), "tenant") or "legacy"
+        tenant_slug = require_tenant_slug(value.get("tenant_slug", "legacy"))
+        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", "complete"))
+        identity = {
+            "task_id": task.task_id,
+            "tenant": tenant,
+            "tenant_slug": tenant_slug,
+            "assignment_id": legacy_state_key(task.task_id, tenant_slug),
+            "dispatch_flow": dispatch_flow,
+        }
         repository_name = value.get("repository")
         if repository_name is not None and (not isinstance(repository_name, str) or not repository_name.strip()):
             raise DispatcherError("invalid_input", "repository 必须是字符串或省略")
@@ -2478,53 +2942,49 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
             else []
         )
         if repository_name is None:
-            results.append({
-                "task_id": task.task_id,
-                "status": "needs_confirmation",
-                "reason": "缺少外部联合证据确认的项目决策",
-                "candidates": {
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="缺少外部联合证据确认的项目决策",
+                candidates={
                     "repositories": [repository.to_dict() for repository in repository_candidates],
                     "base_branches": [],
                 },
-            })
+            ))
             continue
         if not repository_candidates:
-            results.append({
-                "task_id": task.task_id,
-                "status": "needs_confirmation",
-                "reason": f"未找到配置项目：{repository_name}",
-                "candidates": {"repositories": [], "base_branches": []},
-            })
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason=f"未找到配置项目：{repository_name}",
+                candidates={"repositories": [], "base_branches": []},
+            ))
             continue
         if len(repository_candidates) != 1:
-            results.append({
-                "task_id": task.task_id,
-                "status": "needs_confirmation",
-                "reason": "无法根据外部联合证据唯一确定项目",
-                "candidates": {
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="无法根据外部联合证据唯一确定项目",
+                candidates={
                     "repositories": [repository.to_dict() for repository in repository_candidates],
                     "base_branches": [],
                 },
-            })
+            ))
             continue
 
         repository = repository_candidates[0]
-        tenant = require_optional_text(value.get("tenant"), "tenant") or "legacy"
-        tenant_slug = require_tenant_slug(value.get("tenant_slug", "legacy"))
         project_tenants = config.tenants_for(repository.name)
         if tenant_slug != "legacy" and project_tenants.get(tenant) != tenant_slug:
-            results.append({
-                "task_id": task.task_id,
-                "tenant": tenant,
-                "tenant_slug": tenant_slug,
-                "status": "needs_confirmation",
-                "reason": f"租户不属于项目配置：{repository.name}/{tenant}",
-                "candidates": {
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason=f"租户不属于项目配置：{repository.name}/{tenant}",
+                candidates={
                     "repositories": [repository.to_dict()],
                     "tenants": [{"name": name, "slug": slug} for name, slug in project_tenants.items()],
                     "base_branches": [],
                 },
-            })
+            ))
             continue
         branches = decision_branch_candidates(config, repository)
         preferred_branch = preferred_branch_for(
@@ -2537,48 +2997,48 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
             raise DispatcherError("invalid_input", "base_branch 必须是字符串或 null")
         branch = branch_value.strip() if isinstance(branch_value, str) else None
         if branch is None:
-            results.append({
-                "task_id": task.task_id,
-                "status": "needs_confirmation",
-                "reason": "缺少外部联合证据确认的基础分支决策",
-                "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-            })
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="缺少外部联合证据确认的基础分支决策",
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
             continue
         if branch is not None:
             matching = next((entry for entry in branches if entry["name"] == branch), None)
             if matching is None:
-                results.append({
-                    "task_id": task.task_id,
-                    "status": "needs_confirmation",
-                    "reason": f"基础分支不在 {repository.name} 的配置白名单中",
-                    "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-                })
+                results.append(decision_result(
+                    identity,
+                    "needs_confirmation",
+                    reason=f"基础分支不在 {repository.name} 的配置白名单中",
+                    candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+                ))
                 continue
             if matching["valid"] is False:
-                results.append({
-                    "task_id": task.task_id,
-                    "status": "needs_confirmation",
-                    "reason": f"基础分支不存在：{repository.name}/{branch}",
-                    "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-                })
+                results.append(decision_result(
+                    identity,
+                    "needs_confirmation",
+                    reason=f"基础分支不存在：{repository.name}/{branch}",
+                    candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+                ))
                 continue
         elif len(branches) > 1:
-            results.append({
-                "task_id": task.task_id,
-                "status": "needs_confirmation",
-                "reason": "无法唯一确定基础分支",
-                "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-            })
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason="无法唯一确定基础分支",
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
             continue
         elif branches:
             branch = branches[0]["name"]
             if branches[0]["valid"] is False:
-                results.append({
-                    "task_id": task.task_id,
-                    "status": "needs_confirmation",
-                    "reason": f"基础分支不存在：{repository.name}/{branch}",
-                    "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-                })
+                results.append(decision_result(
+                    identity,
+                    "needs_confirmation",
+                    reason=f"基础分支不存在：{repository.name}/{branch}",
+                    candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+                ))
                 continue
 
         assignment = Assignment.from_dict({
@@ -2599,17 +3059,15 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
                 except DispatcherError as error:
                     snapshot_error = error.message
             if snapshot_error:
-                results.append({
-                    "task_id": task.task_id,
-                    "tenant": tenant,
-                    "tenant_slug": tenant_slug,
-                    "status": "needs_confirmation",
-                    "reason": snapshot_error,
-                    "candidates": {"repositories": [repository.to_dict()], "base_branches": branches},
-                })
+                results.append(decision_result(
+                    identity,
+                    "needs_confirmation",
+                    reason=snapshot_error,
+                    candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+                ))
                 continue
         normalized = assignment.to_dict()
-        results.append({"task_id": task.task_id, "status": "selected", "assignment": normalized})
+        results.append(decision_result(identity, "selected", assignment=normalized))
         selected.append(normalized)
 
     status = "ready" if all(result["status"] == "selected" for result in results) else "needs_confirmation"
@@ -2712,7 +3170,7 @@ def config_summary(config: Config) -> dict[str, object]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orca 任务分发器")
-    parser.add_argument("--config", type=Path, default=config_path_from_script())
+    parser.add_argument("--config", type=Path, default=None)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("validate", help="校验配置并列出可用仓库")
     commands.add_parser("repos", help="列出候选仓库")
@@ -2720,10 +3178,12 @@ def build_parser() -> argparse.ArgumentParser:
     project.add_argument("--name", required=True)
     branches = commands.add_parser("branches", help="列出并校验仓库分支")
     branches.add_argument("--repository", required=True)
-    commands.add_parser("state", help="读取长期分发状态")
+    state = commands.add_parser("state", help="读取长期分发状态")
+    state.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="按流程筛选状态")
     recover = commands.add_parser("recover", help="恢复已分发任务的 Orca 会话")
     recover.add_argument("--task-id")
     recover.add_argument("--tenant-slug", help="指定同一任务下要恢复的租户")
+    recover.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="指定要恢复的流程")
     recover.add_argument("--force-unlock", action="store_true")
     task_source_parser = commands.add_parser("task-source", help="输出已渲染的任务获取提示词")
     task_source_parser.add_argument("--jql", help="仅本次运行覆盖配置中的 JQL")
@@ -2767,6 +3227,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  assignee（可选，字符串或 null）：Jira 当前负责人显示名称，作为项目定位与任务上下文证据\n"
             "  tenant（可选，字符串）：租户显示名称；同一 task_id 的不同租户可分别分发\n"
             "  tenant_slug（可选，字符串）：租户稳定安全标识；省略时为 legacy\n"
+            "  dispatch_flow（可选，字符串）：分发流程；省略时为 complete，状态去重 identity 包含该字段\n"
             "  source_task_id（可选，字符串或 null）：归一化前的 Jira 开发子任务编号\n"
             "  source_assignee（可选，字符串或 null）：归一化前开发子任务的 Jira 负责人\n"
             "  parent_task_id（可选，字符串或 null）：关联父产品需求编号\n"
@@ -2783,6 +3244,7 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("--force-unlock", action="store_true")
     reset.add_argument("--force", action="store_true", help="允许复位已分发的任务")
     reset.add_argument("--tenant-slug", help="指定同一任务下要复位的租户")
+    reset.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="指定要复位的流程")
     return parser
 
 
@@ -2835,7 +3297,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             ],
         }
     if arguments.command == "state":
-        return {"state": store.snapshot()}
+        return {"state": store.state_view(arguments.dispatch_flow)}
     if arguments.command == "recover":
         return recover(
             config=config,
@@ -2844,6 +3306,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             task_id=arguments.task_id,
             force_unlock=arguments.force_unlock,
             tenant_slug=arguments.tenant_slug,
+            dispatch_flow=arguments.dispatch_flow,
         )
     if arguments.command == "task-source":
         return task_source_prompt(config, arguments.jql, arguments.flow)
@@ -2860,19 +3323,25 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             raise DispatcherError("invalid_input", f"缺少单任务参数：--{missing.replace('_', '-')}")
         return decide_values(config, validate_decision_values([supplied]))
     if arguments.command == "reset":
-        removed = store.reset(
+        removed = store.reset_entry(
             arguments.task_id,
             arguments.force_unlock,
             arguments.force,
             arguments.tenant_slug,
+            dispatch_flow=arguments.dispatch_flow,
         )
-        if removed:
-            append_history_safely(store, {
-                "task": arguments.task_id,
-                "result": "reset",
-                "forced": arguments.force,
-            })
-        return {"task_id": arguments.task_id, "reset": removed}
+        if removed is not None:
+            append_history_safely(store, state_entry_history(
+                removed,
+                "reset",
+                forced=arguments.force,
+            ))
+        return {
+            "task_id": arguments.task_id,
+            "tenant_slug": removed.tenant_slug if removed is not None else arguments.tenant_slug or "legacy",
+            "dispatch_flow": removed.dispatch_flow if removed is not None else arguments.dispatch_flow,
+            "reset": removed is not None,
+        }
     if arguments.command == "launch":
         return launch(
             config=config,

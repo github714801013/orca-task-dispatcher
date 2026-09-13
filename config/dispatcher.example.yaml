@@ -1,6 +1,7 @@
 version: 1
 
 # 默认会使用 --dangerously-skip-permissions；用户可在 dispatcher.yaml 中将 dispatch.agent_extra_args 覆盖为空字符串。
+# 未显式传入 --config 时，可设置 ORCA_DISPATCHER_CONFIG_DIR 指向包含 dispatcher.yaml 的客户配置目录；不自动读取 .env 或其他文件。
 # proposal 的 Jira 节点使用 native_jql_then_parent_post_filter，父需求字段由 Jira 工具读取后再过滤。
 workspace:
   projects_root: "D:/workplace"

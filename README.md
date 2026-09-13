@@ -19,7 +19,7 @@ config/dispatcher.default.yaml  # 托管默认配置，不修改
 config/dispatcher.yaml          # 用户覆盖配置，已忽略，不提交
 ```
 
-用户覆盖按 mapping 递归合并；标量和 `null` 直接覆盖，列表整体替换。显式 `--config <path>` 仍可加载完整旧配置文件。
+用户覆盖按 mapping 递归合并；标量和 `null` 直接覆盖，列表整体替换。未显式传入 `--config` 时，若设置非空 `ORCA_DISPATCHER_CONFIG_DIR`，脚本自动读取其目录下的 `dispatcher.yaml` 作为用户覆盖层；显式 `--config` 优先，环境变量为空或未设置时继续使用默认 `config/dispatcher.yaml`，目录不存在或缺少该文件时仅使用托管默认配置。客户目录中的 `.env` 和其他文件不会自动读取。
 
 后续任务分发在当前会话内完成：当前会话直接执行任务查询、Jira 需求归档、调研、路由判断和 worktree 准备，不通过 Orca 编排创建或打开新的 Agent 会话；仅在最终已确认的 `launch` 阶段，才使用 Orca 绑定 worktree 并启动目标 Claude terminal。
 
@@ -32,7 +32,7 @@ uv sync
 cp config/dispatcher.example.yaml config/dispatcher.yaml
 ```
 
-Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重命名为 `config/dispatcher.yaml`。
+Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重命名为 `config/dispatcher.yaml`。客户配置位于其他目录时，设置 `ORCA_DISPATCHER_CONFIG_DIR` 为该目录；脚本会自动读取其中的 `dispatcher.yaml`，相对目录按当前工作目录解析。
 
 随后在用户覆盖配置中填写：
 
@@ -66,6 +66,9 @@ uv run --project . python scripts/dispatcher.py task-source --flow direct --jql 
 uv run --project . python scripts/dispatcher.py decide --task-id CW-7622 --source-task-id CW-7624 --title "任务标题" --task-url "https://jira.example/CW-7622" --repository finance --base-branch origin/release_saas --dispatch-flow direct
 uv run --project . python scripts/dispatcher.py decide --input decision.json
 uv run --project . python scripts/dispatcher.py state
+uv run --project . python scripts/dispatcher.py state --dispatch-flow direct
+uv run --project . python scripts/dispatcher.py recover --task-id TASK-123 --dispatch-flow complete
+uv run --project . python scripts/dispatcher.py reset TASK-123 --dispatch-flow proposal
 uv run --project . python scripts/dispatcher.py branches --repository example-repository
 ```
 
@@ -73,7 +76,7 @@ uv run --project . python scripts/dispatcher.py branches --repository example-re
 
 1. 运行 `validate` 验证配置和候选仓库。
 2. 运行 `task-source` 获取固定 JQL 与字段契约；由外部 Jira 工具实际拉取开发需求，逐条解析父产品需求，保留实际任务、来源子任务、标题、描述、负责人和参考方案。参考方案按配置 `task_source.reference_plan_field` 指定的 Jira 字段读取并在非空时映射为 `reference_plan`；未配置或值为空时可省略，参考方案缺失不阻断项目与分支的联合决策。
-3. 运行 `state`，跳过 `dispatched`；`launching` 或 `requires_manual_reset` 按现有规则处理。单个任务暂停不得阻塞其他任务。
+3. 运行 `state`，跳过相同任务、租户和流程已是 `dispatched` 的分发；`launching` 或 `requires_manual_reset` 按现有规则处理。direct、complete、proposal 在同一任务/租户下拥有独立状态，支持 `state --dispatch-flow <flow>` 筛选。单个任务暂停不得阻塞其他任务。
 4. 对每个可处理任务，先读取完整 Jira 原始需求与全部附件本体：完整性校验失败时该任务不得进入 GitNexus 调研或分发。需求快照临时保存于 `.runtime/requirements/<实际-task-id>/`；图片在 Markdown 中保留 OCR 文本与语义描述，其他附件保留原件并由 Markdown 索引相对路径、SHA-256 与可读性状态。随后由外部子 Agent 进行一次跨项目、只读的 GitNexus 远程调研，不创建 worktree；报告返回候选、证据和排除理由。再将报告与实际任务标题/描述、子任务负责人、父产品需求、参考方案人员分工及 `repos`、`branches` 描述联合决策仓库、租户和基础分支。同一 Jira 实际任务命中多个项目或租户时，保留同一个 `task_id`，但展开为多条 tenant assignment；例如 saasoanew 的九讯云（智乐方）与易腾各一条，oanew 与 saasoanew 同时命中时也各一条。项目配置的 `branch_priority` 优先于普通分支候选，例如项目内同时命中九机与九讯云（智乐方）时选择 `release_saas`。
 5. 通过 `decide` 校验外部联合决策：可以使用单任务 CLI 参数直接传入 `dispatch-flow direct` 与 `source-task-id`，也可以使用旧版 `--input`。禁止手工重建或删减字段；直接使用返回 JSON 的 `launch_input` 作为后续 `launch` 输入。该命令只校验显式项目/分支，不调用 Jira、GitNexus 或 Orca，也不写分发状态。若输出 `needs_confirmation`，仅暂停对应任务并补充人工决策后重跑；绝不以候选顺序猜测项目或分支。
 6. 将每个归档复制到最终 tenant worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`；将最终快照绝对路径写入 `requirement_snapshot_path`。GitNexus 调研报告先暂存于 `.runtime/research/<实际-task-id>-gitnexus.md`，同样在项目和分支锁定后迁移到最终 worktree。
@@ -109,9 +112,9 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 
 `worktree_path` 由 dev-spec-gen 统一 worktree CLI 在路由确认后创建或复用并返回；调用该 CLI 前不得询问、要求用户提供或自行猜测路径。若 Orca orchestration 返回 `Dispatch capability is invalid`，只标记为 Orca 编排通信失败；项目、租户、基础分支已明确时仍应继续本地 dev-spec-gen CLI。只有技能缺失、CLI 执行失败、输出不是独立纯 JSON success、返回路径不是有效 linked worktree，或路由无法唯一确定时才暂停。
 
-`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
+`split` 布局的旧单租户任务不接受该字段，同一项目的任务在项目主仓库 tab 的 pane 中聚合；但指定了 `tenant` 的租户 assignment 无论哪种布局都必须提供各自 worktree_path。不同 `dispatch_flow` 可共享该 worktree 或 terminal，但各自使用独立内部状态 key；同一流程重复分发仍会被拒绝。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 仅适用于 `separate`，必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；存在快照时任务描述不内联进命令，只传递快照路径。
 
-同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
+同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；同一任务/租户下的 `direct`、`complete`、`proposal` 则共享对外 `assignment_id`，但使用独立内部状态 identity（`<task_id>::<tenant_slug>::flow::<dispatch_flow>`），可并发分发并共享 worktree/terminal。`state`、`recover`、`reset` 均支持 `--dispatch-flow <direct|complete|proposal>`；省略时仅在唯一流程匹配时兼容，多流程会报歧义。旧状态缺少流程字段时仅按 `complete` 解释。`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
 `decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。指定 `tenant` 的租户任务还必须提供各自 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
 
@@ -124,15 +127,15 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。
 - 就绪等待（`tui-idle`，首轮超时 `ready_timeout_ms`，默认 120s，重试逐轮递增至 360s 上限）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
-- `dispatched` 任务会被跳过，避免重复发送。
+- `dispatched` 任务会按 `task_id`、`tenant_slug` 与 `dispatch_flow` 三元组跳过，避免同一流程重复发送；不同流程不互相阻塞。为保护整体 `state.json` 的读改写，Dispatcher 仍保留全局运行锁，跨进程状态写入会串行，但不会合并不同流程状态。
 - `launching` 或 `requires_manual_reset` 不会在普通 `launch` 中自动重试。separate 的 `launching` 任务可由 `recover` 按 worktree 路径和唯一标题查找并安全接管；split 的 `launching` 仍需人工复位。确认终端与任务状态后，使用 `reset <task_id>` 清除本地状态；复位 `dispatched` 状态需要明确传入 `--force`。
 - 使用 `recover` 可恢复已分发任务，以及进程中断后尚未发送任务的 separate `launching` 会话；它不会对 split `launching` 或其他状态不确定的任务自动重发。
 
 ```bash
 uv run --project . python scripts/dispatcher.py recover
-uv run --project . python scripts/dispatcher.py recover --task-id TASK-123 --tenant-slug <slug>
-uv run --project . python scripts/dispatcher.py reset TASK-123
-uv run --project . python scripts/dispatcher.py reset TASK-123 --force
+uv run --project . python scripts/dispatcher.py recover --task-id TASK-123 --tenant-slug <slug> --dispatch-flow direct
+uv run --project . python scripts/dispatcher.py reset TASK-123 --dispatch-flow complete
+uv run --project . python scripts/dispatcher.py reset TASK-123 --force --dispatch-flow proposal
 ```
 
 ## 安全边界

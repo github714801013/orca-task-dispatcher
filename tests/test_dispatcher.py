@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,7 @@ def assignment(
     path: Path,
     branch: str | None = None,
     worktree_path: Path | None = None,
+    dispatch_flow: str = "complete",
 ) -> dispatcher.Assignment:
     return dispatcher.Assignment(
         task=dispatcher.Task(task_id=task_id, title=task_id, task_url=f"https://jira.example/{task_id}"),
@@ -119,6 +121,7 @@ def assignment(
         repository_path=path,
         base_branch=branch,
         worktree_path=worktree_path,
+        dispatch_flow=dispatch_flow,
     )
 
 
@@ -570,6 +573,205 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(stdout.getvalue())["result"]["fetch_prompt"], "按 status = 待开发 查询任务")
+
+    def test_config_directory_environment_loads_dispatcher_yaml_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_dir = root / "customer-config"
+            config_dir.mkdir()
+            config_path = config_dir / "dispatcher.yaml"
+            config_path.write_text(
+                CONFIG.format(projects_root=projects.as_posix()), encoding="utf-8"
+            )
+            (config_dir / ".env").write_text("[", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(config_dir)}, clear=False):
+                arguments = dispatcher.build_parser().parse_args(["validate"])
+                result = dispatcher.execute(arguments)
+
+            self.assertEqual(Path(result["config"]["projects_root"]), projects.resolve())
+
+    def test_environment_config_merges_with_managed_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            managed = root / "managed.yaml"
+            config_dir = root / "customer-config"
+            projects = root / "projects"
+            projects.mkdir()
+            config_dir.mkdir()
+            managed.write_text(CONFIG.replace('query: "status = 待开发"', 'query: "managed"').format(
+                projects_root=projects.as_posix()
+            ), encoding="utf-8")
+            (config_dir / "dispatcher.yaml").write_text(
+                "task_source:\n  query: customer\n", encoding="utf-8"
+            )
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(config_dir)}, clear=False), \
+                 mock.patch.object(dispatcher, "config_default_path_from_script", return_value=managed):
+                config = dispatcher.load_config(None)
+
+            self.assertEqual(config.task_source_query, "customer")
+            self.assertEqual(config.max_tasks, 12)
+
+    def test_relative_config_directory_uses_current_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_dir = root / "customer-config"
+            config_dir.mkdir()
+            (config_dir / "dispatcher.yaml").write_text(
+                CONFIG.format(projects_root=projects.as_posix()), encoding="utf-8"
+            )
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(root)
+                with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": "customer-config"}, clear=False):
+                    config = dispatcher.load_config(None)
+            finally:
+                os.chdir(previous_directory)
+
+            self.assertEqual(config.projects_root, projects.resolve())
+
+    def test_explicit_config_precedes_config_directory_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env_projects = root / "env-projects"
+            explicit_projects = root / "explicit-projects"
+            (env_projects / "repo-a" / ".git").mkdir(parents=True)
+            (explicit_projects / "repo-a" / ".git").mkdir(parents=True)
+            env_config = root / "env-config" / "dispatcher.yaml"
+            explicit_config = root / "explicit-config" / "dispatcher.yaml"
+            for path, projects in ((env_config, env_projects), (explicit_config, explicit_projects)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(CONFIG.format(projects_root=projects.as_posix()), encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(env_config.parent)}, clear=False):
+                arguments = dispatcher.build_parser().parse_args(["--config", str(explicit_config), "validate"])
+                result = dispatcher.execute(arguments)
+
+            self.assertEqual(Path(result["config"]["projects_root"]), explicit_projects.resolve())
+
+    def test_empty_or_unset_environment_uses_default_user_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            managed = root / "managed.yaml"
+            user = root / "config" / "dispatcher.yaml"
+            projects = root / "projects"
+            projects.mkdir()
+            for path, query in ((managed, "managed"), (user, "user")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    CONFIG.replace('query: "status = 待开发"', f'query: "{query}"').format(
+                        projects_root=projects.as_posix()
+                    ),
+                    encoding="utf-8",
+                )
+
+            for value in (None, "", " \t "):
+                with self.subTest(value=value), mock.patch.dict(os.environ, clear=False):
+                    if value is None:
+                        os.environ.pop("ORCA_DISPATCHER_CONFIG_DIR", None)
+                    else:
+                        os.environ["ORCA_DISPATCHER_CONFIG_DIR"] = value
+                    with mock.patch.object(dispatcher, "config_default_path_from_script", return_value=managed), \
+                         mock.patch.object(dispatcher, "config_path_from_script", return_value=user):
+                        config = dispatcher.load_config(None)
+                self.assertEqual(config.task_source_query, "user")
+
+    def test_missing_environment_directory_uses_managed_default_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill_root = root / "skill"
+            managed = skill_root / "config" / "dispatcher.default.yaml"
+            user = skill_root / "config" / "dispatcher.yaml"
+            projects = root / "projects"
+            projects.mkdir()
+            for path, query in ((managed, "managed"), (user, "user")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    CONFIG.replace('query: "status = 待开发"', f'query: "{query}"').format(
+                        projects_root=projects.as_posix()
+                    ),
+                    encoding="utf-8",
+                )
+            missing_dir = root / "missing"
+            empty_dir = root / "empty"
+            empty_dir.mkdir()
+
+            for environment_dir in (missing_dir, empty_dir):
+                with self.subTest(environment_dir=environment_dir), \
+                     mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(environment_dir)}, clear=False), \
+                     mock.patch.object(dispatcher, "config_default_path_from_script", return_value=managed), \
+                     mock.patch.object(dispatcher, "config_path_from_script", return_value=user):
+                    config = dispatcher.load_config(None)
+
+                self.assertEqual(config.task_source_query, "managed")
+                self.assertEqual(config.root, skill_root.resolve())
+                self.assertEqual(config.state_file, (skill_root / ".runtime" / "state.json").resolve())
+
+    def test_environment_file_value_falls_back_to_managed_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill_root = root / "skill"
+            managed = skill_root / "config" / "dispatcher.default.yaml"
+            user = skill_root / "config" / "dispatcher.yaml"
+            projects = root / "projects"
+            projects.mkdir()
+            for path, query in ((managed, "managed"), (user, "user")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    CONFIG.replace('query: "status = 待开发"', f'query: "{query}"').format(
+                        projects_root=projects.as_posix()
+                    ),
+                    encoding="utf-8",
+                )
+            environment_value = root / "not-a-directory"
+            environment_value.write_text("placeholder", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(environment_value)}, clear=False), \
+                 mock.patch.object(dispatcher, "config_default_path_from_script", return_value=managed), \
+                 mock.patch.object(dispatcher, "config_path_from_script", return_value=user):
+                config = dispatcher.load_config(None)
+
+            self.assertEqual(config.task_source_query, "managed")
+            self.assertEqual(config.root, skill_root.resolve())
+
+    def test_invalid_environment_config_returns_invalid_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_dir = root / "customer-config"
+            config_dir.mkdir()
+            secret = "D:/customer/private"
+            (config_dir / "dispatcher.yaml").write_text(
+                f'customer_secret: "{secret}', encoding="utf-8"
+            )
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(config_dir)}, clear=False):
+                with self.assertRaises(dispatcher.DispatcherError) as raised:
+                    dispatcher.load_config(None)
+
+            self.assertEqual(raised.exception.code, "invalid_config")
+            self.assertNotIn(str(config_dir), raised.exception.message)
+            self.assertNotIn(secret, raised.exception.message)
+            self.assertIn("YAML 格式错误", raised.exception.message)
+
+    def test_invalid_environment_config_encoding_returns_invalid_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_dir = root / "customer-config"
+            config_dir.mkdir()
+            (config_dir / "dispatcher.yaml").write_bytes(b"workspace: \xff")
+
+            with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": str(config_dir)}, clear=False):
+                with self.assertRaises(dispatcher.DispatcherError) as raised:
+                    dispatcher.load_config(None)
+
+            self.assertEqual(raised.exception.code, "invalid_config")
+            self.assertIn("配置文件编码错误", raised.exception.message)
+            self.assertNotIn(str(config_dir), raised.exception.message)
 
     def test_task_source_reference_plan_field_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1486,6 +1688,386 @@ class DispatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(dispatcher.DispatcherError, "任务记录格式不受支持"):
                 store.snapshot()
 
+    def test_state_store_separates_dispatch_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = Path(temporary) / ".runtime" / "state.json"
+            repository_path = Path(temporary) / "repo"
+            repository = dispatcher.Repository("repo", repository_path)
+            store = dispatcher.StateStore(state_file)
+            items = tuple(
+                assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
+                for flow in ("direct", "complete", "proposal")
+            )
+
+            for index, item in enumerate(items):
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), index)
+
+            state = store.snapshot()
+            self.assertEqual(set(state["tasks"]), {
+                "XSWL-1::legacy::flow::direct",
+                "XSWL-1::legacy::flow::complete",
+                "XSWL-1::legacy::flow::proposal",
+            })
+            self.assertEqual(
+                [store.status("XSWL-1", dispatch_flow=flow) for flow in ("direct", "complete", "proposal")],
+                ["launching", "launching", "launching"],
+            )
+            self.assertEqual({item["assignment_id"] for item in state["tasks"].values()}, {"XSWL-1"})
+
+    def test_state_key_parser_rejects_malformed_canonical_key(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "状态键格式"):
+            dispatcher.parse_state_key("XSWL-1::legacy::wrong::direct")
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "状态键格式"):
+            dispatcher.parse_state_key("XSWL-1::legacy::flow::direct::extra")
+
+    def test_state_store_keeps_tenant_and_flow_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            repository_path = Path(temporary) / "repo"
+            repository = dispatcher.Repository("repo", repository_path)
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
+                repository="repo",
+                repository_path=repository_path,
+                base_branch=None,
+                tenant="九机",
+                tenant_slug="jiuji",
+                dispatch_flow="direct",
+            )
+
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
+
+            key = dispatcher.state_key_for("XSWL-1", "jiuji", "direct")
+            self.assertEqual(set(store.snapshot()["tasks"]), {key})
+            self.assertEqual(store.status("XSWL-1", "jiuji", "direct"), "launching")
+            self.assertEqual(store.snapshot()["tasks"][key]["assignment_id"], "XSWL-1::jiuji")
+
+    def test_decide_accepts_same_task_in_different_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            path = root / "decision.json"
+            path.write_text(json.dumps({"version": 1, "tasks": [
+                {
+                    "task_id": "XSWL-1",
+                    "title": "测试",
+                    "task_url": "https://jira.example/XSWL-1",
+                    "repository": "mapped",
+                    "base_branch": "origin/release",
+                    "dispatch_flow": flow,
+                }
+                for flow in ("direct", "complete", "proposal")
+            ]}), encoding="utf-8")
+
+            result = dispatcher.decide(config, path)
+
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(
+                {item["dispatch_flow"] for item in result["tasks"]},
+                {"direct", "complete", "proposal"},
+            )
+
+    def test_launcher_accepts_same_task_in_different_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            items = tuple(
+                assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
+                for flow in ("direct", "complete", "proposal")
+            )
+
+            result = dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
+
+            self.assertEqual([item["status"] for item in result["results"]], ["dispatched"] * 3)
+            self.assertEqual(
+                set(store.snapshot()["tasks"]),
+                {
+                    "XSWL-1::legacy::flow::direct",
+                    "XSWL-1::legacy::flow::complete",
+                    "XSWL-1::legacy::flow::proposal",
+                },
+            )
+            current_run = json.loads(store.current_run_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {item["dispatch_flow"] for item in current_run["tasks"]},
+                {"direct", "complete", "proposal"},
+            )
+
+    def test_launcher_rejects_shared_worktree_across_tenants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace(
+                    'base_branches: ["origin/release"]',
+                    '''tenants:
+        tenant-a:
+          slug: "tenant-a"
+        tenant-b:
+          slug: "tenant-b"
+      base_branches: ["origin/release"]''',
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+            config = dispatcher.load_config(config_path)
+            assignments = tuple(
+                dispatcher.Assignment(
+                    task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
+                    repository="mapped",
+                    repository_path=repository_path,
+                    base_branch="origin/release",
+                    tenant=tenant,
+                    tenant_slug=tenant,
+                    worktree_path=worktree_path,
+                    requirement_snapshot_path=snapshot_path,
+                )
+                for tenant in ("tenant-a", "tenant-b")
+            )
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "不能共享 worktree_path"):
+                dispatcher.launch(config, assignments, dispatcher.StateStore(config.state_file), FakeOrca(), False)
+
+    def test_launcher_rejects_worktree_owned_by_other_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            config = write_config(root, projects, layout_mode="separate")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            first = assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path)
+            second = assignment("XSWL-2", "mapped", repository_path, worktree_path=worktree_path)
+            dispatcher.launch(config, (first,), store, fake_orca, force_unlock=False)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "不能共享 worktree_path"):
+                dispatcher.launch(config, (second,), store, fake_orca, force_unlock=False)
+
+    def test_reset_can_target_one_dispatch_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            repository_path = Path(temporary) / "repo"
+            repository = dispatcher.Repository("repo", repository_path)
+            items = tuple(
+                assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
+                for flow in ("direct", "complete")
+            )
+            for index, item in enumerate(items):
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), index)
+
+            self.assertTrue(store.reset("XSWL-1", force_unlock=False, dispatch_flow="direct"))
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="direct"))
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "launching")
+
+    def test_reset_without_flow_rejects_ambiguous_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            repository_path = Path(temporary) / "repo"
+            repository = dispatcher.Repository("repo", repository_path)
+            for flow in ("direct", "complete"):
+                item = assignment("XSWL-1", "repo", repository_path, dispatch_flow=flow)
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "多个流程"):
+                store.reset("XSWL-1", force_unlock=False)
+
+    def test_flow_filter_parser_supports_state_recover_and_reset(self) -> None:
+        parser = dispatcher.build_parser()
+        for command in ("state", "recover"):
+            arguments = parser.parse_args([command, "--dispatch-flow", "direct"])
+            self.assertEqual(arguments.dispatch_flow, "direct")
+        arguments = parser.parse_args(["reset", "XSWL-1", "--dispatch-flow", "proposal"])
+        self.assertEqual(arguments.dispatch_flow, "proposal")
+
+    def test_state_view_filters_flow_and_legacy_state_defaults_to_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {"XSWL-1": {"status": "launching"}},
+            })
+
+            complete = store.state_view("complete")
+            direct = store.state_view("direct")
+
+            self.assertEqual(complete["tasks"]["XSWL-1"]["dispatch_flow"], "complete")
+            self.assertEqual(complete["tasks"]["XSWL-1"]["state_key"], "XSWL-1")
+            self.assertEqual(direct["tasks"], {})
+            self.assertEqual(store.snapshot()["tasks"], {"XSWL-1": {"status": "launching"}})
+
+    def test_recover_targets_only_requested_dispatch_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            config = write_config(root, projects, layout_mode="separate")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            items = tuple(
+                assignment("XSWL-1", "mapped", repository_path, worktree_path=worktree_path, dispatch_flow=flow)
+                for flow in ("direct", "complete")
+            )
+            dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
+            complete_key = dispatcher.state_key_for("XSWL-1", "legacy", "complete")
+            complete_before = dict(store.snapshot()["tasks"][complete_key])
+            fake_orca.snapshots.clear()
+
+            result = dispatcher.recover(
+                config,
+                store,
+                fake_orca,
+                task_id="XSWL-1",
+                dispatch_flow="direct",
+                force_unlock=False,
+            )
+
+            self.assertEqual(len(result["results"]), 1)
+            self.assertEqual(result["results"][0]["dispatch_flow"], "direct")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "dispatched")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
+            self.assertEqual(store.snapshot()["tasks"][complete_key], complete_before)
+
+    def test_recover_split_uses_resolved_parent_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects, layout_mode="split")
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+            items = tuple(
+                assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
+                for flow in ("direct", "complete")
+            )
+            dispatcher.launch(config, items, store, fake_orca, force_unlock=False)
+            state = store.snapshot()
+            tasks = state["tasks"]
+            assert isinstance(tasks, dict)
+            direct_key = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            state_with_alias = {**state, "tasks": {**tasks, "XSWL-1": dict(tasks[direct_key])}}
+            dispatcher.atomic_write_json(store.state_file, state_with_alias)
+            fake_orca.snapshots.pop("term-2")
+
+            result = dispatcher.recover(
+                config,
+                store,
+                fake_orca,
+                task_id="XSWL-1",
+                dispatch_flow="complete",
+                force_unlock=False,
+            )
+
+            self.assertEqual(result["results"][0]["status"], "recovered")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
+
+    def test_decide_rejects_same_task_and_flow_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            path = root / "decision.json"
+            item = {
+                "task_id": "XSWL-1",
+                "title": "测试",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "base_branch": "origin/release",
+                "dispatch_flow": "direct",
+            }
+            path.write_text(json.dumps({"version": 1, "tasks": [item, item]}), encoding="utf-8")
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "流程重复"):
+                dispatcher.decide(config, path)
+
+    def test_recover_requires_flow_when_task_has_multiple_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            repository = dispatcher.Repository("mapped", repository_path)
+            for flow in ("direct", "complete"):
+                item = assignment("XSWL-1", "mapped", repository_path, dispatch_flow=flow)
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), 0)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "多个流程"):
+                dispatcher.recover(config, store, FakeOrca(), task_id="XSWL-1", force_unlock=False)
+            self.assertEqual(
+                dispatcher.recover(
+                    config, store, FakeOrca(), task_id="XSWL-1", dispatch_flow="direct", force_unlock=False
+                ),
+                {"results": []},
+            )
+
+    def test_state_cli_filters_flow_and_preserves_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            repository = dispatcher.Repository("mapped", projects / "repo-a")
+            for index, flow in enumerate(("direct", "complete")):
+                item = assignment("XSWL-1", "mapped", repository.path, dispatch_flow=flow)
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), index)
+            before = store.state_file.read_text(encoding="utf-8")
+
+            arguments = dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"),
+                "state", "--dispatch-flow", "direct",
+            ])
+            result = dispatcher.execute(arguments)
+
+            state = result["state"]
+            self.assertEqual(set(state["tasks"]), {dispatcher.state_key_for("XSWL-1", "legacy", "direct")})
+            self.assertEqual(state["tasks"][dispatcher.state_key_for("XSWL-1", "legacy", "direct")]["dispatch_flow"], "direct")
+            self.assertEqual(store.state_file.read_text(encoding="utf-8"), before)
+
+    def test_reset_cli_records_resolved_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            repository = dispatcher.Repository("mapped", projects / "repo-a")
+            for index, flow in enumerate(("direct", "complete")):
+                item = assignment("XSWL-1", "mapped", repository.path, dispatch_flow=flow)
+                store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "mapped.tab1", "split"), index)
+
+            arguments = dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"),
+                "reset", "XSWL-1", "--dispatch-flow", "direct",
+            ])
+            result = dispatcher.execute(arguments)
+
+            self.assertTrue(result["reset"])
+            self.assertEqual(result["dispatch_flow"], "direct")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "launching")
+            history = store.history_file.read_text(encoding="utf-8")
+            self.assertIn('"dispatch_flow": "direct"', history)
+
     def test_resumable_shell_requires_recognizable_prompt(self) -> None:
         snapshot = dispatcher.TerminalSnapshot(
             handle="term-1", worktree_id="repo::repo", worktree_path=Path("repo"), tab_id="tab-1", leaf_id="leaf-1",
@@ -1526,6 +2108,185 @@ class DispatcherTests(unittest.TestCase):
                 store.reset("XSWL-1", force_unlock=False)
             self.assertTrue(store.reset("XSWL-1", force_unlock=False, force=True))
             self.assertIsNone(store.status("XSWL-1"))
+
+    def test_old_state_without_flow_defaults_to_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {"XSWL-1": {"status": "launching"}},
+            })
+
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "launching")
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="direct"))
+
+    def test_old_state_explicit_flow_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {"XSWL-1": {"status": "launching", "dispatch_flow": "direct"}},
+            })
+
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "launching")
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="complete"))
+
+    def test_state_view_rejects_conflicting_legacy_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {"task_id": "XSWL-1", "status": "launching", "dispatch_flow": "direct"},
+                    "XSWL-1": {"status": "dispatched", "dispatch_flow": "direct"},
+                },
+            })
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "冲突"):
+                store.state_view()
+
+    def test_state_view_prefers_consistent_canonical_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            value = {
+                "status": "launching",
+                "repository": "repo",
+                "dispatch_flow": "direct",
+            }
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {**value, "task_id": "XSWL-1"},
+                    "XSWL-1": dict(value),
+                },
+            })
+
+            view = store.state_view()
+
+            self.assertEqual(list(view["tasks"]), [canonical])
+
+    def test_reset_removes_equivalent_legacy_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            value = {"status": "launching", "repository": "repo", "dispatch_flow": "direct"}
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {**value, "task_id": "XSWL-1"},
+                    "XSWL-1": dict(value),
+                },
+            })
+
+            self.assertTrue(store.reset("XSWL-1", force_unlock=False, dispatch_flow="direct"))
+            self.assertEqual(store.state_view("direct")["tasks"], {})
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="direct"))
+
+    def test_reset_keeps_legacy_complete_state_when_resetting_direct_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            direct_key = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    direct_key: {
+                        "task_id": "XSWL-1",
+                        "status": "launching",
+                        "dispatch_flow": "direct",
+                    },
+                    "XSWL-1": {"status": "launching"},
+                },
+            })
+
+            self.assertTrue(store.reset("XSWL-1", force_unlock=False, dispatch_flow="direct"))
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="direct"))
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "launching")
+
+    def test_canonical_state_key_rejects_mismatched_value_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {
+                        "task_id": "XSWL-1",
+                        "status": "launching",
+                        "dispatch_flow": "complete",
+                    },
+                },
+            })
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "identity 与状态键不一致"):
+                store.state_view()
+
+    def test_state_mutation_updates_equivalent_legacy_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            value = {"status": "launching", "repository": "repo", "dispatch_flow": "direct"}
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {**value, "task_id": "XSWL-1"},
+                    "XSWL-1": dict(value),
+                },
+            })
+
+            store.mark_requires_manual_reset(canonical, "probe")
+
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "requires_manual_reset")
+
+    def test_state_recovery_updates_equivalent_legacy_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = dispatcher.StateStore(root / ".runtime" / "state.json")
+            canonical = dispatcher.state_key_for("XSWL-1", "legacy", "direct")
+            value = {"status": "launching", "repository": "repo", "dispatch_flow": "direct"}
+            dispatcher.atomic_write_json(store.state_file, {
+                "version": 1,
+                "tasks": {
+                    canonical: {**value, "task_id": "XSWL-1"},
+                    "XSWL-1": dict(value),
+                },
+            })
+            snapshot = dispatcher.TerminalSnapshot(
+                handle="term-1",
+                worktree_id="repo::repo",
+                worktree_path=root / "repo",
+                tab_id="tab-1",
+                leaf_id="leaf-1",
+                title="Terminal",
+                connected=True,
+                writable=True,
+                agent_identity="claude",
+                preview="claude tui",
+            )
+
+            store.mark_recovered(canonical, snapshot, "probe")
+
+            state = store.snapshot()["tasks"]
+            self.assertEqual(state[canonical]["status"], "dispatched")
+            self.assertEqual(state["XSWL-1"]["status"], "dispatched")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "dispatched")
+
+    def test_state_view_keeps_multiple_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
+            item = assignment("XSWL-1", "repo", Path(temporary) / "repo", dispatch_flow="direct")
+            repository = dispatcher.Repository("repo", item.repository_path)
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 0)
+            item = assignment("XSWL-1", "repo", Path(temporary) / "repo", dispatch_flow="complete")
+            store.mark_launching(item, dispatcher.TerminalPlan(repository, (item,), "repo", "split"), 1)
+
+            direct = store.state_view("direct")
+            all_flows = store.state_view()
+
+            self.assertEqual(list(direct["tasks"]), [dispatcher.state_key_for("XSWL-1", "legacy", "direct")])
+            self.assertEqual(len(all_flows["tasks"]), 2)
+            self.assertEqual(len(store.snapshot()["tasks"]), 2)
 
     def test_reset_parser_supports_force(self) -> None:
         arguments = dispatcher.build_parser().parse_args(["reset", "XSWL-1", "--force"])
@@ -1725,7 +2486,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertIn("- 任务描述：“任务描述”", task_command)
             self.assertIn("- 负责人：“测试负责人”", task_command)
             self.assertIn(f"- GitNexus 调研报告：{report_path.resolve().as_posix()}（复用该报告并跳过 GitNexus 调研节点）", task_command)
-            state = dispatcher.read_json_object(config.state_file, {})["tasks"]["XSWL-1"]
+            state = dispatcher.read_json_object(config.state_file, {})["tasks"][dispatcher.state_key_for("XSWL-1")]
             self.assertEqual(state["description"], "任务描述")
             self.assertEqual(state["assignee"], "测试负责人")
             self.assertEqual(state["gitnexus_report_path"], report_path.as_posix())
@@ -1933,11 +2694,12 @@ class DispatcherTests(unittest.TestCase):
             self.assertFalse(any(operation.startswith("split-") for operation, _ in fake_orca.operations))
             self.assertFalse(any(value == "claude" for operation, value in fake_orca.operations if operation == "send"))
             state = store.snapshot()["tasks"]
-            self.assertEqual(state["XSWL-0"]["layout"], "separate")
-            self.assertEqual(state["XSWL-0"]["tab_title"], worktree_paths[0].name)
-            self.assertEqual(state["XSWL-0"]["repository_path"], worktree_paths[0].resolve().as_posix())
-            self.assertEqual(state["XSWL-0"]["source_repository_path"], repository_path.resolve().as_posix())
-            self.assertEqual(state["XSWL-0"]["worktree_path"], worktree_paths[0].resolve().as_posix())
+            first = state[dispatcher.state_key_for("XSWL-0")]
+            self.assertEqual(first["layout"], "separate")
+            self.assertEqual(first["tab_title"], worktree_paths[0].name)
+            self.assertEqual(first["repository_path"], worktree_paths[0].resolve().as_posix())
+            self.assertEqual(first["source_repository_path"], repository_path.resolve().as_posix())
+            self.assertEqual(first["worktree_path"], worktree_paths[0].resolve().as_posix())
             self.assertEqual([item["status"] for item in result["results"]], ["dispatched", "dispatched"])
             self.assertEqual(
                 [value for operation, value in fake_orca.operations if operation == "worktree-status"],
@@ -1987,7 +2749,7 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(result["results"][0]["status"], "dispatched")
             self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "create"), 1)
-            self.assertEqual(store.snapshot()["tasks"]["XSWL-1"]["terminal_handle"], "term-1")
+            self.assertEqual(store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]["terminal_handle"], "term-1")
             self.assertEqual(sum(value.startswith("/dev-spec-gen") for operation, value in fake_orca.operations if operation == "send"), 1)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -2117,9 +2879,11 @@ class DispatcherTests(unittest.TestCase):
             self.assertIn(("split-horizontal", "term-1:cmd.exe /d /k"), fake_orca.operations)
             self.assertFalse(any(operation == "rename" for operation, _ in fake_orca.operations))
             state = store.snapshot()["tasks"]
-            self.assertEqual(state["XSWL-0"]["tab_title"], "mapped.tab1")
-            self.assertEqual(state["XSWL-1"]["tab_title"], "mapped.tab1")
-            self.assertEqual(state["XSWL-0"]["tab_id"], state["XSWL-1"]["tab_id"])
+            first = state[dispatcher.state_key_for("XSWL-0")]
+            second = state[dispatcher.state_key_for("XSWL-1")]
+            self.assertEqual(first["tab_title"], "mapped.tab1")
+            self.assertEqual(second["tab_title"], "mapped.tab1")
+            self.assertEqual(first["tab_id"], second["tab_id"])
 
     def test_recover_reuses_restored_claude_pane_without_resending_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2140,11 +2904,15 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(result["results"], [{
                 "task_id": "XSWL-1",
+                "tenant": "legacy",
+                "tenant_slug": "legacy",
+                "assignment_id": "XSWL-1",
+                "dispatch_flow": "complete",
                 "status": "native_recovered",
                 "terminal_handle": "term-restored",
             }])
             self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "send"), send_count)
-            self.assertEqual(store.snapshot()["tasks"]["XSWL-1"]["terminal_handle"], "term-restored")
+            self.assertEqual(store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]["terminal_handle"], "term-restored")
             self.assertEqual(
                 [value for operation, value in fake_orca.operations if operation == "worktree-status"],
                 [worktree_path.resolve().as_posix(), worktree_path.resolve().as_posix()],
@@ -2169,7 +2937,14 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.recover(config, store, fake_orca, task_id=None, force_unlock=False)
 
-            self.assertEqual(result["results"], [{"task_id": "XSWL-1", "status": "requires_manual_reset"}])
+            self.assertEqual(result["results"], [{
+                "task_id": "XSWL-1",
+                "tenant": "legacy",
+                "tenant_slug": "legacy",
+                "assignment_id": "XSWL-1",
+                "dispatch_flow": "complete",
+                "status": "requires_manual_reset",
+            }])
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2338,7 +3113,14 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.recover(config, store, fake_orca, task_id="XSWL-2", force_unlock=False)
 
-            self.assertEqual(result["results"], [{"task_id": "XSWL-2", "status": "requires_manual_reset"}])
+            self.assertEqual(result["results"], [{
+                "task_id": "XSWL-2",
+                "tenant": "legacy",
+                "tenant_slug": "legacy",
+                "assignment_id": "XSWL-2",
+                "dispatch_flow": "complete",
+                "status": "requires_manual_reset",
+            }])
             self.assertEqual(store.status("XSWL-2"), "requires_manual_reset")
             self.assertEqual(sum(1 for operation, _ in fake_orca.operations if operation == "split-vertical"), split_count)
 
@@ -2358,8 +3140,34 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.recover(config, store, fake_orca, task_id=None, force_unlock=False)
 
-            self.assertEqual(result["results"], [{"task_id": "XSWL-1", "status": "requires_manual_reset"}])
+            self.assertEqual(result["results"], [{
+                "task_id": "XSWL-1",
+                "tenant": "legacy",
+                "tenant_slug": "legacy",
+                "assignment_id": "XSWL-1",
+                "dispatch_flow": "complete",
+                "status": "requires_manual_reset",
+            }])
             self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
+
+    def test_git_child_excludes_config_directory_environment(self) -> None:
+        captured: dict[str, object] = {}
+        original_run = dispatcher.subprocess.run
+
+        def capture_run(*args: object, **kwargs: object) -> SimpleNamespace:
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {"ORCA_DISPATCHER_CONFIG_DIR": "D:/customer/private"}, clear=False):
+            dispatcher.subprocess.run = capture_run
+            try:
+                self.assertTrue(dispatcher.branch_exists(dispatcher.Repository("repo", Path("D:/repo")), "main"))
+            finally:
+                dispatcher.subprocess.run = original_run
+
+        environment = captured["kwargs"]["env"]
+        assert isinstance(environment, dict)
+        self.assertNotIn("ORCA_DISPATCHER_CONFIG_DIR", environment)
 
     def test_orca_terminal_send_preserves_slash_command_from_msys_conversion(self) -> None:
         captured: dict[str, object] = {}
@@ -2372,6 +3180,7 @@ class DispatcherTests(unittest.TestCase):
 
         original_environment = dispatcher.os.environ.copy()
         dispatcher.os.environ["DISPATCHER_TEST_ENV"] = "keep"
+        dispatcher.os.environ["ORCA_DISPATCHER_CONFIG_DIR"] = "D:/customer/private"
         dispatcher.subprocess.run = capture_run
         try:
             text = "/dev-spec-gen https://jira.example/XSWL-1"
@@ -2391,6 +3200,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertEqual(environment["MSYS_NO_PATHCONV"], "1")
         self.assertEqual(environment["MSYS2_ARG_CONV_EXCL"], "*")
         self.assertEqual(environment["DISPATCHER_TEST_ENV"], "keep")
+        self.assertNotIn("ORCA_DISPATCHER_CONFIG_DIR", environment)
 
     def test_orca_handle_accepts_create_and_split_envelopes(self) -> None:
         self.assertEqual(dispatcher.OrcaClient._handle({"terminal": {"handle": "term-create"}}), "term-create")

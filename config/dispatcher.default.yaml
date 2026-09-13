@@ -145,7 +145,7 @@ dispatch:
       # 已确认的 launch 阶段才使用 Orca 绑定 worktree 并启动 Claude terminal；前置任务在当前会话完成。
       # Windows 优先 pwsh.exe，未安装时回退 powershell.exe；macOS 使用 zsh，Linux 使用 bash。
       direct: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
-      separate: "/dev-spec-gen {task_url} 当前工作区当前分支 标准开发流程；base_branch={base_branch}；在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+      separate: "/dev-spec-gen {task_url} 当前工作区当前分支 development_proposal_delivery；base_branch={base_branch}；在当前任务的worktree中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
       split: "/dev-spec-gen {task_url} base_branch={base_branch} 在当前任务 worktree 中进行工作；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
       proposal: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
   layout:
@@ -167,7 +167,8 @@ dispatch:
 
 dedup:
   enabled: true
-  strategy: "task_id"
+  # 状态去重 identity 为 task_id + tenant_slug + dispatch_flow；旧状态缺 flow 时按 complete 兼容。
+  strategy: "task_id_tenant_flow"
   skip_dispatched: true
   state_file: ".runtime/state.json"
 
