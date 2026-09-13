@@ -14,7 +14,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -518,7 +517,8 @@ def read_config_yaml(
     return require_mapping(raw, "配置根")
 
 
-def config_layers(config_file: Path | None) -> Mapping[str, Any]:
+def config_layers(config_file: Path | None) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """返回合并后的配置与用户覆盖层，便于识别仅在用户层出现的旧字段。"""
     default_file = config_default_path_from_script()
     default = read_config_yaml(default_file, required=False)
     user_file = resolve_config_path(config_file)
@@ -528,8 +528,8 @@ def config_layers(config_file: Path | None) -> Mapping[str, Any]:
     if default is None and user is None:
         raise DispatcherError("config_unreadable", f"默认配置不存在：{default_file}")
     if default is None:
-        return user or {}
-    return merge_config_values(default, user or {})
+        return user or {}, user or {}
+    return merge_config_values(default, user or {}), user or {}
 
 def relative_to_root(root: Path, value: Any, field: str) -> Path:
     candidate = Path(require_text(value, field))
@@ -567,10 +567,24 @@ def require_branch_priority(value: Any, field: str) -> tuple[Mapping[str, object
     return tuple(rules)
 
 
-def session_prompt_for(session_prompt: Mapping[str, Any]) -> str:
-    """取唯一的完整开发会话说明；兼容旧 session_prompt.separate 键。"""
-    for key in ("complete", "separate"):
-        value = session_prompt.get(key)
+def nested_mapping(value: Mapping[str, Any], *keys: str) -> Mapping[str, Any]:
+    current: Any = value
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, Mapping) else {}
+
+
+def session_prompt_for(session_prompt: Mapping[str, Any], user_session_prompt: Mapping[str, Any]) -> str:
+    """取唯一的完整开发会话说明；用户层旧 separate 键仍按 complete 沿用。"""
+    candidates = (
+        user_session_prompt.get("complete"),
+        user_session_prompt.get("separate"),
+        session_prompt.get("complete"),
+        session_prompt.get("separate"),
+    )
+    for value in candidates:
         if isinstance(value, str) and value.strip():
             return value.strip()
     raise DispatcherError("invalid_config", "task_source.session_prompt 缺少完整开发会话说明（complete）")
@@ -592,7 +606,7 @@ def deprecation_warnings_for(root_data: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(templates, Mapping) and "split" in templates:
                 warnings.append("dispatch.skill.command_templates.split 已失效并被忽略")
             if isinstance(templates, Mapping) and "separate" in templates:
-                warnings.append("dispatch.skill.command_templates.separate 已更名为 complete")
+                warnings.append("dispatch.skill.command_templates.separate 已更名为 complete；仅在未提供 complete 时沿用其内容")
     task_source = root_data.get("task_source")
     if isinstance(task_source, Mapping):
         session_prompt = task_source.get("session_prompt")
@@ -603,7 +617,7 @@ def deprecation_warnings_for(root_data: Mapping[str, Any]) -> tuple[str, ...]:
 
 def load_config(config_file: Path | None = None) -> Config:
     resolved_config_file = resolve_config_path(config_file)
-    root_data = config_layers(resolved_config_file)
+    root_data, user_data = config_layers(resolved_config_file)
 
     workspace = require_mapping(root_data.get("workspace"), "workspace")
     base_branch = require_mapping(root_data.get("base_branch"), "base_branch")
@@ -674,10 +688,14 @@ def load_config(config_file: Path | None = None) -> Config:
         command_templates.get("proposal", "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"),
         "dispatch.skill.command_templates.proposal",
     )
-    complete_template = command_templates.get("complete")
-    if complete_template is None:
-        complete_template = command_templates.get("separate")
-    complete_template = require_text(complete_template, "dispatch.skill.command_templates.complete")
+    user_templates = nested_mapping(user_data, "dispatch", "skill", "command_templates")
+    complete_template = require_text(
+        user_templates.get("complete")
+        or user_templates.get("separate")
+        or command_templates.get("complete")
+        or command_templates.get("separate"),
+        "dispatch.skill.command_templates.complete",
+    )
     deprecation_warnings = deprecation_warnings_for(root_data)
     for template in (complete_template, direct_template, proposal_template):
         validate_command_template(template)
@@ -730,7 +748,7 @@ def load_config(config_file: Path | None = None) -> Config:
             "direct": direct_template,
             "proposal": proposal_template,
         }),
-        session_prompt=session_prompt_for(session_prompt),
+        session_prompt=session_prompt_for(session_prompt, nested_mapping(user_data, "task_source", "session_prompt")),
         recovery_session_prompt=recovery_session_prompt,
         deprecation_warnings=deprecation_warnings,
     )
@@ -1077,7 +1095,7 @@ def validate_state_worktree_ownership(
 
 
 def terminal_repositories(plans: Iterable[TerminalPlan]) -> tuple[Repository, ...]:
-    repositories: OrderedDict[Path, Repository] = OrderedDict()
+    repositories: dict[Path, Repository] = {}
     for plan in plans:
         repositories.setdefault(plan.repository.path.resolve(), plan.repository)
     return tuple(repositories.values())
@@ -2231,7 +2249,7 @@ def launch(
         records: list[TerminalRecord] = []
         worktree_cache: dict[str, OrcaWorktree] = {}
         for plan in plans:
-            for index, assignment in enumerate(plan.assignments):
+            for assignment in plan.assignments:
                 try:
                     terminal_worktree: OrcaWorktree | None = None
                     if assignment.worktree_path is not None:
@@ -2537,7 +2555,6 @@ def recover(
         retry_read(config, orca.status)
         repository_ids = retry_read(config, orca.repo_ids)
         results: list[dict[str, object]] = []
-        recovered_snapshots: dict[str, TerminalSnapshot] = {}
         for entry in selected:
             stored_task_id = entry.state_key
             value = entry.value
@@ -2629,7 +2646,6 @@ def recover(
                     and snapshot.agent_identity == "claude"
                 ):
                     store.mark_recovered(stored_task_id, snapshot, "native_recovered")
-                    recovered_snapshots[stored_task_id] = snapshot
                     result = state_entry_result(
                         entry, "native_recovered", terminal_handle=snapshot.handle
                     )
@@ -2656,7 +2672,6 @@ def recover(
                     append_history_safely(store, state_entry_history(
                         entry, "recovered", terminal_handle=snapshot.handle
                     ))
-                    recovered_snapshots[stored_task_id] = snapshot
                     result = state_entry_result(
                         entry, "recovered", terminal_handle=snapshot.handle
                     )
@@ -2702,7 +2717,6 @@ def recover(
                 ))
                 results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
-            recovered_snapshots[stored_task_id] = snapshot
             result = state_entry_result(entry, "recovered", terminal_handle=snapshot.handle)
             workspace_status_error = set_worktree_in_progress_safely(orca, store, assignment, snapshot)
             if workspace_status_error:

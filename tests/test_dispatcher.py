@@ -98,9 +98,10 @@ def worktree_assignment(
     dispatch_flow: str = "complete",
     tenant: str = "legacy",
     tenant_slug: str = "legacy",
+    worktree_suffix: str = "",
 ) -> dispatcher.Assignment:
     """创建任务工作树与需求快照，返回可直接分发的 assignment。"""
-    worktree_path = projects / f"{repository_path.name}-{task_id}"
+    worktree_path = projects / f"{repository_path.name}-{task_id}{worktree_suffix}"
     create_linked_worktree(repository_path, worktree_path)
     snapshot_path = create_requirement_snapshot(worktree_path, task_id)
     return dispatcher.Assignment(
@@ -123,17 +124,12 @@ def flow_worktree_assignment(
     dispatch_flow: str,
 ) -> dispatcher.Assignment:
     """同一任务的不同流程各自使用独立 linked worktree 与需求快照。"""
-    worktree_path = projects / f"{repository_path.name}-{task_id}-{dispatch_flow}"
-    create_linked_worktree(repository_path, worktree_path)
-    snapshot_path = create_requirement_snapshot(worktree_path, task_id)
-    return dispatcher.Assignment(
-        task=dispatcher.Task(task_id, task_id, f"https://jira.example/{task_id}"),
-        repository="mapped",
-        repository_path=repository_path,
-        base_branch=None,
-        worktree_path=worktree_path,
-        requirement_snapshot_path=snapshot_path,
+    return worktree_assignment(
+        projects,
+        repository_path,
+        task_id,
         dispatch_flow=dispatch_flow,
+        worktree_suffix=f"-{dispatch_flow}",
     )
 
 
@@ -1777,6 +1773,27 @@ class DispatcherTests(unittest.TestCase):
             self.assertTrue(any("session_prompt.split" in warning for warning in config.deprecation_warnings))
             self.assertIn("worktree_path", config.session_prompt)
 
+    def test_legacy_separate_template_is_reused_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            projects = temporary_root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = temporary_root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                CONFIG.replace("      complete: |", "      separate: |").replace(
+                    "    complete: \"任务确认后直接创建或复用 worktree，并写入 worktree_path\"",
+                    "    separate: \"任务确认后直接创建或复用 worktree，并写入 worktree_path\"",
+                ).format(projects_root=projects.as_posix()),
+                encoding="utf-8",
+            )
+
+            config = dispatcher.load_config(config_path)
+
+            self.assertEqual(config.session_prompt, "任务确认后直接创建或复用 worktree，并写入 worktree_path")
+            self.assertIn("当前工作区当前分支 标准开发流程", config.command_templates["complete"])
+            self.assertTrue(any("separate" in warning for warning in config.deprecation_warnings))
+
     def test_snapshot_rejects_invalid_task_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = dispatcher.StateStore(Path(temporary) / ".runtime" / "state.json")
@@ -2109,8 +2126,7 @@ class DispatcherTests(unittest.TestCase):
             root = Path(temporary)
             projects = root / "projects"
             repository_path = projects / "repo-a"
-            worktree_path = projects / "repo-a-XSWL-1"
-            (repository_path / ".git").mkdir(parents=True)
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             dispatcher.atomic_write_json(config.state_file, {
@@ -2119,8 +2135,9 @@ class DispatcherTests(unittest.TestCase):
                     "task_id": "XSWL-1",
                     "repository": "mapped",
                     "repository_path": repository_path.resolve().as_posix(),
-                    "worktree_path": worktree_path.resolve().as_posix(),
-                    "tab_title": worktree_path.name,
+                    "worktree_path": item.worktree_path.resolve().as_posix(),
+                    "requirement_snapshot_path": item.requirement_snapshot_path.as_posix(),
+                    "tab_title": item.worktree_path.name,
                     "task_url": "https://jira.example/XSWL-1",
                     "title": "XSWL-1",
                     "status": "launching",
@@ -2142,7 +2159,10 @@ class DispatcherTests(unittest.TestCase):
             }])
             self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
             self.assertIn("recovery_metadata_missing", store.history_file.read_text(encoding="utf-8"))
-            self.assertEqual([operation for operation, _ in fake_orca.operations if operation == "create"], [])
+            self.assertEqual(
+                [operation for operation, _ in fake_orca.operations if operation in {"create", "list", "wait", "send"}],
+                [],
+            )
 
     def test_decide_rejects_same_task_and_flow_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
