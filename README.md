@@ -40,7 +40,7 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 - `dispatch.agent_commands`：按平台选择 Claude 启动包装命令。Windows 优先使用可用的 `pwsh.exe`，否则使用 `powershell.exe`；macOS 使用 `/bin/zsh -ilc 'exec claude'`；Linux 使用 `/bin/bash -ilc 'exec claude'`。每个任务都在独立 worktree 的独立 tab 中启动该命令，不存在 pane 或普通 shell 会话。direct 与 complete 均使用当前工作区当前分支；direct 使用 `development_jira_spec(jira 参考方案驱动流程开发`，并要求全自动执行、无需人员介入；旧配置仍可使用 `dispatch.agent`。
 - `base_branch.options`
 - `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；字段未配置或值为空时可省略 `reference_plan`，不得伪造字段值
-- 需要时的 `dispatch.skill.command_templates`；提示词整体只按该模板渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身；direct 模板额外通过 `{source_task_id}` 下发原始开发子任务编号，缺省时回退到 `{task_id}`，供实际开发任务按需读取子任务中的仓库方案
+- 配置顶层的 `stages:` 与 `flows:` 流程注册表；提示词整体只按流程引用节点的 `command_template` 渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身；direct 模板额外通过 `{source_task_id}` 下发原始开发子任务编号，缺省时回退到 `{task_id}`，供实际开发任务按需读取子任务中的仓库方案
 
 `config/dispatcher.yaml` 与根目录 `config.yml` 都是本地文件，已被忽略，**不要提交**。不要在配置或任务输入中保存令牌、密码、Cookie、内部域名、内部路径或运行状态。
 
@@ -112,16 +112,63 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 
 `worktree_path` 由 dev-spec-gen 统一 worktree CLI 在路由确认后创建或复用并返回；调用该 CLI 前不得询问、要求用户提供或自行猜测路径。若 Orca orchestration 返回 `Dispatch capability is invalid`，只标记为 Orca 编排通信失败；项目、租户、基础分支已明确时仍应继续本地 dev-spec-gen CLI。只有技能缺失、CLI 执行失败、输出不是独立纯 JSON success、返回路径不是有效 linked worktree，或路由无法唯一确定时才暂停。
 
-每个任务都必须提供 `worktree_path` 与 `requirement_snapshot_path`：前者是 dev-spec-gen 统一 worktree CLI 创建或复用的独立 linked worktree 绝对路径（不得等于源仓库、必须位于 `workspace.projects_root` 内），后者是通过完整性校验的原始需求快照。不同 `dispatch_flow` 可共享该 worktree 或 terminal，但各自使用独立内部状态 key；同一流程重复分发仍会被拒绝。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按 `dispatch.skill.command_templates` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；任务描述不内联进命令，只传递快照路径。
+每个任务都必须提供 `worktree_path` 与 `requirement_snapshot_path`：前者是 dev-spec-gen 统一 worktree CLI 创建或复用的独立 linked worktree 绝对路径（不得等于源仓库、必须位于 `workspace.projects_root` 内），后者是通过完整性校验的原始需求快照。不同 `dispatch_flow` 可共享该 worktree 或 terminal，但各自使用独立内部状态 key；同一流程重复分发仍会被拒绝。任务 URL 必须由配置中的 `task_url_template` 生成。`description`、`assignee`、`reference_plan`、`source_task_id`、`source_assignee`、`parent_task_id` 和 `parent_assignee` 均为可选任务上下文，随状态保存但不会全部下发：提示词只按该流程引用节点的 `command_template` 渲染，模板必须以 `/dev-spec-gen` 开头，字段值为空的整行会省略；有父产品需求时任务已归一化为产品需求本身，来源开发任务与父任务重复信息不下发。`gitnexus_report_path` 必须指向任务 worktree 内 `docs/engineering/research/` 下已存在的报告；`requirement_snapshot_path` 指向该任务 worktree 内 `docs/engineering/specs/` 下文件名以 `-raw-requirements.md` 结尾的原始需求 Markdown，launch 前会校验其元数据标记为 complete、附件清单位于 `docs/engineering/attachments/<task_id>/` 且每个附件的大小与 SHA-256 一致；快照缺失、不完整或校验失败会阻断该任务。下游必须先读取快照，再按其中相对路径读取附件本体；任务描述不内联进命令，只传递快照路径。
 
-同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；同一任务/租户下的 `direct`、`complete`、`proposal` 则共享对外 `assignment_id`，但使用独立内部状态 identity（`<task_id>::<tenant_slug>::flow::<dispatch_flow>`），可并发分发并共享 worktree/terminal。`state`、`recover`、`reset` 均支持 `--dispatch-flow <direct|complete|proposal>`；省略时仅在唯一流程匹配时兼容，多流程会报歧义。旧状态缺少流程字段时仅按 `complete` 解释。`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
+同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建 worktree、终端和运行状态；同一任务/租户下的 `direct`、`complete`、`proposal` 则共享对外 `assignment_id`，但使用独立内部状态 identity（`<task_id>::<tenant_slug>::flow::<dispatch_flow>`），可并发分发并共享 worktree/terminal。`state`、`recover`、`reset` 均支持 `--dispatch-flow <流程名>`；省略时仅在唯一流程匹配时兼容，多流程会报歧义。这三个只读/复位命令同样接受已从注册表删除的历史流程名（只按字符串匹配已有状态），而 `task-source --flow`、`decide --dispatch-flow`、`launch` 只接受注册表中的流程，未注册会直接报错并列出当前可用流程。旧状态缺少流程字段时仅按 `complete` 解释。`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
 `decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。所有任务都必须提供 `worktree_path` 与完整的 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可供 worktree 准备后交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
+
+## 流程注册表
+
+流程不写死在代码里：配置顶层的 `stages:` 定义独立可复用的节点，`flows:` 按名引用节点组成流程。新增流程只需改配置，不用改脚本。
+
+```yaml
+stages:                       # 有序数组，节点独立可复用，可被多个流程引用
+  - name: complete_dispatch
+    command_template: "/dev-spec-gen {task_url} ..."   # 必须以 /dev-spec-gen 开头
+    # 以下均为可选：session_prompt 缺省回退 task_source.session_prompt.complete，
+    # fetch_prompt 缺省回退 task_source.fetch_prompt，next_steps 仅用于提示，
+    # requires_worktree / requires_snapshot 缺省为 true。
+    session_prompt: |
+      ...会话说明...
+    fetch_prompt: |
+      ...任务获取提示词，支持 {{query}} 与 {{reference_plan_field}}...
+    next_steps:
+      - "执行独立 Jira 节点并归档完整需求与附件"
+    requires_worktree: true
+    requires_snapshot: true
+flows:                        # 有序数组，必须且只能有一个 default: true
+  - name: complete
+    stages: [complete_dispatch]
+    default: true
+```
+
+- 节点名与流程名限 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`，重复名、未知节点引用、未知节点字段、`default` 缺失或不唯一、以及流程引用的节点全都未声明 `command_template`，都会在加载配置时报错。节点为独立定义，不支持在流程内做字段级覆盖。
+- 省略流程时统一使用注册表里 `default: true` 的那个流程：`task-source` 不传 `--flow`、`decide` 与 `launch` 输入不传 `dispatch_flow` 都按此回退；显式传入的流程必须命中注册表。
+- 一个流程引用多个节点时按顺序合成：`command_template` 取最后一个声明它的节点，`session_prompt` 取最后一个声明者，`fetch_prompt` 取第一个声明者，`next_steps` 顺序拼接，`requires_worktree` / `requires_snapshot` 需所有节点都为 `true` 才为 `true`。
+- `requires_worktree: false` 的流程不要求任务级独立 worktree，终端落在项目默认分支的源仓库 checkout，terminal 标题为 `<repository>.<task_id>`。
+- 旧配置的 `dispatch.skill.command_templates` 与 `task_source.flows` 会自动映射为等价注册表并给出弃用告警，其中旧 `separate` 按 `complete` 处理。
+- 注册表沿用既有的合并规则：用户覆盖层出现 `stages` 或 `flows` 时，整份列表替换托管默认的同名列表，不做按名合并。因此在用户层追加流程需同时完整重述被复用的节点；直接改托管默认配置则只需追加一项。用户层只写旧键时仍按旧结构映射，新旧同时出现以注册表为准。
+
+新增流程的最小改动（只改配置，不改代码）：
+
+```yaml
+flows:
+  - name: direct
+    stages: [direct_dispatch]
+  - name: complete
+    stages: [complete_dispatch]
+    default: true
+  - name: proposal
+    stages: [proposal_dispatch]
+  - name: review                        # 新增：直接复用已有节点
+    stages: [complete_dispatch]
+```
 
 ## 分发与状态
 
 - 每个任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
-- 不存在布局配置与 pane 聚合：`dispatch.layout.*`、`dispatch.terminal.shell_commands`、`command_templates.split` 已失效，配置中残留这些字段会被忽略，并在 `validate` 结果的 `config.deprecation_warnings` 中列出。
+- 不存在布局配置与 pane 聚合：`dispatch.layout.*`、`dispatch.terminal.shell_commands` 已失效。配置中残留 `dispatch.skill.command_templates` 或 `task_source.flows` 时，会按旧结构自动映射为注册表并在 `validate` 结果的 `config.deprecation_warnings` 中列出弃用告警；其余未知字段照旧忽略。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
 - Claude Code TUI 仅在 preview 同时出现明确的 `No, exit` 与 `Yes, I accept` 授权选项时，自动提交一次 `Yes, I accept`；授权界面未消失、终端状态无法确认或发送失败时停止并进入 `requires_manual_reset`。未知登录、更新或其他确认界面绝不自动操作。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。

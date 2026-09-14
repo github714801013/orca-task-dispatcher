@@ -33,9 +33,6 @@ task_source:
   query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()"
   # Jira 节点先执行合法基础 JQL，再按 parent key 读取父需求字段并后置过滤；不得伪造父字段 JQL。
   # proposal 流程由独立 Jira 节点和独立调研节点分别参考 dev-spec-gen 后执行。
-  flows:
-    proposal:
-      next_steps: ["独立 Jira 节点归档完整需求与附件", "独立 GitNexus 调研节点执行只读调研", "联合确定项目、租户与基础分支", "查找任一基础分支下同名 worktree", "不存在时调用 dev-spec-gen worktree CLI", "通过 Orca 绑定 worktree 分发开发方案"]
   reference_plan_field: customfield_11103
   fetch_prompt: |
     使用当前环境可用的任务查询工具获取开发任务。
@@ -115,6 +112,49 @@ task_source:
       仅按 CLI 成功 JSON stdout 的公开交接字段继续任务，不要重复初始化或覆盖已有成果。
   max_tasks: 12
 
+# 流程注册表：stages 是独立可复用的节点，flows 按名引用节点组成流程。
+# 新增流程 = 在 flows 数组追加一项（必要时在 stages 追加可复用节点），无需改代码。
+# 节点字段：name、command_template（必须以 /dev-spec-gen 开头）、session_prompt、fetch_prompt、
+#           next_steps、requires_worktree、requires_snapshot；名称限 [A-Za-z0-9][A-Za-z0-9._-]{0,63}。
+stages:
+  - name: direct_dispatch
+    command_template: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
+    fetch_prompt: |
+      使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。
+      查询条件（真实 Jira JQL，必须原样使用）：
+      {{query}}
+      不要读取 Jira 详情、父需求、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。
+    next_steps:
+      - "根据实际任务编号和标题提炼语义 slug"
+      - "创建或复用对应 worktree"
+      - "在该 worktree 启动开发会话"
+      - "仅将 Jira 地址和 direct 开发指令交给实际任务"
+  - name: complete_dispatch
+    command_template: "/dev-spec-gen {task_url} 工作区: 当前工作区当前分支 流程: development_proposal_delivery 调研: 无需调研直接澄清；base_branch={base_branch}；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
+    next_steps:
+      - "执行独立 Jira 节点并归档完整需求与附件"
+      - "执行独立 GitNexus 调研节点"
+      - "创建或复用 worktree"
+      - "生成 version=1 decide 输入"
+      - "通过 decide 后 launch"
+  - name: proposal_dispatch
+    command_template: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
+    next_steps:
+      - "独立 Jira 节点归档完整需求与附件"
+      - "独立 GitNexus 调研节点执行只读调研"
+      - "联合确定项目、租户与基础分支"
+      - "查找任一基础分支下同名 worktree"
+      - "不存在时调用 dev-spec-gen worktree CLI"
+      - "通过 Orca 绑定 worktree 分发开发方案"
+flows:
+  - name: direct
+    stages: [direct_dispatch]
+  - name: complete
+    stages: [complete_dispatch]
+    default: true
+  - name: proposal
+    stages: [proposal_dispatch]
+
 interaction:
   repository_selection: "required"
   base_branch_selection: "optional"
@@ -131,15 +171,6 @@ dispatch:
   # 可选：兼容旧配置时使用 dispatch.agent；未配置 agent_commands 时生效。
   # 跳过 Claude 工具权限弹窗，避免任务命令被权限确认阻塞。
   agent_extra_args: "--dangerously-skip-permissions"
-  skill:
-    # 命令模板必须以 /dev-spec-gen 开头；任务上下文字段与命令合并为同一提示词。
-    # 不要在模板中追加其他 slash command 或改变 /dev-spec-gen 的开头位置。
-    command_templates:
-      # 已确认的 launch 阶段才使用 Orca 绑定 worktree 并启动 Claude terminal；前置任务在当前会话完成。
-      # Windows 优先 pwsh.exe，未安装时回退 powershell.exe；macOS 使用 zsh，Linux 使用 bash。
-      direct: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
-      complete: "/dev-spec-gen {task_url} 工作区: 当前工作区当前分支 流程: development_proposal_delivery 调研: 无需调研直接澄清；base_branch={base_branch}；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
-      proposal: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
   terminal:
     read_retry_attempts: 2
     read_retry_delay_ms: 500

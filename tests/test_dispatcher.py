@@ -133,6 +133,96 @@ def flow_worktree_assignment(
     )
 
 
+REGISTRY_CONFIG = """\
+workspace:
+  projects_root: "{projects_root}"
+  projects:
+    mapped:
+      path: "repo-a"
+      base_branches: ["origin/release"]
+base_branch:
+  options: ["origin/default"]
+  validate: false
+task_source:
+  type: "prompt"
+  query: "status = 待开发"
+  fetch_prompt: "按 {{{{query}}}} 查询任务"
+  session_prompt:
+    complete: "任务确认后直接创建或复用 worktree，并写入 worktree_path"
+    recovery: "这是恢复会话"
+  task_url_template: "https://jira.example/{{task_id}}"
+  max_tasks: 12
+stages:
+  - name: shared_dispatch
+    command_template: "/dev-spec-gen {{task_url}} shared；base_branch={{base_branch}}"
+    next_steps: ["准备 worktree", "启动开发会话"]
+  - name: light_dispatch
+    command_template: "/dev-spec-gen {{task_url}} light；base_branch={{base_branch}}"
+    next_steps: ["轻量处理"]
+    requires_worktree: false
+    requires_snapshot: false
+flows:
+  - name: standard
+    stages: [shared_dispatch]
+    default: true
+  - name: lightweight
+    stages: [light_dispatch]
+  - name: combo
+    stages: [shared_dispatch, light_dispatch]
+dispatch:
+  agent: "claude"
+  agent_commands:
+    windows_pwsh: "claude"
+    windows_powershell: "claude"
+    macos: "claude"
+    linux: "claude"
+  agent_extra_args: ""
+  terminal:
+    read_retry_attempts: 2
+    read_retry_delay_ms: 1
+    ready_retry_attempts: 3
+    send_retry_attempts: 1
+    ready_timeout_ms: 120000
+  concurrency:
+    max_agents: 12
+dedup:
+  enabled: true
+  state_file: ".runtime/state.json"
+"""
+
+
+def write_registry_config(root: Path, projects_root: Path, text: str = REGISTRY_CONFIG) -> dispatcher.Config:
+    config_path = root / "config" / "dispatcher.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(text.format(projects_root=projects_root.as_posix()), encoding="utf-8")
+    return dispatcher.load_config(config_path)
+
+
+def command_config(template: str, *, flow: str = "complete") -> dispatcher.Config:
+    """构造只含一个流程的配置，用于命令渲染测试。"""
+    stage = dispatcher.FlowStage(name="test_stage", command_template=template)
+    flow_definition = dispatcher.DispatchFlow(
+        name=flow,
+        stage_names=("test_stage",),
+        is_default=True,
+        command_template=template,
+        session_prompt=None,
+        fetch_prompt=None,
+        next_steps=(),
+        requires_worktree=True,
+        requires_snapshot=True,
+    )
+    return dispatcher.Config(
+        root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
+        max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
+        task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
+        task_source_query="", fetch_prompt="", agent_command="claude",
+        stages={stage.name: stage},
+        flows={flow: flow_definition},
+        default_flow=flow,
+    )
+
+
 def assignment(
     task_id: str,
     repository: str,
@@ -517,8 +607,8 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(command, f"/dev-spec-gen 出具开发方案 https://jira.example/XSWL-1 {snapshot_path.resolve().as_posix()}")
             self.assertNotIn("不应下发", command)
 
-    def test_assignment_rejects_unknown_dispatch_flow(self) -> None:
-        with self.assertRaisesRegex(dispatcher.DispatcherError, "dispatch_flow 必须"):
+    def test_assignment_rejects_malformed_dispatch_flow(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "只能包含字母、数字、点、下划线和连字符"):
             dispatcher.Assignment.from_dict({
                 "task_id": "XSWL-1",
                 "title": "测试",
@@ -526,8 +616,20 @@ class DispatcherTests(unittest.TestCase):
                 "repository": "repo-a",
                 "repository_path": "D:/repo-a",
                 "base_branch": "main",
-                "dispatch_flow": "unknown",
-            })
+                "dispatch_flow": "unknown::flow",
+            }, "complete")
+
+    def test_unregistered_dispatch_flow_is_rejected_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "dispatch_flow 未注册"):
+                config.flow_for("unknown")
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "flow 未注册"):
+                dispatcher.task_source_prompt(config, flow="unknown")
 
     def test_direct_command_preserves_source_task_and_falls_back_to_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -893,7 +995,7 @@ class DispatcherTests(unittest.TestCase):
             )
             repositories = {"mapped": dispatcher.Repository("mapped", repository_path)}
 
-            with self.assertRaisesRegex(dispatcher.DispatcherError, "requirement_snapshot_path 是必填项"):
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "流程 direct 要求提供 requirement_snapshot_path"):
                 dispatcher.validate_assignment(config, item, repositories)
 
             snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
@@ -1177,7 +1279,7 @@ class DispatcherTests(unittest.TestCase):
                 },
             ]}), encoding="utf-8")
 
-            assignments = dispatcher.read_assignments(path)
+            assignments = dispatcher.read_assignments(path, "complete")
 
             self.assertEqual([item.assignment_id for item in assignments], ["XSWL-1::tenant-a", "XSWL-1::tenant-b"])
 
@@ -1193,7 +1295,7 @@ class DispatcherTests(unittest.TestCase):
                 "base_branch": None,
             }]}), encoding="utf-8")
 
-            assignments = dispatcher.read_assignments(path)
+            assignments = dispatcher.read_assignments(path, "complete")
 
             self.assertEqual([item.task.task_id for item in assignments], ["XSWL-1"])
 
@@ -1337,7 +1439,7 @@ class DispatcherTests(unittest.TestCase):
             }]}), encoding="utf-8")
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "决策任务包含未知字段"):
-                dispatcher.read_decision_input(path)
+                dispatcher.read_decision_input(path, "complete")
 
     def test_read_assignments_rejects_legacy_assignments(self) -> None:
         for payload in (
@@ -1349,7 +1451,7 @@ class DispatcherTests(unittest.TestCase):
                 path.write_text(json.dumps(payload), encoding="utf-8")
 
                 with self.assertRaisesRegex(dispatcher.DispatcherError, "仅支持 tasks"):
-                    dispatcher.read_assignments(path)
+                    dispatcher.read_assignments(path, "complete")
 
     def test_read_assignments_rejects_non_list_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1357,7 +1459,7 @@ class DispatcherTests(unittest.TestCase):
             path.write_text(json.dumps({"tasks": {}}), encoding="utf-8")
 
             with self.assertRaisesRegex(dispatcher.DispatcherError, "tasks 列表"):
-                dispatcher.read_assignments(path)
+                dispatcher.read_assignments(path, "complete")
 
     def test_read_assignments_rejects_unknown_top_level_field(self) -> None:
         for payload in (
@@ -1370,7 +1472,7 @@ class DispatcherTests(unittest.TestCase):
                 path.write_text(json.dumps(payload), encoding="utf-8")
 
                 with self.assertRaisesRegex(dispatcher.DispatcherError, "未知顶层字段"):
-                    dispatcher.read_assignments(path)
+                    dispatcher.read_assignments(path, "complete")
 
     def test_task_rejects_shell_metacharacter_in_id(self) -> None:
         with self.assertRaisesRegex(dispatcher.DispatcherError, "task_id 格式"):
@@ -1534,13 +1636,7 @@ class DispatcherTests(unittest.TestCase):
                 dispatcher.discover_repositories(dispatcher.load_config(config_path))
 
     def test_command_rejects_unsafe_base_branch(self) -> None:
-        config = dispatcher.Config(
-            root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
-            task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
-            task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"complete": "/dev-spec-gen {task_url} base_branch={base_branch}"},
-        )
+        config = command_config("/dev-spec-gen {task_url} base_branch={base_branch}")
         item = dispatcher.Assignment(
             task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
             repository="repo",
@@ -1563,13 +1659,7 @@ class DispatcherTests(unittest.TestCase):
             dispatcher.validate_command_template("任务编号：{task_id}\n/dev-spec-gen {task_url}")
 
     def test_command_omits_source_and_parent_task_info(self) -> None:
-        config = dispatcher.Config(
-            root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
-            task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
-            task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"complete": "/dev-spec-gen {task_url}\n- 任务编号：{task_id}\n- 任务标题：“{title}”"},
-        )
+        config = command_config("/dev-spec-gen {task_url}\n- 任务编号：{task_id}\n- 任务标题：“{title}”")
         item = dispatcher.Assignment(
             task=dispatcher.Task("XSWL-1", "产品需求标题", "https://jira.example/XSWL-1"),
             repository="repo",
@@ -1592,16 +1682,10 @@ class DispatcherTests(unittest.TestCase):
         self.assertNotIn("父", command)
 
     def test_command_rejects_invalid_template(self) -> None:
-        config = dispatcher.Config(
-            root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
-            max_tasks=1, max_agents=1, ready_timeout_ms=1000, read_retry_attempts=1, read_retry_delay_ms=0, ready_retry_attempts=0, send_retry_attempts=0, agent_extra_args="", state_file=Path("state.json"),
-            task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
-            task_source_query="", fetch_prompt="", agent_command="claude",
-            command_templates={"complete": "/dev-spec-gen {task_url"},
-        )
+        config = command_config("/dev-spec-gen {task_url")
 
         with self.assertRaisesRegex(dispatcher.DispatcherError, "模板格式不合法"):
-            dispatcher.validate_command_template(config.command_templates["complete"])
+            dispatcher.validate_command_template(config.flows["complete"].command_template)
 
     def test_discovery_uses_only_explicit_projects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1751,7 +1835,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertTrue(any("dispatch.layout" in warning for warning in config.deprecation_warnings))
             self.assertTrue(any("shell_commands" in warning for warning in config.deprecation_warnings))
             self.assertTrue(any("dispatch.layout" in warning for warning in result["config"]["deprecation_warnings"]))
-            self.assertEqual(sorted(config.command_templates), ["complete", "direct", "proposal"])
+            self.assertEqual(sorted(config.flows), ["complete", "direct", "proposal"])
 
     def test_legacy_split_section_in_session_prompt_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1791,8 +1875,236 @@ class DispatcherTests(unittest.TestCase):
             config = dispatcher.load_config(config_path)
 
             self.assertEqual(config.session_prompt, "任务确认后直接创建或复用 worktree，并写入 worktree_path")
-            self.assertIn("当前工作区当前分支 标准开发流程", config.command_templates["complete"])
+            self.assertIn("当前工作区当前分支 标准开发流程", config.flows["complete"].command_template)
             self.assertTrue(any("separate" in warning for warning in config.deprecation_warnings))
+
+    def test_registry_flow_is_usable_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_registry_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"})
+
+            prompt = dispatcher.task_source_prompt(config, flow="lightweight")
+            self.assertEqual(prompt["flow"], "lightweight")
+            self.assertEqual(prompt["next_steps"], ["轻量处理"])
+
+            item = dispatcher.Assignment(
+                task=dispatcher.Task("XSWL-1", "测试", "https://jira.example/XSWL-1"),
+                repository="mapped",
+                repository_path=repository_path,
+                base_branch="origin/release",
+                dispatch_flow="lightweight",
+            )
+            result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched")
+            sends = [value for operation, value in fake_orca.operations if operation == "send"]
+            self.assertIn("/dev-spec-gen https://jira.example/XSWL-1 light；base_branch=origin/release", sends)
+            self.assertEqual(
+                store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1", "legacy", "lightweight")]["worktree_path"],
+                repository_path.resolve().as_posix(),
+            )
+
+    def test_omitted_dispatch_flow_uses_registry_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_registry_config(root, projects)
+            self.assertEqual(config.default_flow, "standard")
+            worktree_path = projects / "repo-a-XSWL-1"
+            create_linked_worktree(repository_path, worktree_path)
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
+
+            tasks_path = root / "tasks.json"
+            tasks_path.write_text(json.dumps({"tasks": [{
+                "task_id": "XSWL-1",
+                "title": "测试",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "repository_path": repository_path.as_posix(),
+                "base_branch": "origin/release",
+                "worktree_path": worktree_path.as_posix(),
+            }]}), encoding="utf-8")
+
+            assignments = dispatcher.read_assignments(tasks_path, config.default_flow)
+
+            self.assertEqual([item.dispatch_flow for item in assignments], ["standard"])
+
+            decision_path = root / "decision.json"
+            decision_path.write_text(json.dumps({"version": 1, "tasks": [{
+                "task_id": "XSWL-1",
+                "title": "测试",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "base_branch": "origin/release",
+                "worktree_path": worktree_path.as_posix(),
+                "requirement_snapshot_path": snapshot_path.as_posix(),
+            }]}), encoding="utf-8")
+
+            result = dispatcher.decide(config, decision_path)
+
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual([item["dispatch_flow"] for item in result["tasks"]], ["standard"])
+
+    def test_registry_node_can_be_reused_by_multiple_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_registry_config(root, projects)
+
+            standard = config.flows["standard"]
+            combined = config.flows["combo"]
+
+            self.assertEqual(standard.stage_names, ("shared_dispatch",))
+            self.assertEqual(combined.stage_names, ("shared_dispatch", "light_dispatch"))
+            self.assertEqual(combined.next_steps, ("准备 worktree", "启动开发会话", "轻量处理"))
+            self.assertEqual(combined.command_template, config.flows["lightweight"].command_template)
+            self.assertFalse(combined.requires_worktree)
+
+    def test_registry_default_flow_must_be_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "只能有一个 default"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace("    stages: [light_dispatch]", "    stages: [light_dispatch]\n    default: true"),
+                )
+
+    def test_registry_requires_default_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "必须且只能有一个 default"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace("    default: true\n", ""),
+                )
+
+    def test_registry_rejects_unknown_node_and_missing_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "引用了未定义节点：missing_dispatch"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace("    stages: [shared_dispatch]\n    default: true", "    stages: [missing_dispatch]\n    default: true"),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "都未声明 command_template"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace(
+                        '    command_template: "/dev-spec-gen {{task_url}} shared；base_branch={{base_branch}}"',
+                        '    next_steps: ["无模板"]',
+                    ).replace('    next_steps: ["准备 worktree", "启动开发会话"]\n', ""),
+                )
+
+    def test_registry_rejects_duplicate_and_malformed_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "重复流程名：combo"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace("  - name: standard", "  - name: combo"),
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "只能包含字母、数字、点、下划线和连字符"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace("  - name: lightweight", '  - name: "bad::flow"'),
+                )
+
+    def test_state_and_reset_accept_unregistered_flow_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            (repository_path / ".git").mkdir(parents=True)
+            config = write_registry_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            retired_key = dispatcher.state_key_for("XSWL-1", "legacy", "retired")
+            dispatcher.atomic_write_json(config.state_file, {
+                "version": 1,
+                "tasks": {
+                    retired_key: {
+                        "task_id": "XSWL-1",
+                        "tenant_slug": "legacy",
+                        "assignment_id": "XSWL-1",
+                        "status": "launching",
+                        "dispatch_flow": "retired",
+                    },
+                },
+            })
+            arguments = dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"),
+                "state", "--dispatch-flow", "retired",
+            ])
+            result = dispatcher.execute(arguments)
+
+            self.assertEqual(set(result["state"]["tasks"]), {retired_key})
+
+            reset_result = dispatcher.execute(dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"),
+                "reset", "XSWL-1", "--dispatch-flow", "retired",
+            ]))
+            self.assertTrue(reset_result["reset"])
+            self.assertIsNone(store.status("XSWL-1", dispatch_flow="retired"))
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "未注册"):
+                config.flow_for("retired")
+
+    def test_validate_reports_registry_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            write_registry_config(root, projects)
+
+            result = dispatcher.execute(dispatcher.build_parser().parse_args([
+                "--config", str(root / "config" / "dispatcher.yaml"),
+                "validate",
+            ]))
+
+            summary = result["config"]
+            self.assertEqual(summary["default_flow"], "standard")
+            self.assertEqual(
+                [(flow["name"], flow["default"]) for flow in summary["flows"]],
+                [("standard", True), ("lightweight", False), ("combo", False)],
+            )
+            self.assertEqual([stage["name"] for stage in summary["stages"]], ["shared_dispatch", "light_dispatch"])
 
     def test_snapshot_rejects_invalid_task_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2713,7 +3025,7 @@ class DispatcherTests(unittest.TestCase):
                 "repository_path": "C:/repo",
                 "base_branch": None,
                 "reference_plan": "   ",
-            })
+            }, "complete")
 
     def test_task_rejects_non_text_description(self) -> None:
         with self.assertRaisesRegex(dispatcher.DispatcherError, "description 必须是字符串"):
@@ -2795,7 +3107,7 @@ class DispatcherTests(unittest.TestCase):
                     "base_branch": None,
                     "worktree_path": "C:/worktree" if field != "worktree_path" else "worktree",
                     "gitnexus_report_path": "C:/worktree/docs/engineering/research/report.md" if field != "gitnexus_report_path" else "report.md",
-                })
+                }, "complete")
 
     def test_terminal_failures_require_manual_reset(self) -> None:
         for failure, task_count, affected_task_id, orca_options in (
@@ -3119,7 +3431,7 @@ class DispatcherTests(unittest.TestCase):
                 "worktree_path": "D:/repo-a-task",
             }]}), encoding="utf-8")
 
-            assignments = dispatcher.read_assignments(path)
+            assignments = dispatcher.read_assignments(path, "complete")
 
             self.assertEqual(assignments[0].worktree_path, Path("D:/repo-a-task"))
 

@@ -10,6 +10,7 @@ description: 用 CLI 生成并启动用户确认的任务分发。用于手动�
 proposal（出具开发方案）流程必须拆分为两个独立节点：Jira 节点与调研节点均独立参考 `/dev-spec-gen` 公开规范；Jira 节点先规范真实 JQL、读取完整需求及附件并归档，调研节点再消费快照执行 GitNexus 跨项目只读调研。节点成功后才查找任一基础分支下同名 worktree，不存在才调用统一 worktree CLI，最终发送 `/dev-spec-gen 出具开发方案 <jira地址> <原始需求文本路径>`。
 
 - 默认配置由托管的 `config/dispatcher.default.yaml` 提供；未显式传入 `--config` 时，若设置非空 `ORCA_DISPATCHER_CONFIG_DIR`，脚本自动读取该目录下的 `dispatcher.yaml` 作为用户覆盖层，否则使用默认 `config/dispatcher.yaml`；环境变量目录不存在或缺少该文件时仅使用托管默认配置。客户目录中的 `.env` 和其他文件不会自动读取；通过 `task-source --jql` 可临时覆盖本次 JQL，不写入配置。
+- 流程不写死在代码里：配置顶层的 `stages:` 是独立可复用的节点，`flows:` 按名引用节点组成流程，且必须且只能有一个 `default: true` 的流程。新增流程只在配置里追加 `flows` 项（必要时追加 `stages` 节点），不改脚本；`task-source --flow`、`decide --dispatch-flow`、`launch` 只接受注册表中的流程，`state`/`recover`/`reset` 可用已删除的历史流程名操作旧状态。节点名与流程名限 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`；旧 `dispatch.skill.command_templates` 与 `task_source.flows` 自动映射并告警。
 - 完整方案与流程模式由当前会话选择和执行，Dispatcher 不根据参考方案文本自动判断；两条流程最终都必须经过显式 `decide` 和安全 `launch`。
 - 直接流程（`direct`）只做最小分发，使用 `development_jira_spec(jira 参考方案驱动流程开发`；必须同时向下游传递原始实际开发任务编号 `source_task_id`（缺省回退为 `task_id`），供实际开发任务按需读取子任务中的仓库方案；全自动执行，无需人员介入。direct、complete、proposal 在同一任务/租户下使用独立内部状态 identity，可并发分发；对外 `assignment_id` 保持兼容，worktree/terminal 可共享。
 - 后续任务分发在当前会话内完成：当前会话直接执行任务查询、Jira 需求归档、调研、路由判断和 worktree 准备，不通过 Orca 编排创建或打开新的 Agent 会话；仅在最终已确认的 launch 阶段，才使用 Orca 绑定 worktree 并启动目标 Claude terminal。

@@ -97,7 +97,9 @@ SHELL_PROMPT_PATTERN = re.compile(
     r"(?:^|\n)(?:PS [^\n>]+>|(?:[A-Za-z]:)?[\\/][^\n>]*>|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\n$#]*[$#])\s*\Z"
 )
 TASK_STATUSES = frozenset({"launching", "dispatched", "requires_manual_reset"})
-DISPATCH_FLOWS = frozenset({"direct", "complete", "proposal"})
+FLOW_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+LEGACY_FLOW_NAMES = ("direct", "complete", "separate", "proposal")
+LEGACY_FLOW_ALIASES = {"separate": "complete"}
 COMMAND_TEMPLATE_FIELDS = frozenset({"task_url", "task_id", "base_branch", "requirement_snapshot_path"})
 TASK_CONTEXT_TEMPLATE_FIELDS = frozenset({
     "title", "description", "assignee", "tenant", "assignment_id",
@@ -156,9 +158,13 @@ class Task:
 
 
 def require_dispatch_flow(value: Any, field: str = "dispatch_flow") -> str:
+    """校验流程名格式；是否为已注册流程由配置注册表另行判定。"""
     dispatch_flow = require_text(value, field)
-    if dispatch_flow not in DISPATCH_FLOWS:
-        raise DispatcherError("invalid_input", "dispatch_flow 必须是 direct、complete 或 proposal")
+    if not FLOW_NAME_PATTERN.fullmatch(dispatch_flow):
+        raise DispatcherError(
+            "invalid_input",
+            f"{field} 只能包含字母、数字、点、下划线和连字符，且必须以字母或数字开头",
+        )
     return dispatch_flow
 
 
@@ -237,7 +243,7 @@ class Assignment:
     dispatch_flow: str = "complete"
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "Assignment":
+    def from_dict(cls, value: Mapping[str, Any], default_flow: str) -> "Assignment":
         unknown_fields = set(value) - {
             "task_id", "title", "description", "task_url", "repository", "repository_path",
             "base_branch", "worktree_path", "reference_plan", "assignee", "tenant", "tenant_slug", "assignment_id",
@@ -289,7 +295,7 @@ class Assignment:
         snapshot_value = requirement_snapshot_path.strip() if isinstance(requirement_snapshot_path, str) else None
         if snapshot_value is not None and not Path(snapshot_value).is_absolute():
             raise DispatcherError("invalid_input", "requirement_snapshot_path 必须是绝对路径")
-        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", "complete"))
+        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", default_flow))
         return cls(
             task=Task.from_dict(value),
             repository=require_text(value.get("repository"), "repository"),
@@ -394,6 +400,34 @@ class Project:
 
 
 @dataclass(frozen=True)
+class FlowStage:
+    """流程节点：可被任意流程按名复用的一段分发定义。"""
+
+    name: str
+    command_template: str | None = None
+    session_prompt: str | None = None
+    fetch_prompt: str | None = None
+    next_steps: tuple[str, ...] = ()
+    requires_worktree: bool = True
+    requires_snapshot: bool = True
+
+
+@dataclass(frozen=True)
+class DispatchFlow:
+    """分发流程：按顺序引用节点，并派生出实际下发的命令与提示词。"""
+
+    name: str
+    stage_names: tuple[str, ...]
+    is_default: bool
+    command_template: str
+    session_prompt: str | None
+    fetch_prompt: str | None
+    next_steps: tuple[str, ...]
+    requires_worktree: bool
+    requires_snapshot: bool
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path
     projects_root: Path
@@ -414,9 +448,10 @@ class Config:
     task_source_query: str
     fetch_prompt: str
     agent_command: str
-    command_templates: Mapping[str, str]
+    stages: Mapping[str, FlowStage] = field(default_factory=dict)
+    flows: Mapping[str, DispatchFlow] = field(default_factory=dict)
+    default_flow: str = "complete"
     reference_plan_field: str | None = None
-    task_source_flows: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     session_prompt: str = ""
     recovery_session_prompt: str = ""
     deprecation_warnings: tuple[str, ...] = ()
@@ -424,6 +459,18 @@ class Config:
     @property
     def runtime_dir(self) -> Path:
         return self.state_file.parent
+
+    def flow_for(self, name: str, field: str = "dispatch_flow") -> DispatchFlow:
+        """取已注册流程；未注册时给出明确错误而不是回退默认流程。"""
+        flow_name = require_dispatch_flow(name, field)
+        flow = self.flows.get(flow_name)
+        if flow is None:
+            available = "、".join(self.flows) or "无"
+            raise DispatcherError(
+                "invalid_input",
+                f"{field} 未注册：{flow_name}；当前注册表包含：{available}",
+            )
+        return flow
 
     def branches_for(self, repository: str) -> tuple[str, ...]:
         return tuple(self.branch_map_for(repository))
@@ -607,12 +654,220 @@ def deprecation_warnings_for(root_data: Mapping[str, Any]) -> tuple[str, ...]:
                 warnings.append("dispatch.skill.command_templates.split 已失效并被忽略")
             if isinstance(templates, Mapping) and "separate" in templates:
                 warnings.append("dispatch.skill.command_templates.separate 已更名为 complete；仅在未提供 complete 时沿用其内容")
+            if isinstance(templates, Mapping) and any(name in templates for name in LEGACY_FLOW_NAMES):
+                warnings.append(
+                    "dispatch.skill.command_templates 已由顶层 stages/flows 注册表取代；"
+                    "未提供注册表时自动映射为等价节点并继续生效"
+                )
     task_source = root_data.get("task_source")
     if isinstance(task_source, Mapping):
         session_prompt = task_source.get("session_prompt")
         if isinstance(session_prompt, Mapping) and "split" in session_prompt:
             warnings.append("task_source.session_prompt.split 已失效并被忽略")
+        legacy_flows = task_source.get("flows")
+        if isinstance(legacy_flows, Mapping) and legacy_flows:
+            warnings.append(
+                "task_source.flows 已由顶层 stages/flows 注册表取代；"
+                "未提供注册表时其 next_steps 自动映射为等价节点步骤"
+            )
     return tuple(warnings)
+
+
+def require_flow_name(value: Any, field: str) -> str:
+    name = require_text(value, field)
+    if not FLOW_NAME_PATTERN.fullmatch(name):
+        raise DispatcherError(
+            "invalid_config",
+            f"{field} 只能包含字母、数字、点、下划线和连字符，且必须以字母或数字开头",
+        )
+    return name
+
+
+def require_flow_steps(value: Any, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(step, str) and step.strip() for step in value):
+        raise DispatcherError("invalid_config", f"{field} 必须是非空字符串列表")
+    return tuple(step.strip() for step in value)
+
+
+def parse_flow_stage(value: Any, index: int) -> FlowStage:
+    field = f"stages[{index}]"
+    stage = require_mapping(value, field)
+    unknown = set(stage) - {
+        "name", "command_template", "session_prompt", "fetch_prompt",
+        "next_steps", "requires_worktree", "requires_snapshot",
+    }
+    if unknown:
+        raise DispatcherError("invalid_config", f"{field} 包含未知字段：{sorted(unknown)[0]}")
+    command_template = stage.get("command_template")
+    if command_template is not None:
+        command_template = require_text(command_template, f"{field}.command_template")
+        validate_command_template(command_template)
+    return FlowStage(
+        name=require_flow_name(stage.get("name"), f"{field}.name"),
+        command_template=command_template,
+        session_prompt=require_optional_text(stage.get("session_prompt"), f"{field}.session_prompt"),
+        fetch_prompt=require_optional_text(stage.get("fetch_prompt"), f"{field}.fetch_prompt"),
+        next_steps=require_flow_steps(stage.get("next_steps"), f"{field}.next_steps"),
+        requires_worktree=require_bool(stage.get("requires_worktree", True), f"{field}.requires_worktree"),
+        requires_snapshot=require_bool(stage.get("requires_snapshot", True), f"{field}.requires_snapshot"),
+    )
+
+
+def parse_flow_stages(value: Any) -> Mapping[str, FlowStage]:
+    if not isinstance(value, list) or not value:
+        raise DispatcherError("invalid_config", "stages 必须是非空数组")
+    stages: dict[str, FlowStage] = {}
+    for index, item in enumerate(value):
+        stage = parse_flow_stage(item, index)
+        if stage.name in stages:
+            raise DispatcherError("invalid_config", f"stages 包含重复节点名：{stage.name}")
+        stages[stage.name] = stage
+    return MappingProxyType(stages)
+
+
+def compose_flow(
+    name: str,
+    stage_names: tuple[str, ...],
+    stages: Mapping[str, FlowStage],
+    is_default: bool,
+) -> DispatchFlow:
+    if not stage_names:
+        raise DispatcherError("invalid_config", f"流程 {name} 必须引用至少一个节点")
+    missing = next((stage_name for stage_name in stage_names if stage_name not in stages), None)
+    if missing is not None:
+        raise DispatcherError("invalid_config", f"流程 {name} 引用了未定义节点：{missing}")
+    resolved = tuple(stages[stage_name] for stage_name in stage_names)
+    command_template = next((stage.command_template for stage in reversed(resolved) if stage.command_template), None)
+    if command_template is None:
+        raise DispatcherError("invalid_config", f"流程 {name} 引用的节点都未声明 command_template")
+    return DispatchFlow(
+        name=name,
+        stage_names=stage_names,
+        is_default=is_default,
+        command_template=command_template,
+        session_prompt=next((stage.session_prompt for stage in reversed(resolved) if stage.session_prompt), None),
+        fetch_prompt=next((stage.fetch_prompt for stage in resolved if stage.fetch_prompt), None),
+        next_steps=tuple(step for stage in resolved for step in stage.next_steps),
+        requires_worktree=all(stage.requires_worktree for stage in resolved),
+        requires_snapshot=all(stage.requires_snapshot for stage in resolved),
+    )
+
+
+def parse_dispatch_flows(value: Any, stages: Mapping[str, FlowStage]) -> tuple[Mapping[str, DispatchFlow], str]:
+    if not isinstance(value, list) or not value:
+        raise DispatcherError("invalid_config", "flows 必须是非空数组")
+    parsed: list[tuple[str, tuple[str, ...], bool]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        field = f"flows[{index}]"
+        flow = require_mapping(item, field)
+        unknown = set(flow) - {"name", "stages", "default"}
+        if unknown:
+            raise DispatcherError("invalid_config", f"{field} 包含未知字段：{sorted(unknown)[0]}")
+        name = require_flow_name(flow.get("name"), f"{field}.name")
+        if name in seen:
+            raise DispatcherError("invalid_config", f"flows 包含重复流程名：{name}")
+        seen.add(name)
+        stage_names = require_flow_steps(flow.get("stages"), f"{field}.stages")
+        is_default = require_bool(flow.get("default", False), f"{field}.default")
+        parsed.append((name, stage_names, is_default))
+    defaults = [name for name, _, is_default in parsed if is_default]
+    if len(defaults) != 1:
+        raise DispatcherError(
+            "invalid_config",
+            "flows 必须且只能有一个 default: true" if not defaults else "flows 只能有一个 default: true",
+        )
+    flows = {
+        name: compose_flow(name, stage_names, stages, name == defaults[0])
+        for name, stage_names, _ in parsed
+    }
+    return MappingProxyType(flows), defaults[0]
+
+
+def legacy_flow_registry(
+    command_templates: Mapping[str, Any],
+    task_source_flows: Mapping[str, Any],
+    session_prompt: str | None,
+    base: tuple[Mapping[str, FlowStage], Mapping[str, DispatchFlow], str] | None = None,
+) -> tuple[Mapping[str, FlowStage], Mapping[str, DispatchFlow], str]:
+    """把旧的 command_templates / task_source.flows 映射为注册表；已有注册表时按流程覆盖。"""
+    base_stages, base_flows, base_default = base or ({}, {}, "complete")
+    stages: dict[str, FlowStage] = dict(base_stages)
+    flows: dict[str, DispatchFlow] = dict(base_flows)
+    ordered_templates = sorted(
+        command_templates.items(),
+        key=lambda item: 0 if LEGACY_FLOW_ALIASES.get(item[0]) == "complete" else 1,
+    )
+    for index, (name, template) in enumerate(ordered_templates):
+        if name not in LEGACY_FLOW_NAMES:
+            continue
+        flow_name = require_flow_name(LEGACY_FLOW_ALIASES.get(name, name), f"dispatch.skill.command_templates 键[{index}]")
+        legacy_steps = task_source_flows.get(name)
+        if legacy_steps is None:
+            legacy_steps = task_source_flows.get(flow_name)
+        steps: tuple[str, ...] = ()
+        if isinstance(legacy_steps, Mapping):
+            steps = require_flow_steps(legacy_steps.get("next_steps"), f"task_source.flows.{name}.next_steps")
+        command_template = require_text(template, f"dispatch.skill.command_templates.{name}")
+        validate_command_template(command_template)
+        existing = flows.get(flow_name)
+        stage_name = existing.stage_names[0] if existing is not None else f"{flow_name}_stage"
+        previous = stages.get(stage_name)
+        stages[stage_name] = FlowStage(
+            name=stage_name,
+            command_template=command_template,
+            session_prompt=(previous.session_prompt if previous else None)
+            or (session_prompt if flow_name == "complete" else None),
+            fetch_prompt=previous.fetch_prompt if previous else None,
+            next_steps=steps or (previous.next_steps if previous else ()),
+            requires_worktree=previous.requires_worktree if previous else True,
+            requires_snapshot=previous.requires_snapshot if previous else True,
+        )
+        flows[flow_name] = compose_flow(
+            flow_name,
+            (stage_name,),
+            MappingProxyType(stages),
+            existing.is_default if existing is not None else flow_name == "complete",
+        )
+    if "complete" not in flows:
+        raise DispatcherError("invalid_config", "未配置 flows 注册表，且旧配置缺少 complete 命令模板")
+    return MappingProxyType(stages), MappingProxyType(flows), base_default
+
+
+def parse_registry(
+    root_data: Mapping[str, Any],
+) -> tuple[Mapping[str, FlowStage], Mapping[str, DispatchFlow], str]:
+    stages = parse_flow_stages(root_data.get("stages"))
+    flows, default_flow = parse_dispatch_flows(root_data.get("flows"), stages)
+    return stages, flows, default_flow
+
+
+def resolve_flow_registry(
+    root_data: Mapping[str, Any],
+    user_data: Mapping[str, Any],
+    session_prompt: str | None,
+) -> tuple[Mapping[str, FlowStage], Mapping[str, DispatchFlow], str]:
+    """新键优先；用户层仍使用旧键时自动映射为等价注册表，保证既有定制继续生效。"""
+    user_uses_registry = "stages" in user_data or "flows" in user_data
+    base = parse_registry(root_data) if ("stages" in root_data or "flows" in root_data) else None
+    if not user_uses_registry:
+        legacy_templates = nested_mapping(user_data, "dispatch", "skill", "command_templates")
+        legacy_user_flows = nested_mapping(user_data, "task_source", "flows")
+        if legacy_templates or legacy_user_flows:
+            merged_templates = dict(nested_mapping(root_data, "dispatch", "skill", "command_templates"))
+            merged_templates.update(legacy_templates)
+            merged_flows = dict(nested_mapping(root_data, "task_source", "flows"))
+            merged_flows.update(legacy_user_flows)
+            return legacy_flow_registry(merged_templates, merged_flows, session_prompt, base)
+    if base is not None:
+        return base
+    return legacy_flow_registry(
+        dict(nested_mapping(root_data, "dispatch", "skill", "command_templates")),
+        dict(nested_mapping(root_data, "task_source", "flows")),
+        session_prompt,
+    )
 
 
 def load_config(config_file: Path | None = None) -> Config:
@@ -624,7 +879,8 @@ def load_config(config_file: Path | None = None) -> Config:
     task_source = require_mapping(root_data.get("task_source"), "task_source")
     interaction = require_mapping(root_data.get("interaction"), "interaction")
     dispatch = require_mapping(root_data.get("dispatch"), "dispatch")
-    skill = require_mapping(dispatch.get("skill"), "dispatch.skill")
+    skill_value = dispatch.get("skill")
+    skill = require_mapping(skill_value, "dispatch.skill") if skill_value is not None else {}
     terminal = require_mapping(dispatch.get("terminal"), "dispatch.terminal")
     concurrency = require_mapping(dispatch.get("concurrency"), "dispatch.concurrency")
     dedup = require_mapping(root_data.get("dedup"), "dedup")
@@ -679,26 +935,9 @@ def load_config(config_file: Path | None = None) -> Config:
 
     task_url_template = require_text(task_source.get("task_url_template"), "task_source.task_url_template")
     task_url_for(task_url_template, "template-check")
-    command_templates = require_mapping(skill.get("command_templates"), "dispatch.skill.command_templates")
-    direct_template = require_text(
-        command_templates.get("direct", "/dev-spec-gen {task_url}"),
-        "dispatch.skill.command_templates.direct",
-    )
-    proposal_template = require_text(
-        command_templates.get("proposal", "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"),
-        "dispatch.skill.command_templates.proposal",
-    )
-    user_templates = nested_mapping(user_data, "dispatch", "skill", "command_templates")
-    complete_template = require_text(
-        user_templates.get("complete")
-        or user_templates.get("separate")
-        or command_templates.get("complete")
-        or command_templates.get("separate"),
-        "dispatch.skill.command_templates.complete",
-    )
+    resolved_session_prompt = session_prompt_for(session_prompt, nested_mapping(user_data, "task_source", "session_prompt"))
+    stages, flows, default_flow = resolve_flow_registry(root_data, user_data, resolved_session_prompt)
     deprecation_warnings = deprecation_warnings_for(root_data)
-    for template in (complete_template, direct_template, proposal_template):
-        validate_command_template(template)
 
     agent_extra_args = dispatch.get("agent_extra_args")
     if agent_extra_args is None:
@@ -738,17 +977,11 @@ def load_config(config_file: Path | None = None) -> Config:
         task_source_query=task_source_query,
         fetch_prompt=fetch_prompt,
         reference_plan_field=reference_plan_field,
-        task_source_flows=MappingProxyType({
-            require_text(name, "task_source.flows 键"): require_mapping(value, f"task_source.flows.{name}")
-            for name, value in task_source_flows.items()
-        }),
         agent_command=agent_command,
-        command_templates=MappingProxyType({
-            "complete": complete_template,
-            "direct": direct_template,
-            "proposal": proposal_template,
-        }),
-        session_prompt=session_prompt_for(session_prompt, nested_mapping(user_data, "task_source", "session_prompt")),
+        stages=stages,
+        flows=flows,
+        default_flow=default_flow,
+        session_prompt=resolved_session_prompt,
         recovery_session_prompt=recovery_session_prompt,
         deprecation_warnings=deprecation_warnings,
     )
@@ -1036,22 +1269,27 @@ def validate_assignment(config: Config, assignment: Assignment, repositories: Ma
     expected_task_url = task_url_for(config.task_url_template, assignment.task.task_id)
     if assignment.task.task_url != expected_task_url:
         raise DispatcherError("invalid_input", "task_url 必须由 task_url_template 生成")
+    flow = config.flow_for(assignment.dispatch_flow)
     if assignment.worktree_path is None:
-        raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
-    worktree = assignment.worktree_path.resolve()
-    if (
-        not is_within(worktree, config.projects_root)
-        or not worktree.is_dir()
-        or not (worktree / ".git").exists()
-        or not is_linked_worktree(repository, worktree)
-    ):
-        raise DispatcherError("invalid_input", "worktree_path 必须是源仓库的可用 Git worktree")
-    if worktree == repository.path:
-        raise DispatcherError("invalid_input", "worktree_path 不能等于源仓库路径")
+        if flow.requires_worktree:
+            raise DispatcherError("invalid_input", f"流程 {flow.name} 要求每个任务提供独立 worktree_path")
+    else:
+        worktree = assignment.worktree_path.resolve()
+        if (
+            not is_within(worktree, config.projects_root)
+            or not worktree.is_dir()
+            or not (worktree / ".git").exists()
+            or not is_linked_worktree(repository, worktree)
+        ):
+            raise DispatcherError("invalid_input", "worktree_path 必须是源仓库的可用 Git worktree")
+        if worktree == repository.path:
+            raise DispatcherError("invalid_input", "worktree_path 不能等于源仓库路径")
     validate_gitnexus_report_path(config, assignment)
     if assignment.requirement_snapshot_path is None:
-        raise DispatcherError("invalid_input", "requirement_snapshot_path 是必填项")
-    validate_requirement_snapshot_path(config, assignment)
+        if flow.requires_snapshot:
+            raise DispatcherError("invalid_input", f"流程 {flow.name} 要求提供 requirement_snapshot_path")
+    else:
+        validate_requirement_snapshot_path(config, assignment)
     if assignment.base_branch is None:
         return
     if assignment.base_branch not in config.branches_for(repository.name):
@@ -1084,6 +1322,9 @@ def validate_state_worktree_ownership(
         worktree_path = entry.value.get("worktree_path")
         if not isinstance(worktree_path, str):
             continue
+        if worktree_path == entry.value.get("source_repository_path"):
+            # 不要求独立工作树的流程直接使用源仓库 checkout，允许多个任务共享。
+            continue
         worktree_key = os.path.normcase(os.path.normpath(str(Path(worktree_path).resolve())))
         owners_by_worktree.setdefault(worktree_key, set()).add(entry.assignment_id)
     for assignment in assignments:
@@ -1110,12 +1351,15 @@ def build_terminal_plans(
     for assignment in assignments:
         validate_assignment_path(assignment, repositories)
         worktree_path = assignment.worktree_path
-        if worktree_path is None:
-            raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
+        tab_title = (
+            worktree_path.resolve().name
+            if worktree_path is not None
+            else f"{assignment.repository}.{assignment.task.task_id}"
+        )
         plans.append(TerminalPlan(
             repository=repositories[assignment.repository],
             assignments=(assignment,),
-            tab_title=worktree_path.resolve().name,
+            tab_title=tab_title,
         ))
     return tuple(plans)
 
@@ -1355,16 +1599,15 @@ class StateStore:
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
         worktree_path = assignment.worktree_path
-        if worktree_path is None:
-            raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
+        repository_path = worktree_path.resolve() if worktree_path is not None else plan.repository.path.resolve()
         state_key = state_key_for(assignment.task.task_id, assignment.tenant_slug, assignment.dispatch_flow)
         next_tasks = {
             **tasks,
             state_key: {
                 "task_id": assignment.task.task_id,
                 "repository": assignment.repository,
-                "repository_path": worktree_path.resolve().as_posix(),
-                "worktree_path": worktree_path.resolve().as_posix(),
+                "repository_path": repository_path.as_posix(),
+                "worktree_path": worktree_path.resolve().as_posix() if worktree_path is not None else None,
                 "source_repository_path": assignment.repository_path.resolve().as_posix(),
                 "base_branch": assignment.base_branch,
                 "tenant": assignment.tenant,
@@ -1843,16 +2086,7 @@ def task_context_values(assignment: Assignment) -> Mapping[str, str]:
 
 
 def command_for(config: Config, assignment: Assignment, recovery: bool = False) -> str:
-    template_key = (
-        "proposal"
-        if assignment.dispatch_flow == "proposal"
-        else "direct"
-        if assignment.dispatch_flow == "direct"
-        else "complete"
-    )
-    template = config.command_templates.get(template_key)
-    if template is None:
-        raise DispatcherError("invalid_config", f"未配置 {template_key} 分发命令模板")
+    template = config.flow_for(assignment.dispatch_flow).command_template
     values = {
         "task_url": assignment.task.task_url,
         "task_id": require_command_argument(assignment.task.task_id, "task_id"),
@@ -2281,17 +2515,27 @@ def launch(
                     continue
                 try:
                     if terminal_worktree is None:
-                        raise DispatcherError("invalid_input", "每个任务都必须提供独立 worktree_path")
-                    handle = create_terminal_with_retry(
-                        orca,
-                        config,
-                        Repository(name=plan.repository.name, path=terminal_worktree.path),
-                        terminal_worktree.selector,
-                        plan.tab_title,
-                        agent_command_for(config),
-                    )
+                        # 该流程不要求独立任务工作树：终端落在项目默认分支的源仓库 checkout。
+                        handle = create_terminal_with_retry(
+                            orca,
+                            config,
+                            plan.repository,
+                            f"path:{plan.repository.path.as_posix()}",
+                            plan.tab_title,
+                            agent_command_for(config),
+                        )
+                    else:
+                        handle = create_terminal_with_retry(
+                            orca,
+                            config,
+                            Repository(name=plan.repository.name, path=terminal_worktree.path),
+                            terminal_worktree.selector,
+                            plan.tab_title,
+                            agent_command_for(config),
+                        )
                     snapshot = retry_read(config, lambda: orca.terminal_show(handle))
-                    validate_terminal_snapshot(snapshot, terminal_worktree)
+                    if terminal_worktree is not None:
+                        validate_terminal_snapshot(snapshot, terminal_worktree)
                 except DispatcherError as error:
                     results.append(assignment_result(
                         assignment,
@@ -2457,7 +2701,7 @@ def state_entry_history(entry: StateEntry, result: str, **extra: object) -> dict
 
 def recovery_assignment(entry: StateEntry) -> Assignment:
     value = entry.value
-    required_fields = ("repository", "worktree_path", "task_url", "title", "tab_title")
+    required_fields = ("repository", "task_url", "title", "tab_title")
     if any(field not in value for field in required_fields):
         raise DispatcherError("recovery_metadata_missing", "任务缺少恢复所需元数据")
     if value.get("status") == "dispatched" and any(field not in value for field in ("tab_id", "leaf_id")):
@@ -2483,7 +2727,7 @@ def recovery_assignment(entry: StateEntry) -> Assignment:
         "requirement_snapshot_path": value.get("requirement_snapshot_path"),
         "dispatch_flow": value.get("dispatch_flow", entry.dispatch_flow),
         "worktree_path": value.get("worktree_path"),
-    })
+    }, entry.dispatch_flow)
 
 
 def snapshot_matches_state(snapshot: TerminalSnapshot, value: Mapping[str, Any]) -> bool:
@@ -2574,15 +2818,18 @@ def recover(
                 if assignment.requirement_snapshot_path is not None:
                     validate_requirement_snapshot_path(config, assignment)
                 worktree_path = assignment.worktree_path
-                if (
-                    worktree_path is None
-                    or not is_within(worktree_path.resolve(), config.projects_root)
-                    or not worktree_path.is_dir()
-                    or not (worktree_path / ".git").exists()
-                    or not is_linked_worktree(source_repository, worktree_path)
-                ):
-                    raise DispatcherError("recovery_metadata_missing", "任务 worktree 元数据不合法")
-                repository = Repository(name=source_repository.name, path=worktree_path.resolve())
+                if worktree_path is None:
+                    # 不要求独立工作树的流程：终端绑定源仓库 checkout。
+                    repository = source_repository
+                else:
+                    if (
+                        not is_within(worktree_path.resolve(), config.projects_root)
+                        or not worktree_path.is_dir()
+                        or not (worktree_path / ".git").exists()
+                        or not is_linked_worktree(source_repository, worktree_path)
+                    ):
+                        raise DispatcherError("recovery_metadata_missing", "任务 worktree 元数据不合法")
+                    repository = Repository(name=source_repository.name, path=worktree_path.resolve())
                 repository_key = os.path.normcase(os.path.normpath(str(repository.path.resolve())))
                 if repository_key not in repository_ids:
                     orca.repo_add(repository)
@@ -2729,7 +2976,7 @@ def recover(
     return {"results": results}
 
 
-def read_assignments(path: Path) -> tuple[Assignment, ...]:
+def read_assignments(path: Path, default_flow: str) -> tuple[Assignment, ...]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -2748,11 +2995,11 @@ def read_assignments(path: Path) -> tuple[Assignment, ...]:
     for item in tasks:
         if not isinstance(item, Mapping):
             raise DispatcherError("invalid_input", "tasks 每项必须是对象")
-        assignments.append(Assignment.from_dict(item))
+        assignments.append(Assignment.from_dict(item, default_flow))
     return tuple(assignments)
 
 
-def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
+def validate_decision_values(tasks: object, default_flow: str) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(tasks, list):
         raise DispatcherError("invalid_input", "决策 JSON 必须含 tasks 列表")
     decision_fields = {
@@ -2773,7 +3020,7 @@ def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
         tenant = item.get("tenant")
         if tenant_slug == "legacy" and isinstance(tenant, str) and tenant.strip() != "legacy":
             raise DispatcherError("invalid_input", "已指定 tenant 时不能使用保留 tenant_slug：legacy")
-        identity = (task_id, tenant_slug, require_dispatch_flow(item.get("dispatch_flow", "complete")))
+        identity = (task_id, tenant_slug, require_dispatch_flow(item.get("dispatch_flow", default_flow)))
         if identity in task_ids:
             raise DispatcherError("invalid_input", f"任务 ID、租户和流程重复：{task_id}/{tenant_slug}")
         task_ids.add(identity)
@@ -2781,7 +3028,7 @@ def validate_decision_values(tasks: object) -> tuple[Mapping[str, Any], ...]:
     return tuple(values)
 
 
-def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
+def read_decision_input(path: Path, default_flow: str) -> tuple[Mapping[str, Any], ...]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -2794,7 +3041,7 @@ def read_decision_input(path: Path) -> tuple[Mapping[str, Any], ...]:
     if raw.get("version") != 1:
         raise DispatcherError("invalid_input", "决策 JSON version 必须为 1")
     tasks = raw.get("tasks")
-    return validate_decision_values(tasks)
+    return validate_decision_values(tasks, default_flow)
 
 
 def preferred_branch_for(config: Config, repository: Repository, tenants: Iterable[str]) -> str | None:
@@ -2842,7 +3089,7 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
         task = Task.from_dict(value)
         tenant = require_optional_text(value.get("tenant"), "tenant") or "legacy"
         tenant_slug = require_tenant_slug(value.get("tenant_slug", "legacy"))
-        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", "complete"))
+        dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", config.default_flow))
         identity = {
             "task_id": task.task_id,
             "tenant": tenant,
@@ -2965,25 +3212,27 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
             "repository": repository.name,
             "repository_path": repository.path.as_posix(),
             "base_branch": branch,
-        })
-        if assignment.worktree_path is None:
+        }, config.default_flow)
+        flow = config.flow_for(assignment.dispatch_flow)
+        if assignment.worktree_path is None and flow.requires_worktree:
             results.append(decision_result(
                 identity,
                 "needs_confirmation",
-                reason="每个任务都必须提供独立 worktree_path",
+                reason=f"流程 {flow.name} 要求每个任务提供独立 worktree_path",
                 candidates={"repositories": [repository.to_dict()], "base_branches": branches},
             ))
             continue
-        if assignment.requirement_snapshot_path is None:
+        if assignment.requirement_snapshot_path is None and flow.requires_snapshot:
             results.append(decision_result(
                 identity,
                 "needs_confirmation",
-                reason="requirement_snapshot_path 是必填项",
+                reason=f"流程 {flow.name} 要求提供 requirement_snapshot_path",
                 candidates={"repositories": [repository.to_dict()], "base_branches": branches},
             ))
             continue
         try:
-            validate_requirement_snapshot_path(config, assignment)
+            if assignment.requirement_snapshot_path is not None:
+                validate_requirement_snapshot_path(config, assignment)
         except DispatcherError as error:
             results.append(decision_result(
                 identity,
@@ -3006,7 +3255,7 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
 
 
 def decide(config: Config, path: Path) -> dict[str, object]:
-    return decide_values(config, read_decision_input(path))
+    return decide_values(config, read_decision_input(path, config.default_flow))
 
 
 def task_source_prompt(
@@ -3014,71 +3263,37 @@ def task_source_prompt(
     query_override: str | None = None,
     flow: str | None = None,
 ) -> dict[str, object]:
-    selected_flow = flow or "complete"
-    if selected_flow not in DISPATCH_FLOWS:
-        raise DispatcherError("invalid_input", "flow 必须是 direct、complete 或 proposal")
-    configured_flow = config.task_source_flows.get(selected_flow)
-    if configured_flow is not None and not isinstance(configured_flow.get("next_steps"), list):
-        raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是列表")
-    next_steps = configured_flow.get("next_steps") if configured_flow else None
-    if not next_steps:
-        if selected_flow == "direct":
-            next_steps = [
-                "根据实际任务编号和标题提炼语义 slug",
-                "创建或复用对应 worktree",
-                "在该 worktree 启动开发会话",
-                "仅将 Jira 地址和 direct 开发指令交给实际任务",
-            ]
-        elif selected_flow == "proposal":
-            next_steps = [
-                "执行独立 Jira 节点并归档完整需求与附件",
-                "执行独立 GitNexus 调研节点",
-                "联合确定项目、租户与基础分支",
-                "查找任一基础分支下同名 linked worktree",
-                "不存在时调用 dev-spec-gen worktree CLI 创建或复用",
-                "生成 version=1 decide 输入",
-                "通过 Orca 绑定 worktree 并分发开发方案",
-            ]
-        else:
-            next_steps = ["执行独立 Jira 节点并归档完整需求与附件", "执行独立 GitNexus 调研节点", "创建或复用 worktree", "生成 version=1 decide 输入", "通过 decide 后 launch"]
-    if not all(isinstance(step, str) and step.strip() for step in next_steps):
-        raise DispatcherError("invalid_config", f"task_source.flows.{selected_flow}.next_steps 必须是非空字符串列表")
+    selected_flow = flow or config.default_flow
+    resolved = config.flow_for(selected_flow, "flow")
     query = config.task_source_query if query_override is None else require_text(query_override, "jql")
     variables = {
         "query": query,
         "reference_plan_field": config.reference_plan_field or "未配置",
     }
-    names = set(re.findall(r"\{\{([^{}]+)\}\}", config.fetch_prompt))
+    prompt_template = resolved.fetch_prompt or config.fetch_prompt
+    names = set(re.findall(r"\{\{([^{}]+)\}\}", prompt_template))
     unknown = names - variables.keys()
     if unknown:
-        raise DispatcherError("invalid_config", f"task_source.fetch_prompt 包含未知变量：{sorted(unknown)[0]}")
-    prompt = config.fetch_prompt
-    if selected_flow == "direct":
-        prompt = (
-            "使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。\n"
-            "查询条件（真实 Jira JQL，必须原样使用）：\n"
-            f"{query}\n"
-            "不要读取 Jira 详情、父需求、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。"
-        )
-    else:
-        for name, value in variables.items():
-            prompt = prompt.replace(f"{{{{{name}}}}}", value)
+        raise DispatcherError("invalid_config", f"流程 {resolved.name} 的 fetch_prompt 包含未知变量：{sorted(unknown)[0]}")
+    prompt = prompt_template
+    for name, value in variables.items():
+        prompt = prompt.replace(f"{{{{{name}}}}}", value)
     return {
         "type": config.task_source_type,
         "fetch_prompt": prompt,
-        "session_prompt": config.session_prompt,
+        "session_prompt": resolved.session_prompt or config.session_prompt,
         "task_url_template": config.task_url_template,
         "max_tasks": config.max_tasks,
         "reference_plan_field": config.reference_plan_field,
         "query": query,
         "jql_source": "cli" if query_override is not None else "config",
-        "flow": selected_flow,
-        "dispatch_flow": selected_flow,
-        "proposal_command": config.command_templates.get("proposal") if selected_flow == "proposal" else None,
+        "flow": resolved.name,
+        "dispatch_flow": resolved.name,
+        "proposal_command": resolved.command_template if resolved.name == "proposal" else None,
         "jql_semantics": "native_jql_then_parent_post_filter",
         "parent_lookup": {"relation": "parent", "field": config.reference_plan_field, "required": True},
         "post_filter": "child.reference_plan 非空 OR parent.reference_plan 非空",
-        "next_steps": list(next_steps),
+        "next_steps": list(resolved.next_steps),
     }
 
 
@@ -3089,11 +3304,17 @@ def config_summary(config: Config) -> dict[str, object]:
         "max_tasks": config.max_tasks,
         "max_agents": config.max_agents,
         "state_file": config.state_file.as_posix(),
+        "default_flow": config.default_flow,
+        "flows": [
+            {"name": flow.name, "stages": list(flow.stage_names), "default": flow.is_default}
+            for flow in config.flows.values()
+        ],
+        "stages": [{"name": stage.name} for stage in config.stages.values()],
         "deprecation_warnings": list(config.deprecation_warnings),
     }
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(flow_names: tuple[str, ...] | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orca 任务分发器")
     parser.add_argument("--config", type=Path, default=None)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3104,15 +3325,18 @@ def build_parser() -> argparse.ArgumentParser:
     branches = commands.add_parser("branches", help="列出并校验仓库分支")
     branches.add_argument("--repository", required=True)
     state = commands.add_parser("state", help="读取长期分发状态")
-    state.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="按流程筛选状态")
+    state.add_argument("--dispatch-flow", metavar="<流程>", help="按流程筛选状态；允许已从注册表删除的流程名")
     recover = commands.add_parser("recover", help="恢复已分发任务的 Orca 会话")
     recover.add_argument("--task-id")
     recover.add_argument("--tenant-slug", help="指定同一任务下要恢复的租户")
-    recover.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="指定要恢复的流程")
+    recover.add_argument("--dispatch-flow", metavar="<流程>", help="指定要恢复的流程；允许已从注册表删除的流程名")
     recover.add_argument("--force-unlock", action="store_true")
     task_source_parser = commands.add_parser("task-source", help="输出已渲染的任务获取提示词")
     task_source_parser.add_argument("--jql", help="仅本次运行覆盖配置中的 JQL")
-    task_source_parser.add_argument("--flow", choices=("direct", "complete", "proposal"), required=True, help="用户选择的任务流程")
+    task_source_parser.add_argument(
+        "--flow", choices=flow_names, metavar="<流程>", required=True,
+        help="用户选择的任务流程；候选项来自配置注册表",
+    )
     decide_parser = commands.add_parser(
         "decide",
         help="校验外部调研后的项目与分支决策",
@@ -3128,7 +3352,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, kwargs in (
         ("task-id", {"dest": "task_id"}),
         ("title", {}), ("task-url", {"dest": "task_url"}), ("repository", {}),
-        ("base-branch", {"dest": "base_branch"}), ("dispatch-flow", {"dest": "dispatch_flow", "choices": ("direct", "complete", "proposal")}),
+        ("base-branch", {"dest": "base_branch"}), ("dispatch-flow", {"dest": "dispatch_flow", "choices": flow_names, "metavar": "<流程>"}),
         ("source-task-id", {"dest": "source_task_id"}), ("description", {}), ("assignee", {}),
         ("tenant", {}), ("tenant-slug", {"dest": "tenant_slug"}), ("source-assignee", {"dest": "source_assignee"}),
         ("parent-task-id", {"dest": "parent_task_id"}), ("parent-assignee", {"dest": "parent_assignee"}),
@@ -3169,7 +3393,7 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("--force-unlock", action="store_true")
     reset.add_argument("--force", action="store_true", help="允许复位已分发的任务")
     reset.add_argument("--tenant-slug", help="指定同一任务下要复位的租户")
-    reset.add_argument("--dispatch-flow", choices=("direct", "complete", "proposal"), help="指定要复位的流程")
+    reset.add_argument("--dispatch-flow", metavar="<流程>", help="指定要复位的流程；允许已从注册表删除的流程名")
     return parser
 
 
@@ -3246,7 +3470,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
         missing = next((name for name in required if getattr(arguments, name) is None), None)
         if missing is not None:
             raise DispatcherError("invalid_input", f"缺少单任务参数：--{missing.replace('_', '-')}")
-        return decide_values(config, validate_decision_values([supplied]))
+        return decide_values(config, validate_decision_values([supplied], config.default_flow))
     if arguments.command == "reset":
         removed = store.reset_entry(
             arguments.task_id,
@@ -3270,7 +3494,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
     if arguments.command == "launch":
         return launch(
             config=config,
-            assignments=read_assignments(arguments.input),
+            assignments=read_assignments(arguments.input, config.default_flow),
             store=store,
             orca=OrcaClient(),
             force_unlock=arguments.force_unlock,
@@ -3282,9 +3506,20 @@ def emit(value: Mapping[str, object]) -> None:
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+def registered_flow_names(argv: list[str] | None) -> tuple[str, ...] | None:
+    """尽力从配置读取流程名，用于生成 CLI 候选项；配置不可用时退回不做 choices 限制。"""
+    try:
+        pre_parser = argparse.ArgumentParser(add_help=False)
+        pre_parser.add_argument("--config", type=Path, default=None)
+        known, _ = pre_parser.parse_known_args(argv)
+        return tuple(load_config(known.config).flows)
+    except Exception:
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
-        arguments = build_parser().parse_args(argv)
+        arguments = build_parser(registered_flow_names(argv)).parse_args(argv)
     except SystemExit as exit_error:
         if exit_error.code == 0:
             return 0
