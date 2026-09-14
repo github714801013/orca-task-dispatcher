@@ -1978,6 +1978,8 @@ class OrcaClient:
             title,
             "--command",
             command,
+            # 不带该开关时 Orca 会把终端退化成 background handle，创建容易失败。
+            "--focus",
         )
         return self._handle(result)
 
@@ -2133,6 +2135,47 @@ def terminal_has_content(orca: OrcaClient, config: Config, handle: str, snapshot
     """检测会话内容：preview 非空即认为任务已实际运行。"""
     current = snapshot or retry_read(config, lambda: orca.terminal_show(handle))
     return bool(current.preview.strip())
+
+
+CLAUDE_CONFIG_DIR_ENVIRONMENT = "CLAUDE_CONFIG_DIR"
+CLAUDE_SETTINGS_FILENAME = "settings.json"
+CLAUDE_SKIP_DANGEROUS_PROMPT_KEY = "skipDangerousModePermissionPrompt"
+
+
+def claude_settings_path() -> Path:
+    """机器级 Claude 用户配置路径；尊重 CLAUDE_CONFIG_DIR，未设置时使用 ~/.claude。"""
+    directory = os.environ.get(CLAUDE_CONFIG_DIR_ENVIRONMENT, "").strip()
+    base = Path(directory).expanduser() if directory else Path.home() / ".claude"
+    return base / CLAUDE_SETTINGS_FILENAME
+
+
+def ensure_claude_skip_dangerous_prompt() -> Path | None:
+    """启动终端前确保机器级 Claude 配置跳过 Bypass Permissions 确认界面。
+
+    该界面是选择器，向终端发送文本无法改变选中项，因此只能在启动前用配置键跳过。
+    配置已就绪、不可解析或写入失败都不阻断分发，返回 None；实际写入时返回被写入的文件路径。
+    """
+    settings_path = claude_settings_path()
+    settings: dict[str, Any] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            retry_log(f"claude_settings unreadable path={settings_path} error={error}")
+            return None
+        if not isinstance(loaded, dict):
+            retry_log(f"claude_settings not_object path={settings_path}")
+            return None
+        settings = loaded
+    if settings.get(CLAUDE_SKIP_DANGEROUS_PROMPT_KEY) is True:
+        return None
+    try:
+        atomic_write_json(settings_path, {**settings, CLAUDE_SKIP_DANGEROUS_PROMPT_KEY: True})
+    except DispatcherError as error:
+        retry_log(f"claude_settings unwritable path={settings_path} error={error.message}")
+        return None
+    retry_log(f"claude_settings skip_prompt_written path={settings_path}")
+    return settings_path
 
 
 def accept_claude_authorization(orca: OrcaClient, config: Config, handle: str) -> tuple[bool, TerminalSnapshot]:
@@ -3492,6 +3535,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
             "reset": removed is not None,
         }
     if arguments.command == "launch":
+        ensure_claude_skip_dangerous_prompt()
         return launch(
             config=config,
             assignments=read_assignments(arguments.input, config.default_flow),

@@ -3757,6 +3757,76 @@ class DispatcherTests(unittest.TestCase):
         assert isinstance(environment, dict)
         self.assertNotIn("ORCA_DISPATCHER_CONFIG_DIR", environment)
 
+    def test_orca_terminal_create_requests_focus(self) -> None:
+        captured: dict[str, object] = {}
+        original_run = dispatcher.subprocess.run
+
+        def capture_run(*args: object, **kwargs: object) -> SimpleNamespace:
+            captured["args"] = args
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "result": {"handle": "term-1"}}),
+                stderr="",
+            )
+
+        dispatcher.subprocess.run = capture_run
+        try:
+            handle = dispatcher.OrcaClient().terminal_create("id:repo::D:/repo-task", "repo-task", "claude")
+        finally:
+            dispatcher.subprocess.run = original_run
+
+        self.assertEqual(handle, "term-1")
+        command = captured["args"][0]
+        assert isinstance(command, list)
+        self.assertIn("--focus", command)
+        self.assertEqual(command[command.index("--worktree") + 1], "id:repo::D:/repo-task")
+        self.assertEqual(command[command.index("--title") + 1], "repo-task")
+        self.assertEqual(command[command.index("--command") + 1], "claude")
+
+    def test_claude_settings_gain_skip_dangerous_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "settings.json"
+
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": temporary}, clear=False):
+                written = dispatcher.ensure_claude_skip_dangerous_prompt()
+                again = dispatcher.ensure_claude_skip_dangerous_prompt()
+
+            self.assertEqual(written, settings_path)
+            self.assertIsNone(again)
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8")),
+                {"skipDangerousModePermissionPrompt": True},
+            )
+
+    def test_claude_settings_skip_prompt_keeps_other_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "settings.json"
+            settings_path.write_text(
+                json.dumps({"statusLine": {"type": "command"}}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": temporary}, clear=False):
+                dispatcher.ensure_claude_skip_dangerous_prompt()
+
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8")),
+                {"statusLine": {"type": "command"}, "skipDangerousModePermissionPrompt": True},
+            )
+
+    def test_claude_settings_skip_prompt_leaves_broken_config_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "settings.json"
+            for broken in ("{ not json", '["array"]'):
+                with self.subTest(broken=broken):
+                    settings_path.write_text(broken, encoding="utf-8")
+
+                    with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": temporary}, clear=False):
+                        written = dispatcher.ensure_claude_skip_dangerous_prompt()
+
+                    self.assertIsNone(written)
+                    self.assertEqual(settings_path.read_text(encoding="utf-8"), broken)
+
     def test_orca_terminal_send_preserves_slash_command_from_msys_conversion(self) -> None:
         captured: dict[str, object] = {}
         original_run = dispatcher.subprocess.run

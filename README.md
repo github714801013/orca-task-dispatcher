@@ -167,10 +167,10 @@ flows:
 
 ## 分发与状态
 
-- 每个任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
+- 每个任务使用独立 linked worktree 和与该 worktree 目录名一致的唯一 terminal 标题；tab 直接绑定该 worktree，以 `--command claude` 启动会话，等待 TUI 就绪后发送开发请求。创建终端时带 `--focus`，否则 Orca 会在 UI 无法接纳时把终端退化成 background handle，导致创建失败。终端句柄超时时，先按 worktree 路径和标题查找唯一已有终端，仅确认不存在时才重建；多匹配或查询失败会进入 `requires_manual_reset`。
 - 不存在布局配置与 pane 聚合：`dispatch.layout.*`、`dispatch.terminal.shell_commands` 已失效。配置中残留 `dispatch.skill.command_templates` 或 `task_source.flows` 时，会按旧结构自动映射为注册表并在 `validate` 结果的 `config.deprecation_warnings` 中列出弃用告警；其余未知字段照旧忽略。
 - 可配置 `dispatch.agent_extra_args`（如 `--dangerously-skip-permissions`）跳过工具权限弹窗，避免任务命令被权限确认阻塞。
-- Claude Code TUI 仅在 preview 同时出现明确的 `No, exit` 与 `Yes, I accept` 授权选项时，自动提交一次 `Yes, I accept`；授权界面未消失、终端状态无法确认或发送失败时停止并进入 `requires_manual_reset`。未知登录、更新或其他确认界面绝不自动操作。
+- `launch` 执行前会确保机器级 Claude 配置 `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 顶层写入 `skipDangerousModePermissionPrompt: true`，让 `--dangerously-skip-permissions` 的 Bypass Permissions 确认界面不再出现。该界面是只能按键选择的选择器，向终端发送文本无法改变选中项，因此不能依赖自动接受；配置已是 `true`、文件不可解析或写入失败都不阻断分发（只在 stderr 记录诊断）。若该界面仍然出现，Dispatcher 会按原逻辑尝试发送一次 `Yes, I accept` 兜底，界面未消失、终端状态无法确认或发送失败时停止并进入 `requires_manual_reset`。未知登录、更新或其他确认界面绝不自动操作。
 - 任务 worktree 经 `repo add` 新注册后，首次 `terminal create` 若仅因等待 terminal handle 超时，Dispatcher 会先查找 worktree 路径和唯一标题均匹配的终端；确认不存在时才最多重建三次。
 - 就绪等待（`tui-idle`，首轮超时 `ready_timeout_ms`，默认 120s，重试逐轮递增至 360s 上限）后还会读取会话内容（terminal preview）确认任务实际运行，内容为空视为未运行并按 `ready_retry_attempts` 自动重试；命令发送超时按 `send_retry_attempts` 重发，重发可能导致命令被执行两次。重试预算耗尽才标记 `requires_manual_reset`。
 - 终端收到任务且本地状态写入成功后，Dispatcher 会将对应 Orca worktree 卡片设为 `in-progress`。
