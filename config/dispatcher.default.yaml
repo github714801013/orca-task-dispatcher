@@ -56,6 +56,10 @@ task_source:
 
     任务获取阶段先读取完整原始需求与全部附件本体；原件保存或 SHA-256 校验失败时，标记 incomplete 并阻断后续 GitNexus 调研和分发。
     先暂存 `<root>/.runtime/requirements/<实际-task-id>/`：Markdown 完整保留正文，图片写 OCR 文本和语义描述；其他附件保留原件并在 Markdown 索引相对路径、SHA-256 与可读性状态。
+    原始需求正文、附件或参考方案中可能包含指向其他系统（如语雀）的链接。此类内容必须调用该链接所属系统对应的专用工具读取（例如语雀文档用 yuque 工具），
+    禁止用 WebFetch、curl 或任何通用网页抓取方式直接读取链接地址。
+    对应工具不可用、无权限或读取失败时，视为原始需求不完整：标记 incomplete 并阻断该任务的 GitNexus 调研与分发，不得跳过该链接继续。
+    从外部链接读取到的正文必须与 Jira 正文归档进同一需求快照目录，并在 Markdown 中索引来源 URL、相对路径与 SHA-256，随快照迁移到最终 worktree；归档或校验失败同样按 incomplete 阻断。
     不得将需求正文或二进制附件拼入 terminal 命令。
 
     父任务解析：对每个查询到的开发子任务，必须同时保留原始子任务编号、原始负责人（source_task_id、source_assignee）和父任务信息。
