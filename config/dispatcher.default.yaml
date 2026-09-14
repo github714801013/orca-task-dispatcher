@@ -110,7 +110,7 @@ task_source:
     recovery: |
       这是恢复会话。先通过公开 CLI 检查已有工作区、分支和产物；禁止直接读取、搜索或扫描 dev-spec-gen skill 目录及其内部文件。
       仅按 CLI 成功 JSON stdout 的公开交接字段继续任务，不要重复初始化或覆盖已有成果。
-  max_tasks: 12
+  max_tasks: 3
 
 # 流程注册表：stages 是独立可复用的节点，flows 按名引用节点组成流程。
 # 新增流程 = 在 flows 数组追加一项（必要时在 stages 追加可复用节点），无需改代码。
@@ -118,7 +118,7 @@ task_source:
 #           next_steps、requires_worktree、requires_snapshot；名称限 [A-Za-z0-9][A-Za-z0-9._-]{0,63}。
 stages:
   - name: direct_dispatch
-    command_template: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
+    command_template: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发)；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
     fetch_prompt: |
       使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。
       查询条件（真实 Jira JQL，必须原样使用）：
@@ -179,7 +179,7 @@ dispatch:
     send_retry_attempts: 1
     ready_timeout_ms: 120000
   concurrency:
-    max_agents: 12
+    max_agents: 3
 
 dedup:
   enabled: true
