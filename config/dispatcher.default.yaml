@@ -134,6 +134,7 @@ stages:
       - "创建或复用对应 worktree"
       - "在该 worktree 启动开发会话"
       - "仅将 Jira 地址和 direct 开发指令交给实际任务"
+    requires_snapshot: false
   - name: complete_dispatch
     command_template: "/dev-spec-gen {task_url} 工作区: 当前工作区当前分支 流程: development_proposal_delivery 调研: 无需调研直接澄清；base_branch={base_branch}；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
     next_steps:

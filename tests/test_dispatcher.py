@@ -977,7 +977,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("status=success", session_prompt)
         self.assertNotIn("jira.9ji.com", prompt)
 
-    def test_requirement_snapshot_is_required_for_direct_launch(self) -> None:
+    def test_requirement_snapshot_requirement_follows_flow_node(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
@@ -997,13 +997,8 @@ class DispatcherTests(unittest.TestCase):
             )
             repositories = {"mapped": dispatcher.Repository("mapped", repository_path)}
 
-            with self.assertRaisesRegex(dispatcher.DispatcherError, "流程 direct 要求提供 requirement_snapshot_path"):
-                dispatcher.validate_assignment(config, item, repositories)
-
-            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
-            dispatcher.validate_assignment(
-                config,
-                dispatcher.Assignment(
+            def complete_assignment(**extra: object) -> dispatcher.Assignment:
+                return dispatcher.Assignment(
                     task=item.task,
                     repository=item.repository,
                     repository_path=repository_path,
@@ -1011,9 +1006,21 @@ class DispatcherTests(unittest.TestCase):
                     tenant="legacy",
                     tenant_slug="legacy",
                     worktree_path=worktree_path,
-                    requirement_snapshot_path=snapshot_path,
-                    dispatch_flow="direct",
-                ),
+                    dispatch_flow="complete",
+                    **extra,
+                )
+
+            # direct_dispatch 节点声明 requires_snapshot: false，无需快照即可分发。
+            dispatcher.validate_assignment(config, item, repositories)
+
+            # 未声明该字段的流程维持默认要求。
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "流程 complete 要求提供 requirement_snapshot_path"):
+                dispatcher.validate_assignment(config, complete_assignment(), repositories)
+
+            snapshot_path = create_requirement_snapshot(worktree_path, "XSWL-1")
+            dispatcher.validate_assignment(
+                config,
+                complete_assignment(requirement_snapshot_path=snapshot_path),
                 repositories,
             )
 
