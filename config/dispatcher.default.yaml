@@ -2,6 +2,7 @@ version: 1
 
 workspace:
   projects_root: "/path/to/projects"
+  # 任务工作区的位置由 Orca 决定（<Orca workspaceDir>/<仓库名>/<工作区名>），本项目不再配置工作区根目录。
   projects:
     example-repository:
       path: "example-repository"
@@ -29,7 +30,7 @@ base_branch:
 task_source:
   type: "prompt"
   task_url_template: "https://jira.9ji.com/browse/{task_id}"
-  # 可按需在 query 中追加 reference_plan_field 的 IS NOT EMPTY 过滤，只拉取有参考方案的任务。
+  # 基础 JQL：流程引用节点声明 query 时改用节点的默认 JQL（--jql 仍可临时覆盖）。
   query: "issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()"
   # Jira 节点先执行合法基础 JQL，再按 parent key 读取父需求字段并后置过滤；不得伪造父字段 JQL。
   # proposal 流程由独立 Jira 节点和独立调研节点分别参考 dev-spec-gen 后执行。
@@ -37,12 +38,16 @@ task_source:
   fetch_prompt: |
     使用当前环境可用的任务查询工具获取开发任务。
 
-    查询条件（JQL）必须原样使用以下内容，严禁修改：
+    查询条件（JQL）必须原样使用以下内容，严禁改写查询意图、增删条件或调整范围：
     {{query}}
 
-    用户提供的内容可能是伪 SQL 或伪 JQL；Jira 节点必须先参考 dev-spec-gen 公开 CLI 契约分析查询语法，识别是否为伪 JQL。
-    若是伪 JQL，先转换为当前 Jira 实例支持的正确原生 JQL；随后必须把转换后的 JQL 原样交给 Jira 原生解析器校验，通过校验后才执行查询。
-    若不是伪 JQL，也必须先交给 Jira 原生解析器校验后再执行。解析、转换或原生校验失败时停止，不得把未经校验的输入交给 Jira，不得猜测修正。
+    校验顺序固定：先把上面的内容原样交给 Jira 原生解析器，解析通过就按它执行。
+    解析失败才判定为伪 SQL 或伪 JQL，此时先参考 dev-spec-gen 公开 CLI 契约转换为当前 Jira 实例支持的正确原生 JQL，
+    再把转换结果原样交给同一个 Jira 原生解析器校验，通过校验后才执行查询。解析、转换或再校验失败时停止，不得猜测修正。
+
+    原生 JQL 无法表达指向父项的字段条件（例如「父需求的 cf[11103] IS NOT EMPTY」）。这类条件一律不进 JQL：
+    禁止伪造「父需求的 cf」这类语法；改为按 parent key 读取父需求字段后再后置过滤，并与子任务结果合并。
+    交接字段必须写明 jql_semantics=native_jql_then_parent_post_filter、parent_lookup 与 post_filter。
 
     查询对象只能是开发任务。禁止把查询类型改为 产品需求 或任何其他类型；
     产品需求只能作为已查询到任务的父任务获取，绝不直接作为查询条件。
@@ -87,31 +92,23 @@ task_source:
     例如 XSWL-28372（谢熊坤）归一化到 XSWL-26585，参考方案明确谢熊坤负责 C# oanew、吴遥遥负责 Java stock，因此按参考方案锁定 oanew/master-new；
     这是示例，不得硬编码任务编号。只有参考方案缺失或无法映射、且其他证据也无法唯一映射时，才暂停当前任务并继续其他任务。
 
-    同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），每条都必须提供各自 worktree_path。
-    项目和租户确定、worktree 创建后，必须将每个临时需求归档复制到该 worktree 的 `docs/engineering/specs/<日期>-<业务板块>-raw-requirements.md` 与 `docs/engineering/attachments/<实际-task-id>/`。
-    最终将需求 Markdown 的绝对路径写入 requirement_snapshot_path；下游先读此文件，再按其相对路径读取附件本体。
-    租户任务缺失 worktree_path 或 requirement_snapshot_path，或快照/附件清单未标记 complete、附件大小与 SHA-256 不一致时，`dispatcher.py decide` 对该任务返回 needs_confirmation。
-    调研报告先暂存于 `<root>/.runtime/research/<实际-task-id>-gitnexus.md`。项目和基础分支确定后，必须先由统一 worktree CLI 创建/复用对应 worktree，再写入 launch 输入。
+    同一 task_id 的不同 tenant 使用不同 assignment_id（`<task_id>::<tenant_slug>`），并各自给出 worktree_slug；工作区由 launch 阶段创建，会话不创建、不预检工作区。
+    需求归档与调研报告一律先暂存到源仓库的 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/` 下，布局与任务工作区内的 `docs/engineering` 完全同构：
+    快照写 `specs/<日期>-<业务板块>-raw-requirements.md`，附件写 `attachments/<实际-task-id>/`（含清单文件），调研报告写 `research/<实际-task-id>-gitnexus.md`。
+    写入 launch 输入的 requirement_snapshot_path 与 gitnexus_report_path 必须是上述暂存路径的绝对路径；缺快照、附件清单未标记 complete、或附件大小与 SHA-256 不一致时，`dispatcher.py decide` 对该任务返回 needs_confirmation。
+    `dispatcher.py launch` 按任务依次执行：确保源仓库在 Orca 注册 → `orca worktree create` 建工作区 → `git branch -m <用户名>/<工作区名>` → 复用 dev-spec-gen 的 worktree sync 同步未托管内容与 IDE 配置 → 把暂存制品迁入工作区 → `orca orchestration worker-start` 启动受监督 worker。
+    会话不得自行创建目录、迁移制品、创建终端或发送任务文本；这些都由 launch 完成。
   session_prompt:
     complete: |
-      # 任务查询、Jira 归档、调研、路由和 worktree 准备均在当前会话完成；仅最终 launch 阶段使用 Orca 绑定并启动 Claude terminal。
-      # 不通过 Orca 编排创建或打开新的 Agent 会话。
+      # 任务查询、Jira 归档、调研与路由在当前会话完成；工作区创建、制品迁移、worker 启动全部由 dispatcher launch 完成。
       dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
       不得使用 rg、目录扫描或其他方式查找 skill 文件；读取固定 SKILL.md 后，只能通过 dev-spec-gen 提供的 CLI 入口获取其他信息。
       先运行公开 CLI 的 `--help`，再严格按成功 JSON stdout 中的 `next`、公开路径和交接字段继续；不得猜测参数、读取其他内部文件或执行未由 CLI 返回的命令。
-      工具边界：需要打开 Claude terminal、并发分发或恢复会话时使用 Orca；只需要创建 worktree 或运行 dev-spec-gen CLI 时不使用 Orca；两者都需要时，必须先用 dev-spec-gen 创建/复用 worktree，再用 Orca 绑定该 worktree 启动 terminal。
-      路由确认（项目、租户、基础分支）完成后，必须按以下顺序执行：读取固定的全局 dev-spec-gen/SKILL.md → 运行公开 worktree CLI 的 --help → 调用 worktree CLI → 校验独立纯 JSON status=success → 使用其返回的绝对路径。
-      不得在调用 worktree CLI 前询问、要求用户提供或自行猜测 worktree_path；worktree_path 必须由 dev-spec-gen CLI 创建/复用后返回。
-      Orca 的 ask/orchestration 返回 `Dispatch capability is invalid` 或其他通信失败，只标记为 Orca 编排通信失败，不等于本地 dev-spec-gen worktree CLI 失败；项目、租户、分支已唯一确定时不得因此阻断本地 CLI。
-      只有 dev-spec-gen 技能缺失、CLI 执行失败、输出不是独立纯 JSON、返回路径不是有效 linked worktree，或路由本身无法唯一确定时才暂停。
-      重试时创建新的有效 Orca dispatch，或在当前会话直接执行 Dispatcher 规定的本地 worktree CLI；不得继续使用失效的 dispatch capability。
-      必须使用 dev-spec-gen 公开的统一 worktree CLI 创建或复用独立 linked worktree，禁止调用 Orca CLI（包括 `orca worktree create`）替代。
-      仅当 CLI 返回 status=success 的独立纯 JSON stdout 时，才能将其中返回的绝对路径写入 worktree_path；失败输出、混合日志或自行推导的路径均不得使用。
+      工具边界：本会话不调用 orca 命令，也不创建 Git worktree；工作区、分支与 worker 全部由 `dispatcher.py launch` 通过 Orca 完成。
+      路由确认（项目、租户、基础分支）后，只需把需求快照、附件与调研报告暂存到 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/` 下，再把暂存路径交给 decide 与 launch。
+      不得创建、迁移或预检任务工作区，不得向用户询问 worktree 路径；工作区位置由 Orca 决定。
+      只有技能缺失、归档不完整、路由无法唯一确定或 decide 返回 needs_confirmation 时才暂停该任务。
       GitNexus 调研报告必须先从 gitnexus_report_path 读取并校验；报告有效时复用结论并跳过 GitNexus 调研节点。
-      终端标题必须使用该 linked worktree 的目录名，作为唯一会话标识；句柄超时时先按 worktree 路径和该标题查找已有终端，
-      只有确认不存在时才允许重建。多匹配、查询失败或无法确认时停止并等待人工复位，不得猜测或重复发送任务。
-      worktree 名称必须使用实际任务的 task_id（存在父产品需求时为父任务编号），禁止使用原开发需求编号。
-      任务工作区预检未通过或无法确认有效路径时，不创建终端、不进入启动；这不等同于任务或分发失败，等待补充有效路径或人工处理。
     recovery: |
       这是恢复会话。先通过公开 CLI 检查已有工作区、分支和产物；禁止直接读取、搜索或扫描 dev-spec-gen skill 目录及其内部文件。
       仅按 CLI 成功 JSON stdout 的公开交接字段继续任务，不要重复初始化或覆盖已有成果。
@@ -120,19 +117,25 @@ task_source:
 # 流程注册表：stages 是独立可复用的节点，flows 按名引用节点组成流程。
 # 新增流程 = 在 flows 数组追加一项（必要时在 stages 追加可复用节点），无需改代码。
 # 节点字段：name、command_template（必须以 /dev-spec-gen 开头）、session_prompt、fetch_prompt、
-#           next_steps、requires_worktree、requires_snapshot；名称限 [A-Za-z0-9][A-Za-z0-9._-]{0,63}。
+#           query（该流程的默认 JQL，可为伪 JQL）、next_steps、requires_worktree、requires_snapshot；
+#           名称限 [A-Za-z0-9][A-Za-z0-9._-]{0,63}。
 stages:
   - name: direct_dispatch
     command_template: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发)；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
     fetch_prompt: |
       使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。
-      查询条件（真实 Jira JQL，必须原样使用）：
+      查询条件（必须原样使用，严禁改写查询意图、增删条件或调整范围）：
       {{query}}
-      不要读取 Jira 详情、父需求、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。
+      该条件可能是伪 SQL 或伪 JQL：先原样交给 Jira 原生解析器，解析失败才判定为伪 JQL 并转换，转换结果再交同一个解析器校验，通过后才执行。
+      其中的父项字段条件（「父需求的 cf[...]」）无法进原生 JQL：禁止伪造该语法，改为按 parent key 只读取父任务对应的那一个字段再后置过滤，并与子任务结果合并。
+      交接字段必须写明 jql_semantics=native_jql_then_parent_post_filter、parent_lookup 与 post_filter。
+      除该父项字段外，不要读取 Jira 详情、父需求的其余内容、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。
+    query: |
+      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11001] IS NOT EMPTY and cf[11001] not in('无','暂无') or 父需求的cf[11001] IS NOT EMPTY and 父需求的cf[11001] not in('无','暂无'))
     next_steps:
       - "根据实际任务编号和标题提炼语义 slug"
-      - "创建或复用对应 worktree"
-      - "在该 worktree 启动开发会话"
+      - "把需求制品暂存到源仓库 .runtime/<task-id>/docs/engineering/"
+      - "由 launch 建工作区、迁移制品并启动 worker"
       - "仅将 Jira 地址和 direct 开发指令交给实际任务"
     requires_snapshot: false
   - name: complete_dispatch
@@ -140,18 +143,22 @@ stages:
     next_steps:
       - "执行独立 Jira 节点并归档完整需求与附件"
       - "执行独立 GitNexus 调研节点"
-      - "创建或复用 worktree"
+      - "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/"
       - "生成 version=1 decide 输入"
       - "通过 decide 后 launch"
   - name: proposal_dispatch
-    command_template: "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}"
+    command_template: |
+      /dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}
+      用户任务编号：{source_task_id}
+      当前用户名：{source_assignee}
+    query: |
+      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11103] IS NOT EMPTY and cf[11103] not in('无', '暂无') or 父需求的cf[11103] IS NOT EMPTY and 父需求的cf[11103] not in('无', '暂无')) AND (cf[11001] IS EMPTY or cf[11001] in('无', '暂无'))
     next_steps:
       - "独立 Jira 节点归档完整需求与附件"
       - "独立 GitNexus 调研节点执行只读调研"
       - "联合确定项目、租户与基础分支"
-      - "查找任一基础分支下同名 worktree"
-      - "不存在时调用 dev-spec-gen worktree CLI"
-      - "通过 Orca 绑定 worktree 分发开发方案"
+      - "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/"
+      - "由 launch 建工作区并启动开发方案 worker"
 flows:
   - name: direct
     stages: [direct_dispatch]
@@ -169,21 +176,13 @@ interaction:
   allow_other: true
 
 dispatch:
-  agent_commands:
-    windows_pwsh: 'pwsh.exe -NoLogo -NoProfile -NoExit -Command "& claude{agent_args}"'
-    windows_powershell: 'powershell.exe -NoLogo -NoProfile -NoExit -Command "& claude{agent_args}"'
-    macos: "/bin/zsh -ilc 'exec claude{agent_args}'"
-    linux: "/bin/bash -ilc 'exec claude{agent_args}'"
-  # 可选：兼容旧配置时使用 dispatch.agent；未配置 agent_commands 时生效。
-  # 跳过 Claude 工具权限弹窗，避免任务命令被权限确认阻塞。
-  agent_extra_args: "--dangerously-skip-permissions"
+  # 启动命令由 Orca 启动器决定，本配置不再提供 agent_commands / agent_extra_args。
   terminal:
     read_retry_attempts: 2
     read_retry_delay_ms: 500
-    # 就绪等待与命令发送超时后的重试次数（0 表示不重试）。
-    ready_retry_attempts: 3
-    send_retry_attempts: 1
-    ready_timeout_ms: 120000
+    # 创建终端后是否把它切到前台；默认关闭——首次创建同时「打开 workspace + 聚焦 tab」会句柄超时，
+    # 需要前台时改为创建成功后再 switch 这一步。
+    focus: false
   concurrency:
     max_agents: 3
 
