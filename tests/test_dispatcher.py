@@ -319,19 +319,23 @@ def make_snapshot_assignment(projects: Path) -> tuple[Path, Path, Path, dispatch
 
 
 class FakeOrca:
-    """按新流水线实现的最小 Orca 替身：建工作区、绑 Run、起受监督 worker。"""
+    """按新流水线实现的最小 Orca 替身：建工作区、开普通终端、单次投递。"""
 
     def __init__(
         self,
         repository_ids: dict[Path, str] | None = None,
         failure: str | None = None,
         worktree_create_failure: str | None = None,
-        worker_start_failure: str | None = None,
-        dispatch_state: str = "running",
-        dispatch_stage: str = "turn_started",
-        run_create_failure: str | None = None,
+        terminal_create_failure: str | None = None,
+        terminal_send_failure: str | None = None,
+        terminal_idle: bool = True,
+        send_accepted: bool = True,
+        send_stages: tuple[str, ...] = ("input_accepted", "turn_started"),
+        send_request_id: str | None = "req-1",
+        send_observation: str | None = "submitted",
+        send_payload: "dict[str, object] | None" = None,
         create_suffix: str = "",
-        before_worker_start: Callable[[str], None] | None = None,
+        before_terminal_send: Callable[[str], None] | None = None,
     ) -> None:
         self.operations: list[tuple[str, str]] = []
         self.repository_ids = {
@@ -343,18 +347,18 @@ class FakeOrca:
         }
         self.failure = failure
         self.worktree_create_failure = worktree_create_failure
-        self.worker_start_failure = worker_start_failure
-        self.dispatch_state = dispatch_state
-        self.dispatch_stage = dispatch_stage
-        self.run_create_failure = run_create_failure
+        self.terminal_create_failure = terminal_create_failure
+        self.terminal_send_failure = terminal_send_failure
+        self.terminal_idle = terminal_idle
+        self.send_accepted = send_accepted
+        self.send_stages = send_stages
+        self.send_request_id = send_request_id
+        self.send_observation = send_observation
+        self.send_payload = send_payload
         self.create_suffix = create_suffix
-        self.before_worker_start = before_worker_start
+        self.before_terminal_send = before_terminal_send
         self.worktrees_by_id: dict[str, dispatcher.OrcaWorktree] = {}
-        self.terminal_handles: dict[str, str] = {}
-        self.worker_entries: list[dict[str, object]] = []
-        self.dispatches: dict[str, str] = {}
-        self.next_dispatch = 1
-        self.runs: list[str] = []
+        self.terminals_by_handle: dict[str, dispatcher.OrcaTerminal] = {}
 
     def status(self) -> None:
         self.operations.append(("status", ""))
@@ -387,14 +391,18 @@ class FakeOrca:
 
     def terminals(self, worktree: dispatcher.OrcaWorktree) -> tuple[dispatcher.OrcaTerminal, ...]:
         self.operations.append(("terminal-list", worktree.worktree_id))
-        handle = self.terminal_handles.get(worktree.worktree_id)
-        if handle is None:
-            return ()
-        return (dispatcher.OrcaTerminal(handle, worktree.worktree_id, "claude", True, True),)
+        return tuple(
+            terminal for terminal in self.terminals_by_handle.values()
+            if terminal.worktree_id == worktree.worktree_id
+        )
 
-    def workers(self) -> tuple[dict[str, object], ...]:
-        self.operations.append(("worker-list", ""))
-        return tuple(self.worker_entries)
+    def add_agent_terminal(self, worktree_id: str) -> str:
+        """预置一个既有开发会话，供占用判定与清理保护使用。"""
+        handle = f"term-{len(self.terminals_by_handle) + 1}"
+        self.terminals_by_handle[handle] = dispatcher.OrcaTerminal(
+            handle, worktree_id, "claude", True, True,
+        )
+        return handle
 
     def worktree_remove(self, worktree: dispatcher.OrcaWorktree) -> None:
         self.operations.append(("worktree-remove", worktree.worktree_id))
@@ -404,7 +412,6 @@ class FakeOrca:
             check=True, capture_output=True, text=True, encoding="utf-8",
         )
         self.worktrees_by_id.pop(worktree.worktree_id, None)
-        self.terminal_handles.pop(worktree.worktree_id, None)
 
     def worktree_create(
         self,
@@ -412,7 +419,7 @@ class FakeOrca:
         repository_id: str,
         base_branch: str | None,
         comment: str,
-    ) -> dispatcher.WorktreeCreation:
+    ) -> dispatcher.OrcaWorktree:
         repo_path = self.repository_paths.get(repository_id)
         if repo_path is None:
             repo_path = next(
@@ -436,62 +443,57 @@ class FakeOrca:
             base_branch=base_branch,
             comment=comment,
         )
-        handle = f"term-{name}"
         self.worktrees_by_id[worktree.worktree_id] = worktree
-        self.terminal_handles[worktree.worktree_id] = handle
-        return dispatcher.WorktreeCreation(worktree, handle)
+        return worktree
 
-    def orchestration_run_create(self, objective: str) -> str:
-        self.operations.append(("run-create", objective))
-        if self.run_create_failure:
-            raise dispatcher.DispatcherError("orca_command_failed", self.run_create_failure)
-        run_id = f"run-{len(self.runs) + 1}"
-        self.runs.append(run_id)
-        return run_id
-
-    def orchestration_run_use(self, run_id: str) -> None:
-        self.operations.append(("run-use", run_id))
-
-    def orchestration_show(self, dispatch_id: str) -> "dict[str, object]":
-        self.operations.append(("worker-show", dispatch_id))
-        if self.failure == "worker-show":
-            raise dispatcher.DispatcherError("orca_command_failed", "worker-show 失败")
-        if dispatch_id in self.dispatches:
-            return {"id": dispatch_id, "status": self.dispatches[dispatch_id]}
-        raise dispatcher.DispatcherError("orca_command_failed", "未知 dispatch")
-
-    def worker_start(
+    def terminal_create(
         self,
-        worktree_id: str,
-        spec: str,
-        task_title: str,
-        terminal_handle: str | None = None,
-    ) -> "dict[str, object]":
-        self.operations.append(("worker-start", worktree_id))
-        self.operations.append(("worker-terminal", terminal_handle or "agent"))
-        self.operations.append(("worker-spec", spec))
-        if self.before_worker_start is not None:
-            self.before_worker_start(worktree_id)
-        if self.worker_start_failure:
-            raise dispatcher.DispatcherError("orca_command_failed", self.worker_start_failure)
-        dispatch_id = f"ctx-{self.next_dispatch}"
-        self.next_dispatch += 1
-        self.dispatches[dispatch_id] = self.dispatch_state
-        resolved_worktree_id = worktree_id.removeprefix("id:")
-        self.worker_entries.append({
-            "dispatchId": dispatch_id,
-            "workerState": self.dispatch_state,
-            "dispatchStatus": "completed" if self.dispatch_state == "succeeded" else self.dispatch_state,
-            "terminalState": "released" if self.dispatch_state == "succeeded" else "active",
-            "resource": {"worktreeId": resolved_worktree_id},
-        })
-        return {
-            "runId": self.runs[-1] if self.runs else "run-1",
-            "taskId": f"task-{dispatch_id}",
-            "dispatchId": dispatch_id,
-            "state": self.dispatch_state,
-            "stage": self.dispatch_stage,
+        worktree: dispatcher.OrcaWorktree,
+        title: str,
+        command: str,
+    ) -> str:
+        self.operations.append(("terminal-create", worktree.worktree_id))
+        self.operations.append(("terminal-title", title))
+        self.operations.append(("terminal-command", command))
+        if self.terminal_create_failure:
+            raise dispatcher.DispatcherError("orca_command_failed", self.terminal_create_failure)
+        handle = f"term-{len(self.terminals_by_handle) + 1}"
+        self.terminals_by_handle[handle] = dispatcher.OrcaTerminal(
+            handle, worktree.worktree_id, "claude", True, True,
+        )
+        return handle
+
+    def terminal_show(self, handle: str) -> dispatcher.OrcaTerminal:
+        self.operations.append(("terminal-show", handle))
+        terminal = self.terminals_by_handle.get(handle)
+        if terminal is None:
+            raise dispatcher.DispatcherError("orca_command_failed", "未知终端句柄")
+        return terminal
+
+    def terminal_wait(self, handle: str, timeout_ms: int) -> "dict[str, object]":
+        self.operations.append(("terminal-wait", handle))
+        if self.terminal_idle:
+            return {"satisfied": True, "status": "idle"}
+        return {"satisfied": False, "status": "timeout"}
+
+    def terminal_send(self, handle: str, text: str) -> "dict[str, object]":
+        self.operations.append(("terminal-send", handle))
+        self.operations.append(("terminal-spec", text))
+        if self.before_terminal_send is not None:
+            self.before_terminal_send(handle)
+        if self.terminal_send_failure:
+            raise dispatcher.DispatcherError("orca_command_failed", self.terminal_send_failure)
+        if self.send_payload is not None:
+            return self.send_payload
+        prompt: dict[str, object] = {
+            "requestId": self.send_request_id,
+            "stages": list(self.send_stages),
+            "provider": "claude",
         }
+        if self.send_observation is not None:
+            prompt["observation"] = self.send_observation
+        return {"send": {"accepted": self.send_accepted, "prompt": prompt}}
+
 
 class DispatcherTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1001,7 +1003,7 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("branch_priority", prompt)
         self.assertNotIn("created", prompt)
         self.assertIn("任务查询、Jira 归档、调研与路由在当前会话完成", session_prompt)
-        self.assertIn("工作区创建、制品迁移、worker 启动全部由 dispatcher launch 完成", session_prompt)
+        self.assertIn("工作区创建、制品迁移、开发会话启动全部由 dispatcher launch 完成", session_prompt)
         self.assertIn("暂存到 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/`", session_prompt)
         self.assertIn("GitNexus 调研报告必须先从 gitnexus_report_path", session_prompt)
         self.assertIn("本会话不调用 orca 命令，也不创建 Git worktree", session_prompt)
@@ -1270,7 +1272,7 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             worktree_path = repository_path.parent / dispatcher.worktree_name_for(item)
             completed = subprocess.run(
                 ("git", "-C", str(worktree_path), "branch", "--show-current"),
@@ -1912,8 +1914,8 @@ class DispatcherTests(unittest.TestCase):
             )
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
-            sends = [value for operation, value in fake_orca.operations if operation == "worker-spec"]
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
+            sends = [value for operation, value in fake_orca.operations if operation == "terminal-spec"]
             self.assertIn("/dev-spec-gen https://jira.example/XSWL-1 light；base_branch=origin/release", sends)
             self.assertEqual(
                 store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1", "legacy", "lightweight")]["worktree_path"],
@@ -2350,7 +2352,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(store.status("XSWL-1", dispatch_flow="complete"), "dispatched")
             self.assertEqual(store.snapshot()["tasks"][complete_key], complete_before)
 
-    def test_recover_marks_state_without_dispatch_id_for_manual_reset(self) -> None:
+    def test_recover_marks_state_without_terminal_handle_for_manual_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
@@ -2384,9 +2386,9 @@ class DispatcherTests(unittest.TestCase):
                 "status": "requires_manual_reset",
             }])
             self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
-            self.assertIn("dispatch_id_missing", store.history_file.read_text(encoding="utf-8"))
+            self.assertIn("terminal_handle_missing", store.history_file.read_text(encoding="utf-8"))
             self.assertEqual(
-                [operation for operation, _ in fake_orca.operations if operation in {"worker-start", "worker-spec"}],
+                [operation for operation, _ in fake_orca.operations if operation in {"terminal-send", "terminal-spec"}],
                 [],
             )
 
@@ -2645,11 +2647,13 @@ class DispatcherTests(unittest.TestCase):
                     "XSWL-1": dict(value),
                 },
             })
-            store.mark_recovered(canonical, "ctx-1", "running", "probe")
+            store.mark_recovered(canonical, "turn_started", "recovered", terminal_handle="term-1")
 
             state = store.snapshot()["tasks"]
             self.assertEqual(state[canonical]["status"], "dispatched")
             self.assertEqual(state["XSWL-1"]["status"], "dispatched")
+            self.assertEqual(state[canonical]["terminal_handle"], "term-1")
+            self.assertEqual(state["XSWL-1"]["terminal_handle"], "term-1")
             self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "dispatched")
 
     def test_state_view_keeps_multiple_flows(self) -> None:
@@ -2699,12 +2703,13 @@ class DispatcherTests(unittest.TestCase):
             expected_path = os.path.normcase(os.path.normpath(str(repository_path.resolve())))
             self.assertEqual([item[0] for item in fake_orca.operations], [
                 "status", "repo-list", "repo-show", "repo-add", "repo-show",
-                "run-create", "worker-list", "worktree-list", "worktree-create",
-                "worktree-list", "worktree-list", "worker-list", "terminal-list",
-                "worker-start", "worker-terminal", "worker-spec", "worktree-status",
+                "worktree-list", "worktree-create", "worktree-list", "worktree-list",
+                "terminal-list", "terminal-create", "terminal-title", "terminal-command",
+                "terminal-show", "terminal-wait", "terminal-send", "terminal-spec",
+                "worktree-status",
             ])
             self.assertIn(("repo-add", expected_path), fake_orca.operations)
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
 
     def test_launch_supports_selected_recursive_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2727,7 +2732,7 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertIn("worktree-create", [operation for operation, _ in fake_orca.operations])
 
     def test_base_branch_only_appears_in_dev_spec_command(self) -> None:
@@ -2751,7 +2756,7 @@ class DispatcherTests(unittest.TestCase):
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             create = next(value for operation, value in fake_orca.operations if operation == "worktree-create")
-            sends = [value for operation, value in fake_orca.operations if operation == "worker-spec"]
+            sends = [value for operation, value in fake_orca.operations if operation == "terminal-spec"]
             task_command = next(value for value in sends if value.startswith("/dev-spec-gen"))
             self.assertNotIn("origin/release", create)
             self.assertIn("base_branch=origin/release", task_command)
@@ -2777,7 +2782,7 @@ class DispatcherTests(unittest.TestCase):
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            sends = [value for operation, value in fake_orca.operations if operation == "worker-spec"]
+            sends = [value for operation, value in fake_orca.operations if operation == "terminal-spec"]
             task_command = next(value for value in sends if value.startswith("/dev-spec-gen"))
             self.assertIn("- 参考方案：“参考方案内容”", task_command)
 
@@ -2793,7 +2798,7 @@ class DispatcherTests(unittest.TestCase):
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            sends = [value for operation, value in fake_orca.operations if operation == "worker-spec"]
+            sends = [value for operation, value in fake_orca.operations if operation == "terminal-spec"]
             task_command = next(value for value in sends if value.startswith("/dev-spec-gen"))
             self.assertNotIn("参考方案", task_command)
 
@@ -2843,7 +2848,7 @@ class DispatcherTests(unittest.TestCase):
 
             dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            task_command = next(value for operation, value in fake_orca.operations if operation == "worker-spec" and value.startswith("/dev-spec-gen"))
+            task_command = next(value for operation, value in fake_orca.operations if operation == "terminal-spec" and value.startswith("/dev-spec-gen"))
             # 命令里的制品路径指向任务工作区（launch 已把暂存制品迁入）。
             worktree_docs = repository_path.parent / "XSWL-1" / "docs" / "engineering"
             self.assertNotIn("任务描述", task_command)
@@ -3026,7 +3031,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(from_cli["query"], "project = X")
             self.assertEqual(from_cli["jql_source"], "cli")
 
-    def test_agent_first_worker_starts_after_artifacts_are_ready(self) -> None:
+    def test_agent_session_starts_after_artifacts_are_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
@@ -3035,21 +3040,25 @@ class DispatcherTests(unittest.TestCase):
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
 
-            def assert_artifacts_ready(selector: str) -> None:
-                self.assertTrue(selector.startswith("id:"))
+            def assert_artifacts_ready(handle: str) -> None:
+                self.assertEqual(
+                    fake_orca.terminal_show(handle).worktree_id,
+                    next(iter(fake_orca.worktrees_by_id)),
+                )
                 worktree = next(iter(fake_orca.worktrees_by_id.values()))
                 docs = worktree.path / "docs" / "engineering"
                 self.assertTrue((docs / "specs" / item.requirement_snapshot_path.name).is_file())
                 self.assertTrue((docs / "attachments" / "XSWL-1" / "manifest.json").is_file())
                 self.assertTrue((docs / "attachments" / "XSWL-1" / "001-requirement.txt").is_file())
 
-            fake_orca = FakeOrca({repository_path: "repo-mapped"}, before_worker_start=assert_artifacts_ready)
+            fake_orca = FakeOrca({repository_path: "repo-mapped"}, before_terminal_send=assert_artifacts_ready)
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             create = next(value for operation, value in fake_orca.operations if operation == "worktree-create")
             self.assertIn(dispatcher.worktree_comment_for(item), create)
-            self.assertIn(("worker-terminal", f"term-{dispatcher.worktree_name_for(item)}"), fake_orca.operations)
+            self.assertIn(("terminal-command", "claude"), fake_orca.operations)
+            self.assertIn(("terminal-title", dispatcher.worktree_name_for(item)), fake_orca.operations)
 
     def test_matching_worktree_is_reused_without_second_create(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3065,16 +3074,16 @@ class DispatcherTests(unittest.TestCase):
                 dispatcher.worktree_comment_for(item),
             )
             dispatcher.rename_worktree_branch(
-                creation.worktree.path,
+                creation.path,
                 dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", repository_path)),
             )
             fake_orca.operations.clear()
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertNotIn("worktree-create", [operation for operation, _ in fake_orca.operations])
-            self.assertIn(("worker-terminal", creation.agent_terminal_handle), fake_orca.operations)
+            self.assertIn(("terminal-title", dispatcher.worktree_name_for(item)), fake_orca.operations)
 
     def test_reused_worktree_with_initial_branch_is_renamed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3094,10 +3103,10 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertNotIn("worktree-create", [operation for operation, _ in fake_orca.operations])
             self.assertEqual(
-                dispatcher.git_current_branch(creation.worktree.path),
+                dispatcher.git_current_branch(creation.path),
                 dispatcher.worktree_branch_for(item, repository),
             )
 
@@ -3118,8 +3127,8 @@ class DispatcherTests(unittest.TestCase):
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
-            self.assertIn(("worktree-remove", suffix.worktree.worktree_id), fake_orca.operations)
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
+            self.assertIn(("worktree-remove", suffix.worktree_id), fake_orca.operations)
             creates = [value for operation, value in fake_orca.operations if operation == "worktree-create"]
             self.assertEqual(len(creates), 1)
             self.assertIn(f"{dispatcher.worktree_name_for(item)}:", creates[0])
@@ -3137,16 +3146,16 @@ class DispatcherTests(unittest.TestCase):
                 f"{dispatcher.worktree_name_for(item)}-2", "repo-mapped", item.base_branch,
                 dispatcher.worktree_comment_for(item),
             )
-            (suffix.worktree.path / "uncommitted.txt").write_text("x", encoding="utf-8")
+            (suffix.path / "uncommitted.txt").write_text("x", encoding="utf-8")
             fake_orca.operations.clear()
 
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertNotIn("worktree-create", [operation for operation, _ in fake_orca.operations])
-            self.assertTrue(suffix.worktree.path.is_dir())
+            self.assertTrue(suffix.path.is_dir())
 
-    def test_automatic_suffix_return_never_dispatches_worker(self) -> None:
+    def test_automatic_suffix_return_never_dispatches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             projects = root / "projects"
@@ -3159,7 +3168,7 @@ class DispatcherTests(unittest.TestCase):
             result = dispatcher.launch(config, (item,), store, fake_orca, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
-            self.assertNotIn("worker-start", [operation for operation, _ in fake_orca.operations])
+            self.assertNotIn("terminal-send", [operation for operation, _ in fake_orca.operations])
             self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
 
     def test_duplicate_physical_worktree_name_is_rejected_before_orca_calls(self) -> None:
@@ -3193,7 +3202,7 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
-            self.assertNotIn("worker-start", [operation for operation, _ in fake_orca.operations])
+            self.assertNotIn("terminal-send", [operation for operation, _ in fake_orca.operations])
 
     def test_create_waits_for_delayed_registration_and_terminal_without_recreating(self) -> None:
         for failure in (None, "runtime_unavailable", "runtime_timeout", "orca_timeout"):
@@ -3204,10 +3213,10 @@ class DispatcherTests(unittest.TestCase):
                 config = write_config(root, root / "projects")
                 store = dispatcher.StateStore(config.state_file)
                 fake = FakeOrca({repository_path: "repo-mapped"})
-                create, listing, terminals = fake.worktree_create, fake.worktrees, fake.terminals
+                create, listing = fake.worktree_create, fake.worktrees
                 clock = [0.0]
 
-                def delayed_create(*args: object, **kwargs: object) -> dispatcher.WorktreeCreation:
+                def delayed_create(*args: object, **kwargs: object) -> dispatcher.OrcaWorktree:
                     receipt = create(*args, **kwargs)
                     clock[0] = 30.0
                     if failure:
@@ -3227,25 +3236,25 @@ class DispatcherTests(unittest.TestCase):
                         )
                     return listing(repo_id)
 
-                def assert_inputs_ready(selector: str) -> None:
+                def assert_inputs_ready(handle: str) -> None:
                     worktree = next(iter(fake.worktrees_by_id.values()))
-                    self.assertEqual(selector, worktree.selector)
-                    self.assertGreaterEqual(clock[0], 45)
+                    # 投递必须发生在制品迁入并校验之后，且必须等过只读查询的等待窗口。
+                    self.assertEqual(fake.terminal_show(handle).worktree_id, worktree.worktree_id)
+                    self.assertGreater(clock[0], 35)
                     docs = worktree.path / "docs" / "engineering"
                     settled = dataclasses.replace(item, requirement_snapshot_path=docs / "specs" / item.requirement_snapshot_path.name)
                     dispatcher.validate_requirement_snapshot_path(config, settled, docs)
 
-                fake.before_worker_start = assert_inputs_ready
+                fake.before_terminal_send = assert_inputs_ready
                 with mock.patch.object(fake, "worktree_create", side_effect=delayed_create) as created, \
                      mock.patch.object(fake, "worktrees", side_effect=delayed_listing), \
-                     mock.patch.object(fake, "terminals", side_effect=lambda worktree: () if clock[0] < 45 else terminals(worktree)), \
                      mock.patch.object(dispatcher.time, "monotonic", side_effect=lambda: clock[0]), \
                      mock.patch.object(dispatcher.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
                     result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
-                self.assertEqual(result["results"][0]["status"], "dispatched")
+                self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
                 created.assert_called_once()
-                self.assertEqual(sum(op == "worker-start" for op, _ in fake.operations), 1)
+                self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
                 self.assertEqual(len(fake.worktrees_by_id), 1)
                 if failure:
                     self.assertTrue(result["results"][0].get("warnings"))
@@ -3269,7 +3278,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertEqual(clock[0], 10)
             created.assert_called_once()
-            self.assertNotIn("worker-start", [op for op, _ in fake.operations])
+            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
             state = store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]
             self.assertEqual(state["recovery_history"][-1]["reason"], "worktree_creation_unconfirmed")
 
@@ -3308,7 +3317,7 @@ class DispatcherTests(unittest.TestCase):
             with mock.patch.object(fake, "terminals", side_effect=flaky_terminals):
                 result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "dispatched")
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertGreaterEqual(calls["count"], 2)
             self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
             self.assertEqual(len(fake.worktrees_by_id), 1)
@@ -3375,9 +3384,9 @@ class DispatcherTests(unittest.TestCase):
             state = store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]
             self.assertEqual(state["worktree_id"], next(iter(fake.worktrees_by_id)))
             self.assertIsNotNone(state["worktree_path"])
-            self.assertNotIn("worker-start", [op for op, _ in fake.operations])
+            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
 
-    def test_new_worktree_with_multiple_claude_terminals_is_not_dispatched(self) -> None:
+    def test_new_worktree_with_existing_agent_session_is_not_dispatched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "projects" / "repo-a"
@@ -3396,8 +3405,8 @@ class DispatcherTests(unittest.TestCase):
                 result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
-            self.assertIn("terminal", result["results"][0]["message"])
-            self.assertNotIn("worker-start", [op for op, _ in fake.operations])
+            self.assertIn("活动开发会话", result["results"][0]["message"])
+            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
 
     def test_reuse_rejects_base_branch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3412,7 +3421,7 @@ class DispatcherTests(unittest.TestCase):
                 dispatcher.worktree_comment_for(item),
             )
             dispatcher.rename_worktree_branch(
-                creation.worktree.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
+                creation.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
             )
             fake.operations.clear()
 
@@ -3420,6 +3429,52 @@ class DispatcherTests(unittest.TestCase):
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
             self.assertIn("基础分支", result["results"][0]["message"])
+            self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
+
+    def test_base_branch_matches_accepts_remote_tracking_ref(self) -> None:
+        # 实测：--base-branch origin/release_9ji 被 Orca 记成 refs/remotes/origin/release_9ji。
+        worktree = dispatcher.OrcaWorktree("repo::D:/probe", Path("D:/probe"))
+        for recorded in ("origin/release_9ji", "refs/remotes/origin/release_9ji"):
+            self.assertTrue(
+                dispatcher.base_branch_matches(
+                    dataclasses.replace(worktree, base_branch=recorded), "origin/release_9ji"
+                ),
+                recorded,
+            )
+        for recorded in ("release_9ji", "refs/heads/release_9ji"):
+            self.assertTrue(
+                dispatcher.base_branch_matches(
+                    dataclasses.replace(worktree, base_branch=recorded), "release_9ji"
+                ),
+                recorded,
+            )
+        remote_tracking = dataclasses.replace(
+            worktree, base_branch="refs/remotes/origin/release_9ji"
+        )
+        self.assertFalse(dispatcher.base_branch_matches(remote_tracking, "origin/release_saas"))
+        self.assertFalse(dispatcher.base_branch_matches(remote_tracking, "release_9ji"))
+        self.assertTrue(dispatcher.base_branch_matches(remote_tracking, None))
+
+    def test_reused_worktree_accepts_remote_tracking_base_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "projects" / "repo-a"
+            item = worktree_assignment(root / "projects", path, "XSWL-1", branch="origin/release")
+            config = write_config(root, root / "projects")
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({path: "repo-mapped"})
+            creation = fake.worktree_create(
+                dispatcher.worktree_name_for(item), "repo-mapped", "refs/remotes/origin/release",
+                dispatcher.worktree_comment_for(item),
+            )
+            dispatcher.rename_worktree_branch(
+                creation.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
+            )
+            fake.operations.clear()
+
+            result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
 
     def test_reuse_rejects_foreign_comment_and_guides_recovery(self) -> None:
@@ -3432,7 +3487,7 @@ class DispatcherTests(unittest.TestCase):
             fake = FakeOrca({path: "repo-mapped"})
             creation = fake.worktree_create(dispatcher.worktree_name_for(item), "repo-mapped", item.base_branch, "")
             dispatcher.rename_worktree_branch(
-                creation.worktree.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
+                creation.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
             )
             fake.operations.clear()
 
@@ -3442,7 +3497,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertIn("人工确认后删除或改名", result["results"][0]["message"])
             self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
 
-    def test_multiple_claude_terminals_block_takeover(self) -> None:
+    def test_existing_agent_session_blocks_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "projects" / "repo-a"
@@ -3455,9 +3510,9 @@ class DispatcherTests(unittest.TestCase):
                 dispatcher.worktree_comment_for(item),
             )
             dispatcher.rename_worktree_branch(
-                creation.worktree.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
+                creation.path, dispatcher.worktree_branch_for(item, dispatcher.Repository("mapped", path)),
             )
-            worktree_id = creation.worktree.worktree_id
+            worktree_id = creation.worktree_id
             duplicates = (
                 dispatcher.OrcaTerminal("term-a", worktree_id, "claude", True, True),
                 dispatcher.OrcaTerminal("term-b", worktree_id, "claude", True, True),
@@ -3468,24 +3523,37 @@ class DispatcherTests(unittest.TestCase):
                 result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
             self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
-            self.assertIn("terminal", result["results"][0]["message"])
-            self.assertNotIn("worker-start", [op for op, _ in fake.operations])
+            self.assertIn("活动开发会话", result["results"][0]["message"])
+            self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
+            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
 
-    def test_settled_worker_states_do_not_block_reuse(self) -> None:
-        worktree = dispatcher.OrcaWorktree("repo::D:/probe", Path("D:/probe"))
-        settled = (
-            {"workerState": "succeeded", "dispatchStatus": "completed", "resource": {"worktreeId": "repo::D:/probe"}},
-            {"workerState": "failed", "dispatchStatus": "failed", "resource": {"worktreeId": "repo::D:/probe"}},
-        )
-        running = (
-            {"workerState": "ready", "dispatchStatus": "dispatched", "resource": {"worktreeId": "repo::D:/probe"}},
-            {"workerState": None, "dispatchStatus": None, "resource": {"worktreeId": "repo::D:/probe"}},
-        )
-        self.assertFalse(dispatcher.has_active_worker(worktree, settled))
-        self.assertTrue(dispatcher.has_active_worker(worktree, running))
-        self.assertFalse(dispatcher.has_active_worker(worktree, [
-            {"workerState": "ready", "resource": {"worktreeId": "repo::D:/other"}},
-        ]))
+    def test_agent_session_occupancy_counts_only_live_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            worktree = dispatcher.OrcaWorktree("repo::D:/probe", Path("D:/probe"))
+            fake = FakeOrca()
+
+            self.assertFalse(dispatcher.has_live_agent_terminal(config, fake, worktree))
+            fake.add_agent_terminal(worktree.worktree_id)
+            self.assertTrue(dispatcher.has_live_agent_terminal(config, fake, worktree))
+
+            def shell_only(_worktree: object) -> tuple[dispatcher.OrcaTerminal, ...]:
+                return (dispatcher.OrcaTerminal("term-shell", worktree.worktree_id, None, True, True),)
+
+            self.assertFalse(dispatcher.has_live_agent_terminal(
+                config, SimpleNamespace(terminals=shell_only), worktree
+            ))
+
+            def unreadable(_worktree: object) -> tuple[dispatcher.OrcaTerminal, ...]:
+                raise dispatcher.DispatcherError("orca_command_failed", "读取失败")
+
+            # 只读探测失败时按占用处理：宁可停手，也不并发投递到同一个工作区。
+            self.assertTrue(dispatcher.has_live_agent_terminal(
+                config, SimpleNamespace(terminals=unreadable), worktree
+            ))
 
     def test_orca_error_retains_structured_transport_code(self) -> None:
         response = SimpleNamespace(returncode=1, stderr="", stdout=json.dumps({
@@ -3555,6 +3623,251 @@ class DispatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(dispatcher.DispatcherError, "不能强制解锁"):
                 with store.launch_lock(force_unlock=True):
                     pass
+
+    def launch_single_task(self, **orca_options: object) -> SimpleNamespace:
+        """单任务启动的公共脚手架：临时仓库、暂存快照、状态与 Orca 替身。"""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        projects = root / "projects"
+        repository_path = projects / "repo-a"
+        item = worktree_assignment(projects, repository_path, "XSWL-1")
+        config = write_config(root, projects)
+        store = dispatcher.StateStore(config.state_file)
+        fake = FakeOrca({repository_path: "repo-mapped"}, **orca_options)
+        result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
+        return SimpleNamespace(
+            result=result, fake=fake, item=item, config=config, store=store,
+            payload=result["results"][0], status=store.status("XSWL-1"),
+        )
+
+    def test_worktree_create_never_requests_an_agent(self) -> None:
+        payload = {"worktree": {
+            "id": "repo-1::D:/probe", "path": "D:/probe", "repoId": "repo-1",
+            "baseRef": "origin/release",
+        }}
+        with mock.patch.object(dispatcher.OrcaClient, "_call", return_value=payload) as call:
+            created = dispatcher.OrcaClient("orca").worktree_create(
+                "XSWL-1", "repo-1", "origin/release", "orca-task-dispatcher:XSWL-1",
+            )
+
+        arguments = call.call_args.args
+        self.assertNotIn("--agent", arguments)
+        self.assertNotIn("--prompt", arguments)
+        self.assertIn("--comment", arguments)
+        self.assertIn("--no-parent", arguments)
+        self.assertEqual(created.worktree_id, "repo-1::D:/probe")
+
+    def test_dispatch_pipeline_never_touches_orchestration(self) -> None:
+        launched = self.launch_single_task()
+
+        self.assertEqual(launched.status, "dispatched")
+        orchestration = [
+            operation for operation, _ in launched.fake.operations
+            if "orchestration" in operation or operation.startswith(("worker-", "run-"))
+        ]
+        self.assertEqual(orchestration, [])
+        self.assertFalse((launched.store.runtime_dir / "orchestration.json").exists())
+
+    def test_turn_started_confirms_dispatch_without_warning(self) -> None:
+        launched = self.launch_single_task()
+
+        self.assertEqual(launched.status, "dispatched")
+        self.assertEqual(launched.payload["dispatch_state"], "turn_started")
+        self.assertEqual(launched.payload["send_request_id"], "req-1")
+        self.assertNotIn("warnings", launched.payload)
+        state = launched.store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]
+        self.assertEqual(state["send_stages"], ["input_accepted", "turn_started"])
+        self.assertTrue(state["send_accepted"])
+
+    def test_input_accepted_dispatches_once_with_warning(self) -> None:
+        launched = self.launch_single_task(send_stages=("input_accepted",))
+
+        self.assertEqual(launched.status, "dispatched")
+        self.assertEqual(launched.payload["dispatch_state"], "input_accepted")
+        self.assertEqual(launched.payload["warnings"], [dispatcher.TURN_START_UNOBSERVED])
+        # 观察期静默不是重发理由：只投递一次。
+        self.assertEqual(sum(op == "terminal-send" for op, _ in launched.fake.operations), 1)
+
+    def test_refused_send_marks_manual_reset_without_resend(self) -> None:
+        launched = self.launch_single_task(send_accepted=False, send_stages=("input_accepted",))
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("未接受", launched.payload["message"])
+        self.assertEqual(launched.payload["send_request_id"], "req-1")
+        self.assertEqual(sum(op == "terminal-send" for op, _ in launched.fake.operations), 1)
+
+    def test_unobservable_host_marks_manual_reset_without_resend(self) -> None:
+        launched = self.launch_single_task(
+            send_stages=("input_accepted",),
+            send_request_id="unsupported-old-host",
+            send_observation="unsupported",
+        )
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("不支持投递观察", launched.payload["message"])
+        self.assertEqual(sum(op == "terminal-send" for op, _ in launched.fake.operations), 1)
+
+    def test_unparsable_send_receipt_marks_manual_reset(self) -> None:
+        launched = self.launch_single_task(send_payload={"ok": True})
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("send", launched.payload["message"])
+        self.assertEqual(sum(op == "terminal-send" for op, _ in launched.fake.operations), 1)
+
+    def test_terminal_not_idle_never_receives_text(self) -> None:
+        launched = self.launch_single_task(terminal_idle=False)
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("未在预算内进入空闲状态", launched.payload["message"])
+        self.assertEqual([op for op, _ in launched.fake.operations if op == "terminal-send"], [])
+        state = launched.store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]
+        self.assertEqual(state["terminal_handle"], launched.payload["terminal_handle"])
+
+    def test_sync_failure_stops_before_terminal_creation(self) -> None:
+        with mock.patch.object(
+            dispatcher, "sync_worktree_files",
+            side_effect=dispatcher.DispatcherError("worktree_sync_failed", "同步失败"),
+        ):
+            launched = self.launch_single_task()
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("同步失败", launched.payload["message"])
+        self.assertNotIn("terminal-create", [op for op, _ in launched.fake.operations])
+        self.assertNotIn("terminal-send", [op for op, _ in launched.fake.operations])
+
+    def test_terminal_create_failure_marks_manual_reset_keeping_worktree(self) -> None:
+        launched = self.launch_single_task(terminal_create_failure="句柄超时")
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertIn("句柄超时", launched.payload["message"])
+        self.assertNotIn("terminal-send", [op for op, _ in launched.fake.operations])
+        self.assertEqual(len(launched.fake.worktrees_by_id), 1)
+
+    def test_state_write_after_send_marks_manual_reset_without_resend(self) -> None:
+        with mock.patch.object(
+            dispatcher.StateStore, "mark_dispatched",
+            side_effect=dispatcher.DispatcherError("state_unreadable", "状态写入失败"),
+        ):
+            launched = self.launch_single_task()
+
+        self.assertEqual(launched.status, "requires_manual_reset")
+        self.assertEqual(launched.payload["send_request_id"], "req-1")
+        self.assertTrue(launched.payload["terminal_handle"])
+        self.assertEqual(sum(op == "terminal-send" for op, _ in launched.fake.operations), 1)
+        self.assertEqual(launched.store.status("XSWL-1"), "requires_manual_reset")
+
+    def test_suffix_worktree_with_agent_session_is_not_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            item = worktree_assignment(projects, repository_path, "XSWL-1")
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            suffix = fake.worktree_create(
+                f"{dispatcher.worktree_name_for(item)}-2", "repo-mapped", item.base_branch,
+                dispatcher.worktree_comment_for(item),
+            )
+            fake.add_agent_terminal(suffix.worktree_id)
+            fake.operations.clear()
+
+            result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
+            self.assertIn("开发会话", result["results"][0]["message"])
+            self.assertNotIn("worktree-remove", [op for op, _ in fake.operations])
+            self.assertTrue(suffix.path.is_dir())
+
+    def recover_record(self, store: dispatcher.StateStore, **fields: object) -> None:
+        """写入一条可直接 recover 的分发记录。"""
+        value = {
+            "task_id": "XSWL-1",
+            "repository": "mapped",
+            "task_url": "https://jira.example/XSWL-1",
+            "title": "XSWL-1",
+            "dispatch_flow": "complete",
+            "status": "dispatched",
+            "terminal_handle": "term-1",
+            "worktree_id": "repo-mapped::D:/probe",
+            "send_accepted": True,
+            "send_stages": ["input_accepted", "turn_started"],
+            **fields,
+        }
+        dispatcher.atomic_write_json(store.state_file, {
+            "version": 1,
+            "tasks": {dispatcher.state_key_for("XSWL-1"): value},
+        })
+
+    def recover_store(self) -> tuple[dispatcher.Config, dispatcher.StateStore]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        projects = root / "projects"
+        (projects / "repo-a" / ".git").mkdir(parents=True)
+        return write_config(root, projects), dispatcher.StateStore(root / ".runtime" / "state.json")
+
+    def test_recover_confirms_only_accepted_send_evidence(self) -> None:
+        config, store = self.recover_store()
+        self.recover_record(store)
+        fake = FakeOrca()
+        fake.terminals_by_handle["term-1"] = dispatcher.OrcaTerminal(
+            "term-1", "repo-mapped::D:/probe", "claude", True, True,
+        )
+
+        result = dispatcher.recover(config, store, fake, task_id="XSWL-1", force_unlock=False)
+
+        self.assertEqual([item["status"] for item in result["results"]], ["recovered"])
+        self.assertEqual(store.status("XSWL-1"), "dispatched")
+        state = store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1")]
+        self.assertEqual(state["terminal_handle"], "term-1")
+        self.assertEqual(len(state["recovery_history"]), 1)
+
+    def test_recover_without_send_evidence_requires_manual_reset(self) -> None:
+        config, store = self.recover_store()
+        self.recover_record(store, status="launching", send_accepted=None, send_stages=[])
+        fake = FakeOrca()
+        fake.terminals_by_handle["term-1"] = dispatcher.OrcaTerminal(
+            "term-1", "repo-mapped::D:/probe", "claude", True, True,
+        )
+
+        result = dispatcher.recover(config, store, fake, task_id="XSWL-1", force_unlock=False)
+
+        self.assertEqual([item["status"] for item in result["results"]], ["requires_manual_reset"])
+        self.assertEqual(store.status("XSWL-1"), "requires_manual_reset")
+        self.assertIn("dispatch_not_confirmed", store.history_file.read_text(encoding="utf-8"))
+
+    def test_recover_rejects_terminal_from_other_worktree(self) -> None:
+        config, store = self.recover_store()
+        self.recover_record(store, worktree_id="repo-mapped::D:/other")
+        fake = FakeOrca()
+        fake.terminals_by_handle["term-1"] = dispatcher.OrcaTerminal(
+            "term-1", "repo-mapped::D:/probe", "claude", True, True,
+        )
+
+        result = dispatcher.recover(config, store, fake, task_id="XSWL-1", force_unlock=False)
+
+        self.assertEqual([item["status"] for item in result["results"]], ["requires_manual_reset"])
+        self.assertIn("terminal_worktree_mismatch", store.history_file.read_text(encoding="utf-8"))
+
+    def test_recover_leaves_legacy_orchestration_records_untouched(self) -> None:
+        config, store = self.recover_store()
+        self.recover_record(store, terminal_handle=None, dispatch_id="ctx-1", orchestration_run_id="run-1")
+        store.runtime_dir.mkdir(parents=True, exist_ok=True)
+        run_file = store.runtime_dir / "orchestration.json"
+        run_file.write_text('{"runId": "run-1"}\n', encoding="utf-8")
+        fake = FakeOrca()
+
+        result = dispatcher.recover(config, store, fake, task_id="XSWL-1", force_unlock=False)
+
+        self.assertEqual([item["status"] for item in result["results"]], ["requires_manual_reset"])
+        self.assertIn("terminal_handle_missing", store.history_file.read_text(encoding="utf-8"))
+        self.assertEqual(run_file.read_text(encoding="utf-8"), '{"runId": "run-1"}\n')
+        self.assertEqual(
+            [op for op, _ in fake.operations if "orchestration" in op or op.startswith(("worker-", "run-"))],
+            [],
+        )
 
     def test_invalid_arguments_emit_single_json(self) -> None:
         stdout = io.StringIO()

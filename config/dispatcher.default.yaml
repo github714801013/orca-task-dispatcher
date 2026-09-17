@@ -96,15 +96,15 @@ task_source:
     需求归档与调研报告一律先暂存到源仓库的 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/` 下，布局与任务工作区内的 `docs/engineering` 完全同构：
     快照写 `specs/<日期>-<业务板块>-raw-requirements.md`，附件写 `attachments/<实际-task-id>/`（含清单文件），调研报告写 `research/<实际-task-id>-gitnexus.md`。
     写入 launch 输入的 requirement_snapshot_path 与 gitnexus_report_path 必须是上述暂存路径的绝对路径；缺快照、附件清单未标记 complete、或附件大小与 SHA-256 不一致时，`dispatcher.py decide` 对该任务返回 needs_confirmation。
-    `dispatcher.py launch` 按任务依次执行：确保源仓库在 Orca 注册 → `orca worktree create` 建工作区 → `git branch -m <用户名>/<工作区名>` → 复用 dev-spec-gen 的 worktree sync 同步未托管内容与 IDE 配置 → 把暂存制品迁入工作区 → `orca orchestration worker-start` 启动受监督 worker。
+    `dispatcher.py launch` 按任务依次执行：确保源仓库在 Orca 注册 → `orca worktree create` 建工作区 → `git branch -m <用户名>/<工作区名>` → 复用 dev-spec-gen 的 worktree sync 同步未托管内容与 IDE 配置 → 把暂存制品迁入工作区并校验 → `orca terminal create --command claude` 开启开发会话 → `orca terminal wait --for tui-idle` → `orca terminal send --enter --wait-submit` 投递一次任务文本。
     会话不得自行创建目录、迁移制品、创建终端或发送任务文本；这些都由 launch 完成。
   session_prompt:
     complete: |
-      # 任务查询、Jira 归档、调研与路由在当前会话完成；工作区创建、制品迁移、worker 启动全部由 dispatcher launch 完成。
+      # 任务查询、Jira 归档、调研与路由在当前会话完成；工作区创建、制品迁移、开发会话启动全部由 dispatcher launch 完成。
       dev-spec-gen 是全局安装的技能。禁止 Agent 检索、扫描或读取 skill 目录中的其他文件；仅允许读取固定的全局 `dev-spec-gen/SKILL.md`，并以该文件为准执行技能要求。
       不得使用 rg、目录扫描或其他方式查找 skill 文件；读取固定 SKILL.md 后，只能通过 dev-spec-gen 提供的 CLI 入口获取其他信息。
       先运行公开 CLI 的 `--help`，再严格按成功 JSON stdout 中的 `next`、公开路径和交接字段继续；不得猜测参数、读取其他内部文件或执行未由 CLI 返回的命令。
-      工具边界：本会话不调用 orca 命令，也不创建 Git worktree；工作区、分支与 worker 全部由 `dispatcher.py launch` 通过 Orca 完成。
+      工具边界：本会话不调用 orca 命令，也不创建 Git worktree；工作区、分支与开发会话全部由 `dispatcher.py launch` 通过 Orca 完成。
       路由确认（项目、租户、基础分支）后，只需把需求快照、附件与调研报告暂存到 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/` 下，再把暂存路径交给 decide 与 launch。
       不得创建、迁移或预检任务工作区，不得向用户询问 worktree 路径；工作区位置由 Orca 决定。
       只有技能缺失、归档不完整、路由无法唯一确定或 decide 返回 needs_confirmation 时才暂停该任务。
@@ -135,7 +135,7 @@ stages:
     next_steps:
       - "根据实际任务编号和标题提炼语义 slug"
       - "把需求制品暂存到源仓库 .runtime/<task-id>/docs/engineering/"
-      - "由 launch 建工作区、迁移制品并启动 worker"
+      - "由 launch 建工作区、迁移制品并开启开发会话"
       - "仅将 Jira 地址和 direct 开发指令交给实际任务"
     requires_snapshot: false
   - name: complete_dispatch
@@ -158,7 +158,7 @@ stages:
       - "独立 GitNexus 调研节点执行只读调研"
       - "联合确定项目、租户与基础分支"
       - "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/"
-      - "由 launch 建工作区并启动开发方案 worker"
+      - "由 launch 建工作区并开启开发方案会话"
 flows:
   - name: direct
     stages: [direct_dispatch]
@@ -176,13 +176,13 @@ interaction:
   allow_other: true
 
 dispatch:
-  # 启动命令由 Orca 启动器决定，本配置不再提供 agent_commands / agent_extra_args。
+  # 启动命令固定为 claude，由 launch 通过 orca terminal create --command claude 显式给出；
+  # 本配置不提供 agent_commands / agent_extra_args。
   terminal:
     read_retry_attempts: 2
     read_retry_delay_ms: 500
-    # 创建终端后是否把它切到前台；默认关闭——首次创建同时「打开 workspace + 聚焦 tab」会句柄超时，
-    # 需要前台时改为创建成功后再 switch 这一步。
-    focus: false
+    # 不配置创建后聚焦：首次创建同时「打开 workspace + 聚焦 tab」会句柄超时，
+    # 需要前台时由人工或后续 orca terminal switch 完成。
   concurrency:
     max_agents: 3
 

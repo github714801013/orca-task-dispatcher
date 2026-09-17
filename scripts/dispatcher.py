@@ -247,12 +247,6 @@ class OrcaTerminal:
 
 
 @dataclass(frozen=True)
-class WorktreeCreation:
-    worktree: OrcaWorktree
-    agent_terminal_handle: str | None
-
-
-@dataclass(frozen=True)
 class Assignment:
     task: Task
     repository: str
@@ -374,21 +368,32 @@ class Assignment:
 
 
 @dataclass(frozen=True)
-class WorkerRecord:
+class SendReceipt:
+    """终端投递回执：接受输入与观察到起步是两件事。"""
+
+    accepted: bool
+    request_id: str | None
+    stages: tuple[str, ...]
+    observation: str | None
+    process_incarnation: str | None = None
+
+    @property
+    def turn_started(self) -> bool:
+        return "turn_started" in self.stages
+
+
+@dataclass(frozen=True)
+class DispatchRecord:
     assignment: Assignment
     worktree: OrcaWorktree
-    dispatch_id: str
-    task_id: str
-    run_id: str
-    state: str
-    stage: str
+    terminal_handle: str
+    receipt: SendReceipt
     warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class PreparedWorktree:
     worktree: OrcaWorktree
-    terminal_handle: str | None
     warnings: tuple[str, ...]
 
 
@@ -1281,26 +1286,6 @@ class StateStore:
     def lock_file(self) -> Path:
         return self.runtime_dir / "launch.lock"
 
-    def orchestration_file(self) -> Path:
-        return self.runtime_dir / "orchestration.json"
-
-    def orchestration_run_id(self) -> str | None:
-        """已绑定的编排 Run；worker-start 必须先绑定到 Run。"""
-        path = self.orchestration_file()
-        if not path.is_file():
-            return None
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        run_id = value.get("run_id") if isinstance(value, Mapping) else None
-        return run_id if isinstance(run_id, str) and run_id else None
-
-    def set_orchestration_run_id(self, run_id: str) -> None:
-        path = self.orchestration_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, {"run_id": run_id})
-
     def snapshot(self) -> dict[str, object]:
         state = read_json_object(self.state_file, {"version": 1, "tasks": {}})
         if state.get("version") != 1 or not isinstance(state.get("tasks"), dict):
@@ -1502,12 +1487,8 @@ class StateStore:
         }
         atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
 
-    def mark_worktree_prepared(
-        self,
-        assignment: Assignment,
-        worktree: OrcaWorktree,
-        terminal_handle: str | None,
-    ) -> None:
+    def _update_launching(self, assignment: Assignment, **fields: object) -> None:
+        """启动中记录的局部更新；不在 launching 状态时不写，避免覆盖已分发结果。"""
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
@@ -1517,18 +1498,31 @@ class StateStore:
             raise DispatcherError("state_unreadable", "任务启动状态缺失或不处于 launching")
         next_tasks = {
             **tasks,
-            state_key: {
-                **existing,
-                "worktree_path": worktree.path.as_posix(),
-                "worktree_id": worktree.worktree_id,
-                "worktree_comment": worktree.comment,
-                "startup_terminal_handle": terminal_handle,
-                "updated_at": utc_now(),
-            },
+            state_key: {**existing, **fields, "updated_at": utc_now()},
         }
         atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
 
-    def mark_dispatched(self, record: WorkerRecord) -> None:
+    def mark_worktree_prepared(self, assignment: Assignment, worktree: OrcaWorktree) -> None:
+        self._update_launching(
+            assignment,
+            worktree_path=worktree.path.as_posix(),
+            worktree_id=worktree.worktree_id,
+            worktree_comment=worktree.comment,
+            dispatch_state="worktree_ready",
+        )
+
+    def mark_terminal_created(self, assignment: Assignment, terminal_handle: str) -> None:
+        self._update_launching(
+            assignment,
+            terminal_handle=terminal_handle,
+            dispatch_state="terminal_ready",
+        )
+
+    def mark_send_started(self, assignment: Assignment) -> None:
+        """发送前落盘：进程若在投递后中断，仍能区分「未发送」与「发送结果未知」。"""
+        self._update_launching(assignment, dispatch_state="sending", send_started_at=utc_now())
+
+    def mark_dispatched(self, record: DispatchRecord) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
@@ -1552,11 +1546,13 @@ class StateStore:
                 "status": "dispatched",
                 "worktree_path": record.worktree.path.as_posix(),
                 "worktree_id": record.worktree.worktree_id,
-                "dispatch_id": record.dispatch_id,
-                "orchestration_task_id": record.task_id,
-                "orchestration_run_id": record.run_id,
-                "dispatch_state": record.state,
-                "dispatch_stage": record.stage,
+                "terminal_handle": record.terminal_handle,
+                "send_request_id": record.receipt.request_id,
+                "send_accepted": record.receipt.accepted,
+                "send_stages": list(record.receipt.stages),
+                "send_observation": record.receipt.observation,
+                "send_process_incarnation": record.receipt.process_incarnation,
+                "dispatch_state": "turn_started" if record.receipt.turn_started else "input_accepted",
                 "gitnexus_report_path": assignment.gitnexus_report_path.as_posix() if assignment.gitnexus_report_path else None,
                 "requirement_snapshot_path": assignment.requirement_snapshot_path.as_posix() if assignment.requirement_snapshot_path else None,
                 "dispatched_at": utc_now(),
@@ -1566,7 +1562,7 @@ class StateStore:
         }
         atomic_write_json(self.state_file, {"version": 1, "tasks": next_tasks})
 
-    def mark_recovered(self, state_key: str, dispatch_id: str, dispatch_state: str, result: str) -> None:
+    def mark_recovered(self, state_key: str, dispatch_state: str, result: str, **fields: object) -> None:
         state = self.snapshot()
         tasks = state["tasks"]
         assert isinstance(tasks, dict)
@@ -1584,16 +1580,16 @@ class StateStore:
             raise DispatcherError("state_unreadable", "待恢复任务状态缺失")
         previous_history = entry.value.get("recovery_history")
         history = list(previous_history) if isinstance(previous_history, list) else []
-        event = {"at": utc_now(), "result": result, "dispatch_id": dispatch_id}
+        event = {"at": utc_now(), "result": result, "dispatch_state": dispatch_state, **fields}
         updated = {
             candidate.state_key: {
                 **candidate.value,
+                **fields,
                 "task_id": entry.task_id,
                 "tenant_slug": entry.tenant_slug,
                 "assignment_id": entry.assignment_id,
                 "dispatch_flow": entry.dispatch_flow,
                 "status": "dispatched",
-                "dispatch_id": dispatch_id,
                 "dispatch_state": dispatch_state,
                 "updated_at": event["at"],
                 "recovery_history": [*history, event],
@@ -1883,24 +1879,68 @@ class OrcaClient:
         for value in values:
             if not isinstance(value, Mapping):
                 raise DispatcherError("orca_invalid_json", "Orca terminal 项格式不合法")
-            agent_identity = value.get("agentIdentity")
-            terminals.append(OrcaTerminal(
-                handle=require_text(value.get("handle"), "Orca terminal.handle"),
-                worktree_id=require_text(value.get("worktreeId"), "Orca terminal.worktreeId"),
-                agent_identity=agent_identity.strip() if isinstance(agent_identity, str) and agent_identity.strip() else None,
-                connected=value.get("connected") is True,
-                writable=value.get("writable") is True,
-            ))
+            terminals.append(self._terminal_from_payload(value))
         return tuple(terminals)
 
-    def workers(self) -> tuple[Mapping[str, Any], ...]:
-        result = self._call("orchestration", "worker-list")
-        values = result.get("workers")
-        if not isinstance(values, list):
-            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 workers 列表")
-        if not all(isinstance(value, Mapping) for value in values):
-            raise DispatcherError("orca_invalid_json", "Orca worker 项格式不合法")
-        return tuple(value for value in values if isinstance(value, Mapping))
+    @staticmethod
+    def _terminal_from_payload(value: Mapping[str, Any]) -> OrcaTerminal:
+        agent_identity = value.get("agentIdentity")
+        return OrcaTerminal(
+            handle=require_text(value.get("handle"), "Orca terminal.handle"),
+            worktree_id=require_text(value.get("worktreeId"), "Orca terminal.worktreeId"),
+            agent_identity=(
+                agent_identity.strip()
+                if isinstance(agent_identity, str) and agent_identity.strip()
+                else None
+            ),
+            connected=value.get("connected") is True,
+            writable=value.get("writable") is True,
+        )
+
+    def terminal_show(self, handle: str) -> OrcaTerminal:
+        result = self._call("terminal", "show", "--terminal", handle)
+        terminal = result.get("terminal")
+        if not isinstance(terminal, Mapping):
+            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 terminal 对象")
+        return self._terminal_from_payload(terminal)
+
+    @staticmethod
+    def _terminal_handle(result: Mapping[str, Any]) -> str:
+        """兼容不同版本的创建回执结构，取其中的 terminal handle。"""
+        candidates = (result, result.get("terminal"), result.get("createdTerminal"), result.get("split"))
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                handle = candidate.get("handle")
+                if isinstance(handle, str) and handle.strip():
+                    return handle.strip()
+        raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 terminal handle")
+
+    def terminal_create(self, worktree: OrcaWorktree, title: str, command: str) -> str:
+        result = self._call(
+            "terminal", "create",
+            "--worktree", worktree.selector,
+            "--title", title,
+            "--command", command,
+        )
+        return self._terminal_handle(result)
+
+    def terminal_wait(self, handle: str, timeout_ms: int) -> Mapping[str, Any]:
+        result = self._call(
+            "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+            "--timeout-ms", str(timeout_ms),
+            timeout_seconds=max(ORCA_COMMAND_TIMEOUT_SECONDS, timeout_ms / 1000 + 15),
+        )
+        wait = result.get("wait")
+        return wait if isinstance(wait, Mapping) else {}
+
+    def terminal_send(self, handle: str, text: str) -> Mapping[str, Any]:
+        """普通投递；--wait-submit 只观察已接受的输入，不会因此重发。"""
+        return self._call(
+            "terminal", "send", "--terminal", handle,
+            "--text", text, "--enter",
+            "--wait-submit", str(SEND_OBSERVE_SECONDS),
+            timeout_seconds=ORCA_SEND_TIMEOUT_SECONDS,
+        )
 
     def worktree_remove(self, worktree: OrcaWorktree) -> None:
         self._call("worktree", "rm", "--worktree", worktree.selector)
@@ -1916,11 +1956,11 @@ class OrcaClient:
         repository_id: str,
         base_branch: str | None,
         comment: str,
-    ) -> WorktreeCreation:
-        """以 agent-first 方式建 Orca 工作区，避开 bare create 的 fallback shell。"""
+    ) -> OrcaWorktree:
+        """只创建工作区；开发会话由后续的 terminal create 显式启动。"""
         arguments = [
             "worktree", "create", "--name", name, "--repo", f"id:{repository_id}", "--no-parent",
-            "--agent", WORKER_AGENT, "--comment", comment,
+            "--comment", comment,
         ]
         if base_branch:
             arguments.extend(["--base-branch", base_branch])
@@ -1928,49 +1968,25 @@ class OrcaClient:
         worktree = result.get("worktree")
         if not isinstance(worktree, Mapping):
             raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 worktree 对象")
-        handle = result.get("agentTerminalHandle")
-        if not isinstance(handle, str) or not handle.strip():
-            startup_terminal = result.get("startupTerminal")
-            handle = startup_terminal.get("handle") if isinstance(startup_terminal, Mapping) else None
-        return WorktreeCreation(
-            worktree=self._worktree_from_payload(worktree),
-            agent_terminal_handle=handle.strip() if isinstance(handle, str) and handle.strip() else None,
-        )
+        return self._worktree_from_payload(worktree)
 
-    def orchestration_run_create(self, objective: str) -> str:
-        result = self._call("orchestration", "run-create", "--objective", objective)
-        run = result.get("run")
-        if not isinstance(run, Mapping):
-            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 run 对象")
-        return require_text(run.get("id"), "Orca run.id")
-
-    def orchestration_run_use(self, run_id: str) -> None:
-        self._call("orchestration", "run-use", "--id", run_id)
-
-    def orchestration_show(self, dispatch_id: str) -> Mapping[str, Any]:
-        result = self._call("orchestration", "worker-show", "--dispatch", dispatch_id)
-        dispatch = result.get("dispatch")
-        if not isinstance(dispatch, Mapping):
-            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 dispatch 对象")
-        return dispatch
-
-    def worker_start(
-        self,
-        worktree_selector: str,
-        spec: str,
-        task_title: str,
-        terminal_handle: str | None = None,
-    ) -> Mapping[str, Any]:
-        """受监督 worker：优先接管已验证的 agent terminal，否则由 Orca 在既有工作区新建 agent。"""
-        arguments = [
-            "orchestration", "worker-start", "--worktree", worktree_selector,
-            "--spec", spec, "--task-title", task_title,
-        ]
-        if terminal_handle:
-            arguments.extend(["--terminal", terminal_handle])
-        else:
-            arguments.extend(["--agent", WORKER_AGENT])
-        return self._call(*arguments, timeout_seconds=ORCA_WORKER_TIMEOUT_SECONDS)
+def parse_send_receipt(result: Mapping[str, Any]) -> SendReceipt:
+    """只读回执本身判定接受与起步，不把顶层 ok 当作接受证明。"""
+    send = result.get("send")
+    if not isinstance(send, Mapping):
+        raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 send 对象")
+    prompt = send.get("prompt")
+    prompt = prompt if isinstance(prompt, Mapping) else {}
+    stages = prompt.get("stages")
+    return SendReceipt(
+        accepted=send.get("accepted") is True,
+        request_id=require_optional_text(prompt.get("requestId"), "Orca send.prompt.requestId"),
+        stages=tuple(str(stage) for stage in stages) if isinstance(stages, list) else (),
+        observation=require_optional_text(prompt.get("observation"), "Orca send.prompt.observation"),
+        process_incarnation=require_optional_text(
+            prompt.get("processIncarnation"), "Orca send.prompt.processIncarnation"
+        ),
+    )
 
 
 def validate_command_template(template: str) -> None:
@@ -2125,11 +2141,13 @@ def set_worktree_in_progress_safely(
 ORCA_WORKTREE_TIMEOUT_SECONDS = 600
 ORCA_WORKTREE_POLL_SECONDS = 5
 ORCA_TRANSPORT_ERRORS = frozenset({"runtime_unavailable", "runtime_timeout"})
-WORKTREE_RECEIPT_RECOVERED = "创建回执未收到；已只读确认原名工作区与原终端就绪，未重复创建"
-ORCA_WORKER_TIMEOUT_SECONDS = 600
-WORKER_AGENT = "claude"
+WORKTREE_RECEIPT_RECOVERED = "创建回执未收到；已只读确认原名工作区归属，未重复创建"
+TERMINAL_AGENT = "claude"
+TERMINAL_READY_TIMEOUT_MS = 120_000
+SEND_OBSERVE_SECONDS = 10
+TURN_START_UNOBSERVED = "任务文本已接受，但未观察到开发会话起步"
+ORCA_SEND_TIMEOUT_SECONDS = SEND_OBSERVE_SECONDS + 30
 STAGING_DIRECTORY = ".runtime"
-ORCHESTRATION_OBJECTIVE = "orca-task-dispatcher 任务分发"
 
 
 def ensure_repository_registered(orca: OrcaClient, repository: Repository) -> str:
@@ -2212,40 +2230,15 @@ def worktree_is_clean(worktree_path: Path) -> bool:
     return not completed.stdout.strip()
 
 
-def worker_worktree_id(worker: Mapping[str, Any]) -> str | None:
-    resource = worker.get("resource")
-    if isinstance(resource, Mapping):
-        value = resource.get("worktreeId")
-        if isinstance(value, str) and value:
-            return value
-    projection = worker.get("projection")
-    if isinstance(projection, Mapping):
-        workspace = projection.get("workspace")
-        if isinstance(workspace, Mapping):
-            value = workspace.get("id")
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def worker_is_active(worker: Mapping[str, Any]) -> bool:
-    """已终结的 worker 不算占用；无法识别的状态按「占用」处理（宁可停手也不重复投递）。
-
-    词表来自 Orca 实测值：运行中为 workerState=ready / dispatchStatus=dispatched，
-    已终结为 workerState=failed|succeeded / dispatchStatus=failed|completed。
-    """
-    settled_worker_states = {"failed", "succeeded", "stopped"}
-    settled_dispatch_statuses = {"failed", "completed", "stopped"}
-    return not (
-        worker.get("workerState") in settled_worker_states
-        or worker.get("dispatchStatus") in settled_dispatch_statuses
-    )
-
-
-def has_active_worker(worktree: OrcaWorktree, workers: Iterable[Mapping[str, Any]]) -> bool:
+def has_live_agent_terminal(config: Config, orca: OrcaClient, worktree: OrcaWorktree) -> bool:
+    """工作区内是否还有活着的开发会话；只读探测失败时按占用处理，宁可停手。"""
+    try:
+        terminals = retry_read(config, lambda: orca.terminals(worktree))
+    except DispatcherError:
+        return True
     return any(
-        worker_worktree_id(worker) == worktree.worktree_id and worker_is_active(worker)
-        for worker in workers
+        terminal.worktree_id == worktree.worktree_id and terminal.agent_identity == TERMINAL_AGENT
+        for terminal in terminals
     )
 
 
@@ -2322,9 +2315,17 @@ def rename_worktree_branch(worktree_path: Path, branch: str) -> None:
 
 
 def base_branch_matches(worktree: OrcaWorktree, base_branch: str | None) -> bool:
+    """Orca 记录的 baseRef 可能是裸引用，也可能是 refs/heads/ 或 refs/remotes/ 全名。
+
+    实测：`--base-branch origin/release_9ji` 会被记成 `refs/remotes/origin/release_9ji`。
+    """
     if base_branch is None:
         return True
-    return worktree.base_branch in {base_branch, f"refs/heads/{base_branch}"}
+    return worktree.base_branch in {
+        base_branch,
+        f"refs/heads/{base_branch}",
+        f"refs/remotes/{base_branch}",
+    }
 
 
 def validate_task_worktree(
@@ -2360,11 +2361,11 @@ def ensure_worktree_branch(repository: Repository, assignment: Assignment, workt
 
 
 def cleanup_suffix_worktrees(
+    config: Config,
     orca: OrcaClient,
     worktrees: Iterable[OrcaWorktree],
     repository_id: str,
     assignment: Assignment,
-    workers: Iterable[Mapping[str, Any]],
 ) -> None:
     expected_name = worktree_name_for(assignment)
     suffix_pattern = re.compile(rf"{re.escape(expected_name)}-\d+\Z")
@@ -2372,51 +2373,25 @@ def cleanup_suffix_worktrees(
     for worktree in suffixes:
         if worktree.repository_id != repository_id or not base_branch_matches(worktree, assignment.base_branch):
             raise DispatcherError("worktree_suffix_unsafe", "发现身份或基础分支不符的自动后缀工作区")
-        if has_active_worker(worktree, workers):
-            raise DispatcherError("worktree_suffix_active", "发现仍有关联 worker 的自动后缀工作区")
+        if has_live_agent_terminal(config, orca, worktree):
+            raise DispatcherError("worktree_suffix_active", "发现仍有开发会话的自动后缀工作区")
         if not worktree_is_clean(worktree.path):
             raise DispatcherError("worktree_suffix_dirty", "发现含未提交改动的自动后缀工作区")
     for worktree in suffixes:
         orca.worktree_remove(worktree)
 
 
-def select_created_terminal(
+def verify_created_terminal(
     config: Config,
     orca: OrcaClient,
     worktree: OrcaWorktree,
-    returned_handle: str | None,
-) -> str | None:
-    """返回已就绪的 Claude terminal；尚未就绪返回 None，出现歧义则报错。"""
-    terminals = retry_read(config, lambda: orca.terminals(worktree))
-    candidates = tuple(
-        terminal
-        for terminal in terminals
-        if terminal.worktree_id == worktree.worktree_id
-        and terminal.agent_identity == WORKER_AGENT
-        and terminal.connected
-        and terminal.writable
-    )
-    if len(candidates) > 1:
-        raise DispatcherError("worktree_terminal_ambiguous", "新工作区存在多个 Claude terminal，不能自动接管")
-    if not candidates:
-        return None
-    if returned_handle is not None and candidates[0].handle != returned_handle:
-        raise DispatcherError("worktree_terminal_ambiguous", "创建回执的 terminal 与当前终端不一致")
-    return candidates[0].handle
-
-
-def select_reusable_terminal(config: Config, orca: OrcaClient, worktree: OrcaWorktree) -> str | None:
-    terminals = retry_read(config, lambda: orca.terminals(worktree))
-    live = tuple(
-        terminal for terminal in terminals
-        if terminal.worktree_id == worktree.worktree_id and terminal.connected and terminal.writable
-    )
-    if not live:
-        return None
-    candidates = tuple(terminal for terminal in live if terminal.agent_identity == WORKER_AGENT)
-    if len(live) == 1 and len(candidates) == 1:
-        return candidates[0].handle
-    raise DispatcherError("worktree_terminal_ambiguous", "既有工作区存在无法安全接管的 live terminal")
+    handle: str,
+) -> OrcaTerminal:
+    """确认本次创建的终端确实落在目标任务工作区；不复用任何既有终端。"""
+    terminal = retry_read(config, lambda: orca.terminal_show(handle))
+    if terminal.worktree_id != worktree.worktree_id:
+        raise DispatcherError("terminal_worktree_mismatch", "新建终端不属于目标任务工作区")
+    return terminal
 
 
 def creation_conflict_error(
@@ -2447,6 +2422,22 @@ def creation_conflict_error(
     return None
 
 
+def worktree_git_ready(worktree_path: Path) -> bool:
+    """确认 Orca 侧检出已完成：路径已是可读的 Git 工作区。"""
+    if not worktree_path.is_dir():
+        return False
+    completed = subprocess.run(
+        ["git", "-C", str(worktree_path), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        env=child_environment(),
+    )
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
 def observe_created_worktree(
     config: Config,
     orca: OrcaClient,
@@ -2455,10 +2446,9 @@ def observe_created_worktree(
     assignment: Assignment,
     repository_id: str,
     expected_worktree_id: str | None,
-    expected_terminal_handle: str | None,
     receipt_lost: bool,
 ) -> PreparedWorktree:
-    """创建请求已发出但回执未确认：只读等待原名工作区与原终端就绪，绝不重发创建。"""
+    """创建请求已发出但回执未确认：只读等待原名工作区检出就绪，绝不重发创建。"""
     name = worktree_name_for(assignment)
     deadline = time.monotonic() + ORCA_WORKTREE_TIMEOUT_SECONDS
     warnings: tuple[str, ...] = (WORKTREE_RECEIPT_RECOVERED,) if receipt_lost else ()
@@ -2471,15 +2461,15 @@ def observe_created_worktree(
             exact = tuple(worktree for worktree in worktrees if worktree.path.name == name)
             if exact:
                 worktree = exact[0]
-                # 资源一确认就先落状态，之后任何失败都能人工核对到实际工作区。
-                store.mark_worktree_prepared(assignment, worktree, None)
-                if has_active_worker(worktree, retry_read(config, orca.workers)):
-                    raise DispatcherError("worktree_active", "同名任务工作区已有运行中的 worker")
-                handle = select_created_terminal(config, orca, worktree, expected_terminal_handle)
-                if handle is not None:
-                    store.mark_worktree_prepared(assignment, worktree, handle)
+                if not worktree_git_ready(worktree.path):
+                    retry_log("同名工作区已出现但检出尚未完成；继续只读等待")
+                else:
+                    # 资源一确认就先落状态，之后任何失败都能人工核对到实际工作区。
+                    store.mark_worktree_prepared(assignment, worktree)
+                    if has_live_agent_terminal(config, orca, worktree):
+                        raise DispatcherError("worktree_active", "同名任务工作区已有活动开发会话")
                     ensure_worktree_branch(repository, assignment, worktree)
-                    return PreparedWorktree(worktree, handle, (
+                    return PreparedWorktree(worktree, (
                         *sync_worktree_files(repository, worktree.path),
                         *warnings,
                     ))
@@ -2502,10 +2492,9 @@ def prepare_task_worktree(
     assignment: Assignment,
     repository_id: str,
 ) -> PreparedWorktree:
-    """严格解析稳定工作区：清理安全后缀、复用已验证资源或 agent-first 创建。"""
-    workers = retry_read(config, orca.workers)
+    """严格解析稳定工作区：清理安全后缀、复用已验证工作区或创建新工作区。"""
     worktrees = retry_read(config, lambda: orca.worktrees(repository_id))
-    cleanup_suffix_worktrees(orca, worktrees, repository_id, assignment, workers)
+    cleanup_suffix_worktrees(config, orca, worktrees, repository_id, assignment)
     if any(re.compile(rf"{re.escape(worktree_name_for(assignment))}-\d+\Z").fullmatch(worktree.path.name) for worktree in worktrees):
         worktrees = retry_read(config, lambda: orca.worktrees(repository_id))
     expected_name = worktree_name_for(assignment)
@@ -2515,15 +2504,14 @@ def prepare_task_worktree(
     if matching:
         worktree = matching[0]
         validate_task_worktree(worktree, assignment, repository_id)
-        if has_active_worker(worktree, workers):
-            raise DispatcherError("worktree_active", "同名任务工作区已有运行中的 worker")
-        terminal_handle = select_reusable_terminal(config, orca, worktree)
-        store.mark_worktree_prepared(assignment, worktree, terminal_handle)
+        if has_live_agent_terminal(config, orca, worktree):
+            raise DispatcherError("worktree_active", "同名任务工作区已有活动开发会话")
+        store.mark_worktree_prepared(assignment, worktree)
         ensure_worktree_branch(repository, assignment, worktree)
-        return PreparedWorktree(worktree, terminal_handle, sync_worktree_files(repository, worktree.path))
+        return PreparedWorktree(worktree, sync_worktree_files(repository, worktree.path))
 
     try:
-        creation = orca.worktree_create(
+        created = orca.worktree_create(
             name=expected_name,
             repository_id=repository_id,
             base_branch=assignment.base_branch,
@@ -2536,24 +2524,21 @@ def prepare_task_worktree(
         return observe_created_worktree(
             config, orca, store, repository, assignment, repository_id,
             expected_worktree_id=None,
-            expected_terminal_handle=None,
             receipt_lost=True,
         )
-    # 回执已拿到：先落状态，再等终端就绪，避免工作区已存在却没有任何记录。
-    store.mark_worktree_prepared(assignment, creation.worktree, None)
+    # 回执已拿到：先落状态，再等检出就绪，避免工作区已存在却没有任何记录。
+    store.mark_worktree_prepared(assignment, created)
     listed = retry_read(config, lambda: orca.worktrees(repository_id))
-    if not any(worktree.worktree_id == creation.worktree.worktree_id for worktree in listed):
+    if not any(worktree.worktree_id == created.worktree_id for worktree in listed):
         retry_log("创建回执未在列表中确认；只读等待原名工作区就绪，不重发创建")
         return observe_created_worktree(
             config, orca, store, repository, assignment, repository_id,
-            expected_worktree_id=creation.worktree.worktree_id,
-            expected_terminal_handle=creation.agent_terminal_handle,
+            expected_worktree_id=created.worktree_id,
             receipt_lost=True,
         )
     return observe_created_worktree(
         config, orca, store, repository, assignment, repository_id,
-        expected_worktree_id=creation.worktree.worktree_id,
-        expected_terminal_handle=creation.agent_terminal_handle,
+        expected_worktree_id=created.worktree_id,
         receipt_lost=False,
     )
 
@@ -2586,17 +2571,6 @@ def relocate_requirement_artifacts(assignment: Assignment, worktree_path: Path) 
         requirement_snapshot_path=relocated_snapshot,
         gitnexus_report_path=relocated_report,
     )
-
-
-def ensure_orchestration_run(orca: OrcaClient, store: StateStore) -> str:
-    """worker-start 要求调用方绑定到 Run；首次创建后复用它。"""
-    run_id = store.orchestration_run_id()
-    if run_id:
-        orca.orchestration_run_use(run_id)
-        return run_id
-    run_id = orca.orchestration_run_create(ORCHESTRATION_OBJECTIVE)
-    store.set_orchestration_run_id(run_id)
-    return run_id
 
 
 def launch(
@@ -2654,7 +2628,6 @@ def launch(
 
         retry_read(config, orca.status)
         repository_ids = retry_read(config, orca.repo_ids)
-        run_id: str | None = None
         for assignment in selected:
             repository = repositories[assignment.repository]
             try:
@@ -2662,6 +2635,8 @@ def launch(
             except DispatcherError as error:
                 results.append(assignment_result(assignment, "failed_state", message=error.message))
                 continue
+            terminal_handle: str | None = None
+            receipt: SendReceipt | None = None
             try:
                 repository_id = repository_ids.get(
                     os.path.normcase(os.path.normpath(str(repository.path.resolve())))
@@ -2669,57 +2644,83 @@ def launch(
                 if repository_id is None:
                     repository_id = ensure_repository_registered(orca, repository)
                     repository_ids[os.path.normcase(os.path.normpath(str(repository.path.resolve())))] = repository_id
-                if run_id is None:
-                    # 先绑定 Run：worker-list 不带 --run 时按调用方 Run 过滤，占用判定必须在绑定后进行。
-                    run_id = ensure_orchestration_run(orca, store)
                 if config.flow_for(assignment.dispatch_flow).requires_worktree:
                     prepared = prepare_task_worktree(config, orca, store, repository, assignment, repository_id)
                     worktree = prepared.worktree
                     create_warnings = prepared.warnings
-                    terminal_handle = prepared.terminal_handle
                     settled = relocate_requirement_artifacts(assignment, worktree.path)
                     worktree_docs = worktree.path / "docs" / "engineering"
                 else:
-                    # 不要求独立工作树的流程：worker 落在源仓库 checkout，制品留在暂存目录。
+                    # 不要求独立工作树的流程：开发会话落在源仓库 checkout，制品留在暂存目录。
                     worktree = OrcaWorktree(
                         worktree_id=f"path:{repository.path.resolve().as_posix()}",
                         path=repository.path.resolve(),
                     )
                     create_warnings = ()
-                    terminal_handle = None
                     settled = assignment
                     worktree_docs = staged_docs_root(assignment)
                 if settled.requirement_snapshot_path is not None:
                     validate_requirement_snapshot_path(config, settled, worktree_docs)
                 validate_gitnexus_report_path(config, settled, worktree_docs)
-                dispatch = orca.worker_start(
-                    worktree.selector,
-                    command_for(config, settled),
-                    assignment.task.title,
-                    terminal_handle=terminal_handle,
+                # 制品校验通过后才新建开发会话：只用本次创建的终端，不复用既有会话。
+                terminal_handle = orca.terminal_create(
+                    worktree,
+                    worktree_name_for(assignment),
+                    TERMINAL_AGENT,
                 )
+                terminal = verify_created_terminal(config, orca, worktree, terminal_handle)
+                store.mark_terminal_created(assignment, terminal.handle)
+                wait = orca.terminal_wait(terminal.handle, TERMINAL_READY_TIMEOUT_MS)
+                if wait.get("satisfied") is not True:
+                    raise DispatcherError(
+                        "terminal_not_ready",
+                        "开发会话未在预算内进入空闲状态；未发送任务文本，请人工核对后复位",
+                    )
+                store.mark_send_started(settled)
+                receipt = parse_send_receipt(orca.terminal_send(
+                    terminal.handle,
+                    command_for(config, settled),
+                ))
+                if not receipt.accepted:
+                    raise DispatcherError(
+                        "dispatch_not_accepted",
+                        "Orca 未接受任务文本；不重发，请人工核对终端后复位",
+                    )
+                if receipt.observation == "unsupported":
+                    # 旧主机能收下文本却不返回可核验回执：不静默降级，也不重发。
+                    raise DispatcherError(
+                        "dispatch_unverifiable",
+                        "当前 Orca 主机不支持投递观察，无法核验任务文本是否执行；"
+                        "不重发，请人工核对终端后复位",
+                    )
             except DispatcherError as error:
+                detail: dict[str, object] = {}
+                if terminal_handle:
+                    detail["terminal_handle"] = terminal_handle
+                if receipt is not None and receipt.request_id:
+                    detail["send_request_id"] = receipt.request_id
                 results.append(assignment_result(
                     assignment,
                     "requires_manual_reset",
                     message=error.message,
+                    **detail,
                 ))
                 append_history_safely(store, assignment_history(
-                    assignment, "requires_manual_reset", reason=error.code
+                    assignment, "requires_manual_reset", reason=error.code, **detail
                 ))
                 state_error = mark_manual_reset_safely(store, assignment, error.code)
                 if state_error:
                     results[-1]["state_error"] = state_error
                 continue
-            record = WorkerRecord(
+            record = DispatchRecord(
                 assignment=settled,
                 worktree=worktree,
-                dispatch_id=require_text(dispatch.get("dispatchId"), "Orca dispatch.dispatchId"),
-                task_id=str(dispatch.get("taskId") or ""),
-                run_id=str(dispatch.get("runId") or ""),
-                state=str(dispatch.get("state") or ""),
-                stage=str(dispatch.get("stage") or ""),
-                warnings=create_warnings,
+                terminal_handle=terminal_handle,
+                receipt=receipt,
+                warnings=(
+                    *create_warnings,
+                    *(() if receipt.turn_started else (TURN_START_UNOBSERVED,)),
+                ),
             )
             try:
                 store.mark_dispatched(record)
@@ -2728,23 +2729,27 @@ def launch(
                     settled,
                     "requires_manual_reset",
                     message=error.message,
-                    dispatch_id=record.dispatch_id,
+                    terminal_handle=terminal_handle,
+                    send_request_id=receipt.request_id,
                 ))
                 append_history_safely(store, assignment_history(
                     settled,
                     "uncertain",
-                    dispatch_id=record.dispatch_id,
-                    reason="state_write_after_worker_start",
+                    terminal_handle=terminal_handle,
+                    send_request_id=receipt.request_id,
+                    reason="state_write_after_send",
                 ))
-                state_error = mark_manual_reset_safely(store, settled, "state_write_after_worker_start")
+                state_error = mark_manual_reset_safely(store, settled, "state_write_after_send")
                 if state_error:
                     results[-1]["state_error"] = state_error
                 continue
+            dispatch_state = "turn_started" if receipt.turn_started else "input_accepted"
             result = assignment_result(
                 settled,
                 "dispatched",
-                dispatch_id=record.dispatch_id,
-                dispatch_state=record.state,
+                terminal_handle=terminal_handle,
+                send_request_id=receipt.request_id,
+                dispatch_state=dispatch_state,
             )
             if record.warnings:
                 result["warnings"] = list(record.warnings)
@@ -2761,8 +2766,8 @@ def launch(
                 settled,
                 "dispatched",
                 repo=settled.repository,
-                dispatch_id=record.dispatch_id,
-                dispatch_state=record.state,
+                terminal_handle=terminal_handle,
+                dispatch_state=dispatch_state,
             ))
 
         current_run = {
@@ -2881,16 +2886,25 @@ def recover(
         results: list[dict[str, object]] = []
         for entry in selected:
             value = entry.value
-            dispatch_id = value.get("dispatch_id")
-            if not isinstance(dispatch_id, str) or not dispatch_id:
-                store.mark_requires_manual_reset(entry.state_key, "dispatch_id_missing")
+            handle = value.get("terminal_handle")
+            if not isinstance(handle, str) or not handle:
+                # 历史 orchestration 记录与未落盘终端句柄的记录都只报告，不迁移、不重发。
+                store.mark_requires_manual_reset(entry.state_key, "terminal_handle_missing")
                 append_history_safely(store, state_entry_history(
-                    entry, "requires_manual_reset", reason="dispatch_id_missing"
+                    entry, "requires_manual_reset", reason="terminal_handle_missing"
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
+                continue
+            if value.get("send_accepted") is not True:
+                # 没有已落盘的接受证据：不重发，交人工核对终端实际状态。
+                store.mark_requires_manual_reset(entry.state_key, "dispatch_not_confirmed")
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason="dispatch_not_confirmed"
                 ))
                 results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
             try:
-                dispatch = orca.orchestration_show(dispatch_id)
+                terminal = orca.terminal_show(handle)
             except DispatcherError as error:
                 store.mark_requires_manual_reset(entry.state_key, error.code)
                 append_history_safely(store, state_entry_history(
@@ -2898,15 +2912,21 @@ def recover(
                 ))
                 results.append(state_entry_result(entry, "requires_manual_reset"))
                 continue
-            dispatch_state = require_text(
-                dispatch.get("status") or dispatch.get("state"), "Orca dispatch.status"
-            )
-            store.mark_recovered(entry.state_key, dispatch_id, dispatch_state, "recovered")
+            worktree_id = value.get("worktree_id")
+            if isinstance(worktree_id, str) and worktree_id and terminal.worktree_id != worktree_id:
+                store.mark_requires_manual_reset(entry.state_key, "terminal_worktree_mismatch")
+                append_history_safely(store, state_entry_history(
+                    entry, "requires_manual_reset", reason="terminal_worktree_mismatch"
+                ))
+                results.append(state_entry_result(entry, "requires_manual_reset"))
+                continue
+            dispatch_state = str(value.get("dispatch_state") or "")
+            store.mark_recovered(entry.state_key, dispatch_state, "recovered", terminal_handle=handle)
             append_history_safely(store, state_entry_history(
-                entry, "recovered", dispatch_id=dispatch_id, dispatch_state=dispatch_state
+                entry, "recovered", terminal_handle=handle, dispatch_state=dispatch_state
             ))
             results.append(state_entry_result(
-                entry, "recovered", dispatch_id=dispatch_id, dispatch_state=dispatch_state
+                entry, "recovered", terminal_handle=handle, dispatch_state=dispatch_state
             ))
 
     return {"results": results}
