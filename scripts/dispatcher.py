@@ -388,12 +388,15 @@ class DispatchRecord:
     worktree: OrcaWorktree
     terminal_handle: str
     receipt: SendReceipt
+    initial_prompt_digest: str
+    duplicate_of_state_key: str | None = None
     warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class PreparedWorktree:
     worktree: OrcaWorktree
+    active_terminals: tuple[OrcaTerminal, ...]
     warnings: tuple[str, ...]
 
 
@@ -1418,6 +1421,19 @@ class StateStore:
             )
         )
 
+    def terminal_records_for_worktree(self, worktree_id: str) -> tuple[tuple[str, Mapping[str, object]], ...]:
+        """只读返回 state 中与物理工作区关联的终端证据，跨流程但不合并状态。"""
+        tasks = self.snapshot()["tasks"]
+        assert isinstance(tasks, dict)
+        records: list[tuple[str, Mapping[str, object]]] = []
+        for entry in self._resolved_entries(tasks):
+            if (
+                entry.value.get("worktree_id") == worktree_id
+                and entry.value.get("terminal_handle")
+            ):
+                records.append((entry.state_key, entry.value))
+        return tuple(records)
+
     def status(self, task_id: str, tenant_slug: str = "legacy", dispatch_flow: str | None = "complete") -> str | None:
         tasks = self.snapshot()["tasks"]
         assert isinstance(tasks, dict)
@@ -1518,9 +1534,14 @@ class StateStore:
             dispatch_state="terminal_ready",
         )
 
-    def mark_send_started(self, assignment: Assignment) -> None:
-        """发送前落盘：进程若在投递后中断，仍能区分「未发送」与「发送结果未知」。"""
-        self._update_launching(assignment, dispatch_state="sending", send_started_at=utc_now())
+    def mark_send_started(self, assignment: Assignment, initial_prompt_digest: str) -> None:
+        """发送前落盘首次投递摘要，避免把完整任务文本写入状态。"""
+        self._update_launching(
+            assignment,
+            initial_prompt_digest=initial_prompt_digest,
+            dispatch_state="sending",
+            send_started_at=utc_now(),
+        )
 
     def mark_dispatched(self, record: DispatchRecord) -> None:
         state = self.snapshot()
@@ -1547,6 +1568,8 @@ class StateStore:
                 "worktree_path": record.worktree.path.as_posix(),
                 "worktree_id": record.worktree.worktree_id,
                 "terminal_handle": record.terminal_handle,
+                "initial_prompt_digest": record.initial_prompt_digest,
+                "duplicate_of_state_key": record.duplicate_of_state_key,
                 "send_request_id": record.receipt.request_id,
                 "send_accepted": record.receipt.accepted,
                 "send_stages": list(record.receipt.stages),
@@ -1989,6 +2012,42 @@ def parse_send_receipt(result: Mapping[str, Any]) -> SendReceipt:
     )
 
 
+def initial_prompt_digest(prompt: str) -> str:
+    """保存首次投递内容的摘要，不把任务正文写入运行状态。"""
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def receipt_from_state(value: Mapping[str, object]) -> SendReceipt:
+    stages = value.get("send_stages")
+    return SendReceipt(
+        accepted=value.get("send_accepted") is True,
+        request_id=value.get("send_request_id") if isinstance(value.get("send_request_id"), str) else None,
+        stages=tuple(str(stage) for stage in stages) if isinstance(stages, list) else (),
+        observation=value.get("send_observation") if isinstance(value.get("send_observation"), str) else None,
+        process_incarnation=(
+            value.get("send_process_incarnation")
+            if isinstance(value.get("send_process_incarnation"), str)
+            else None
+        ),
+    )
+
+
+def duplicate_terminal_for_prompt(
+    store: StateStore,
+    worktree: OrcaWorktree,
+    active_terminals: Iterable[OrcaTerminal],
+    digest: str,
+) -> tuple[str, Mapping[str, object], OrcaTerminal] | None:
+    active_by_handle = {terminal.handle: terminal for terminal in active_terminals}
+    for state_key, value in store.terminal_records_for_worktree(worktree.worktree_id):
+        if value.get("initial_prompt_digest") != digest:
+            continue
+        handle = value.get("terminal_handle")
+        if isinstance(handle, str) and handle in active_by_handle:
+            return state_key, value, active_by_handle[handle]
+    return None
+
+
 def validate_command_template(template: str) -> None:
     if not template.startswith("/dev-spec-gen"):
         raise DispatcherError("invalid_config", "分发命令模板必须以 /dev-spec-gen 开头")
@@ -2230,8 +2289,23 @@ def worktree_is_clean(worktree_path: Path) -> bool:
     return not completed.stdout.strip()
 
 
+def active_agent_terminals(
+    config: Config, orca: OrcaClient, worktree: OrcaWorktree
+) -> tuple[OrcaTerminal, ...]:
+    """返回活动 Claude 会话；查询失败按异常交给调用方决定是否停手。"""
+    terminals = retry_read(config, lambda: orca.terminals(worktree))
+    return tuple(
+        terminal
+        for terminal in terminals
+        if terminal.worktree_id == worktree.worktree_id
+        and terminal.agent_identity == TERMINAL_AGENT
+        and terminal.connected
+        and terminal.writable
+    )
+
+
 def has_live_agent_terminal(config: Config, orca: OrcaClient, worktree: OrcaWorktree) -> bool:
-    """工作区内是否还有活着的开发会话；只读探测失败时按占用处理，宁可停手。"""
+    """后缀清理保留原保护，不能把不可写或暂时断连的 Claude 当作可删除。"""
     try:
         terminals = retry_read(config, lambda: orca.terminals(worktree))
     except DispatcherError:
@@ -2252,10 +2326,10 @@ def require_unique_worktree_names(config: Config, assignments: Iterable[Assignme
             worktree_name_for(assignment),
         )
         previous = seen.get(key)
-        if previous is not None:
+        if previous is not None and previous.assignment_id != assignment.assignment_id:
             raise DispatcherError(
                 "invalid_input",
-                "同一输入中不同任务分配不能使用相同 worktree_name；请显式提供不同 worktree_slug",
+                "不同任务或租户不能使用相同 worktree_name；请显式提供不同 worktree_slug",
             )
         seen[key] = assignment
 
@@ -2466,11 +2540,10 @@ def observe_created_worktree(
                 else:
                     # 资源一确认就先落状态，之后任何失败都能人工核对到实际工作区。
                     store.mark_worktree_prepared(assignment, worktree)
-                    if has_live_agent_terminal(config, orca, worktree):
-                        raise DispatcherError("worktree_active", "同名任务工作区已有活动开发会话")
+                    active_terminals = active_agent_terminals(config, orca, worktree)
                     ensure_worktree_branch(repository, assignment, worktree)
-                    return PreparedWorktree(worktree, (
-                        *sync_worktree_files(repository, worktree.path),
+                    return PreparedWorktree(worktree, active_terminals, (
+                        *(() if active_terminals else sync_worktree_files(repository, worktree.path)),
                         *warnings,
                     ))
         except DispatcherError as error:
@@ -2504,11 +2577,14 @@ def prepare_task_worktree(
     if matching:
         worktree = matching[0]
         validate_task_worktree(worktree, assignment, repository_id)
-        if has_live_agent_terminal(config, orca, worktree):
-            raise DispatcherError("worktree_active", "同名任务工作区已有活动开发会话")
+        active_terminals = active_agent_terminals(config, orca, worktree)
         store.mark_worktree_prepared(assignment, worktree)
         ensure_worktree_branch(repository, assignment, worktree)
-        return PreparedWorktree(worktree, sync_worktree_files(repository, worktree.path))
+        return PreparedWorktree(
+            worktree,
+            active_terminals,
+            () if active_terminals else sync_worktree_files(repository, worktree.path),
+        )
 
     try:
         created = orca.worktree_create(
@@ -2543,8 +2619,23 @@ def prepare_task_worktree(
     )
 
 
-def relocate_requirement_artifacts(assignment: Assignment, worktree_path: Path) -> Assignment:
-    """把暂存在源仓库 .runtime 下的任务制品整体复制进任务工作区（暂存目录保留）。"""
+def copy_missing_artifact(source: str, destination: str) -> str:
+    """共享工作区仅补缺失制品，不覆盖活动会话已有内容。"""
+    target = Path(destination)
+    if target.exists():
+        return destination
+    try:
+        with target.open("xb") as output, Path(source).open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+    except FileExistsError:
+        pass
+    return destination
+
+
+def relocate_requirement_artifacts(
+    assignment: Assignment, worktree_path: Path, *, preserve_existing: bool = False
+) -> Assignment:
+    """迁入暂存制品；共享活动工作区时仅补充缺失文件。"""
     docs_root = staged_docs_root(assignment)
     target_root = worktree_path / "docs" / "engineering"
     snapshot_path = assignment.requirement_snapshot_path
@@ -2563,7 +2654,10 @@ def relocate_requirement_artifacts(assignment: Assignment, worktree_path: Path) 
         relocated_report = target_root / "research" / resolved_report.name
     if docs_root.is_dir():
         try:
-            shutil.copytree(docs_root, target_root, dirs_exist_ok=True)
+            shutil.copytree(
+                docs_root, target_root, dirs_exist_ok=True,
+                copy_function=copy_missing_artifact if preserve_existing else shutil.copy2,
+            )
         except (OSError, shutil.Error) as error:
             raise DispatcherError("artifact_relocation_failed", "无法迁入任务需求制品") from error
     return replace(
@@ -2647,8 +2741,11 @@ def launch(
                 if config.flow_for(assignment.dispatch_flow).requires_worktree:
                     prepared = prepare_task_worktree(config, orca, store, repository, assignment, repository_id)
                     worktree = prepared.worktree
+                    active_terminals = prepared.active_terminals
                     create_warnings = prepared.warnings
-                    settled = relocate_requirement_artifacts(assignment, worktree.path)
+                    settled = relocate_requirement_artifacts(
+                        assignment, worktree.path, preserve_existing=bool(active_terminals)
+                    )
                     worktree_docs = worktree.path / "docs" / "engineering"
                 else:
                     # 不要求独立工作树的流程：开发会话落在源仓库 checkout，制品留在暂存目录。
@@ -2656,13 +2753,57 @@ def launch(
                         worktree_id=f"path:{repository.path.resolve().as_posix()}",
                         path=repository.path.resolve(),
                     )
+                    active_terminals = active_agent_terminals(config, orca, worktree)
                     create_warnings = ()
                     settled = assignment
                     worktree_docs = staged_docs_root(assignment)
                 if settled.requirement_snapshot_path is not None:
                     validate_requirement_snapshot_path(config, settled, worktree_docs)
                 validate_gitnexus_report_path(config, settled, worktree_docs)
-                # 制品校验通过后才新建开发会话：只用本次创建的终端，不复用既有会话。
+                prompt = command_for(config, settled)
+                prompt_digest = initial_prompt_digest(prompt)
+                duplicate = duplicate_terminal_for_prompt(store, worktree, active_terminals, prompt_digest)
+                if duplicate is not None:
+                    duplicate_state_key, duplicate_value, duplicate_terminal = duplicate
+                    terminal_handle = duplicate_terminal.handle
+                    receipt = receipt_from_state(duplicate_value)
+                    if not receipt.accepted or receipt.observation == "unsupported":
+                        raise DispatcherError(
+                            "duplicate_session_unconfirmed",
+                            "相同内容的活动会话首次投递结果未确认；不新建、不重发，请人工核对",
+                        )
+                    record = DispatchRecord(
+                        assignment=settled,
+                        worktree=worktree,
+                        terminal_handle=terminal_handle,
+                        receipt=receipt,
+                        initial_prompt_digest=prompt_digest,
+                        duplicate_of_state_key=duplicate_state_key,
+                        warnings=(
+                            *create_warnings,
+                            *(() if receipt.turn_started else (TURN_START_UNOBSERVED,)),
+                        ),
+                    )
+                    store.mark_dispatched(record)
+                    result = assignment_result(
+                        settled,
+                        "skipped_duplicate_session",
+                        terminal_handle=terminal_handle,
+                        send_request_id=receipt.request_id,
+                        dispatch_state=("turn_started" if receipt.turn_started else "input_accepted"),
+                        duplicate_of_state_key=duplicate_state_key,
+                    )
+                    if record.warnings:
+                        result["warnings"] = list(record.warnings)
+                    results.append(result)
+                    append_history_safely(store, assignment_history(
+                        settled,
+                        "skipped_duplicate_session",
+                        terminal_handle=terminal_handle,
+                        duplicate_of_state_key=duplicate_state_key,
+                    ))
+                    continue
+                # 制品校验且未发现相同首次投递后才新建开发会话。
                 terminal_handle = orca.terminal_create(
                     worktree,
                     worktree_name_for(assignment),
@@ -2676,10 +2817,10 @@ def launch(
                         "terminal_not_ready",
                         "开发会话未在预算内进入空闲状态；未发送任务文本，请人工核对后复位",
                     )
-                store.mark_send_started(settled)
+                store.mark_send_started(settled, prompt_digest)
                 receipt = parse_send_receipt(orca.terminal_send(
                     terminal.handle,
-                    command_for(config, settled),
+                    prompt,
                 ))
                 if not receipt.accepted:
                     raise DispatcherError(
@@ -2717,6 +2858,7 @@ def launch(
                 worktree=worktree,
                 terminal_handle=terminal_handle,
                 receipt=receipt,
+                initial_prompt_digest=prompt_digest,
                 warnings=(
                     *create_warnings,
                     *(() if receipt.turn_started else (TURN_START_UNOBSERVED,)),
@@ -2750,6 +2892,7 @@ def launch(
                 terminal_handle=terminal_handle,
                 send_request_id=receipt.request_id,
                 dispatch_state=dispatch_state,
+                initial_prompt_digest=record.initial_prompt_digest,
             )
             if record.warnings:
                 result["warnings"] = list(record.warnings)

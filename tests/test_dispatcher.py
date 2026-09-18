@@ -3177,8 +3177,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             item = worktree_assignment(projects, repository_path, "XSWL-1")
-            duplicate = dataclasses.replace(item, dispatch_flow="direct")
+            duplicate = dataclasses.replace(item, tenant="其他", tenant_slug="other")
             config = write_config(root, projects)
+            config = dataclasses.replace(config, projects={
+                **config.projects,
+                "mapped": dataclasses.replace(config.projects["mapped"], tenants={"其他": "other"}),
+            })
             store = dispatcher.StateStore(config.state_file)
             fake_orca = FakeOrca({repository_path: "repo-mapped"})
 
@@ -3386,7 +3390,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertIsNotNone(state["worktree_path"])
             self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
 
-    def test_new_worktree_with_existing_agent_session_is_not_dispatched(self) -> None:
+    def test_new_worktree_with_existing_agent_session_allows_new_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "projects" / "repo-a"
@@ -3404,9 +3408,8 @@ class DispatcherTests(unittest.TestCase):
             with mock.patch.object(fake, "terminals", side_effect=duplicated):
                 result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
-            self.assertIn("活动开发会话", result["results"][0]["message"])
-            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
 
     def test_reuse_rejects_base_branch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3497,7 +3500,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertIn("人工确认后删除或改名", result["results"][0]["message"])
             self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
 
-    def test_existing_agent_session_blocks_reuse(self) -> None:
+    def test_existing_agent_session_allows_new_prompt_on_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "projects" / "repo-a"
@@ -3522,10 +3525,9 @@ class DispatcherTests(unittest.TestCase):
             with mock.patch.object(fake, "terminals", return_value=duplicates):
                 result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
 
-            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
-            self.assertIn("活动开发会话", result["results"][0]["message"])
+            self.assertEqual(result["results"][0]["status"], "dispatched", result["results"][0])
             self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
-            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
 
     def test_agent_session_occupancy_counts_only_live_agents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3539,6 +3541,11 @@ class DispatcherTests(unittest.TestCase):
             self.assertFalse(dispatcher.has_live_agent_terminal(config, fake, worktree))
             fake.add_agent_terminal(worktree.worktree_id)
             self.assertTrue(dispatcher.has_live_agent_terminal(config, fake, worktree))
+            with mock.patch.object(fake, "terminals", return_value=(
+                dispatcher.OrcaTerminal("term-disconnected", worktree.worktree_id, "claude", False, False),
+            )):
+                self.assertTrue(dispatcher.has_live_agent_terminal(config, fake, worktree))
+                self.assertEqual(dispatcher.active_agent_terminals(config, fake, worktree), ())
 
             def shell_only(_worktree: object) -> tuple[dispatcher.OrcaTerminal, ...]:
                 return (dispatcher.OrcaTerminal("term-shell", worktree.worktree_id, None, True, True),)
@@ -3668,6 +3675,245 @@ class DispatcherTests(unittest.TestCase):
         ]
         self.assertEqual(orchestration, [])
         self.assertFalse((launched.store.runtime_dir / "orchestration.json").exists())
+
+    def test_same_prompt_across_flows_skips_duplicate_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            config = dataclasses.replace(config, flows={
+                **config.flows,
+                "proposal": dataclasses.replace(
+                    config.flows["proposal"], command_template=config.flows["direct"].command_template
+                ),
+            })
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+
+            first_result = dispatcher.launch(config, (first,), store, fake, force_unlock=False)
+            first_state = store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1", dispatch_flow="direct")]
+            second_result = dispatcher.launch(config, (second,), store, fake, force_unlock=False)
+
+            self.assertEqual(first_result["results"][0]["status"], "dispatched")
+            self.assertEqual(second_result["results"][0]["status"], "skipped_duplicate_session")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="direct"), "dispatched")
+            self.assertEqual(store.status("XSWL-1", dispatch_flow="proposal"), "dispatched")
+            self.assertEqual(sum(op == "terminal-create" for op, _ in fake.operations), 1)
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
+            self.assertEqual(
+                second_result["results"][0]["duplicate_of_state_key"],
+                "XSWL-1::legacy::flow::direct",
+            )
+            second_key = dispatcher.state_key_for("XSWL-1", dispatch_flow="proposal")
+            second_state = store.snapshot()["tasks"][second_key]
+            self.assertEqual(second_state["terminal_handle"], first_state["terminal_handle"])
+            self.assertEqual(second_state["send_request_id"], first_state["send_request_id"])
+            recovered = dispatcher.recover(config, store, fake, task_id="XSWL-1", dispatch_flow="proposal", force_unlock=False)
+            self.assertEqual(recovered["results"][0]["status"], "recovered")
+            store.reset("XSWL-1", force_unlock=False, force=True, dispatch_flow="proposal")
+            self.assertEqual(store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1", dispatch_flow="direct")], first_state)
+
+    def test_different_prompt_across_flows_starts_second_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+
+            result = dispatcher.launch(config, (first, second), store, fake, force_unlock=False)
+
+            self.assertEqual([value["status"] for value in result["results"]], ["dispatched", "dispatched"])
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+            self.assertEqual(len(fake.worktrees_by_id), 1)
+            self.assertEqual(sum(op == "terminal-create" for op, _ in fake.operations), 2)
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 2)
+            self.assertEqual(
+                len({
+                    state["initial_prompt_digest"]
+                    for state in store.snapshot()["tasks"].values()
+                }),
+                2,
+            )
+
+    def test_legacy_active_terminal_without_digest_is_not_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            config = dataclasses.replace(config, flows={
+                **config.flows,
+                "proposal": dataclasses.replace(
+                    config.flows["proposal"], command_template=config.flows["direct"].command_template
+                ),
+            })
+
+            # 旧状态没有摘要，不能证明首次文本一致；应新开终端而不是静默跳过。
+            first_result = dispatcher.launch(config, (first,), store, fake, force_unlock=False)
+            state = store.snapshot()
+            direct_key = dispatcher.state_key_for("XSWL-1", dispatch_flow="direct")
+            dispatcher.atomic_write_json(store.state_file, {
+                **state,
+                "tasks": {**state["tasks"], direct_key: {
+                    key: value for key, value in state["tasks"][direct_key].items()
+                    if key != "initial_prompt_digest"
+                }},
+            })
+            second_result = dispatcher.launch(config, (second,), store, fake, force_unlock=False)
+
+            self.assertEqual(first_result["results"][0]["status"], "dispatched")
+            self.assertEqual(second_result["results"][0]["status"], "dispatched")
+            self.assertEqual(sum(op == "terminal-create" for op, _ in fake.operations), 2)
+
+    def test_duplicate_accepted_without_turn_started_keeps_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            path = projects / "repo-a"
+            first = worktree_assignment(projects, path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            config = dataclasses.replace(config, flows={
+                **config.flows,
+                "proposal": dataclasses.replace(
+                    config.flows["proposal"], command_template=config.flows["direct"].command_template
+                ),
+            })
+            fake = FakeOrca({path: "repo-mapped"}, send_stages=("input_accepted",))
+            store = dispatcher.StateStore(config.state_file)
+            result = dispatcher.launch(config, (first, second), store, fake, force_unlock=False)
+            self.assertEqual(result["results"][1]["status"], "skipped_duplicate_session", result)
+            self.assertEqual(result["results"][1]["dispatch_state"], "input_accepted")
+            self.assertIn(dispatcher.TURN_START_UNOBSERVED, result["results"][1].get("warnings", []))
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
+
+    def test_inactive_terminal_digest_does_not_block_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            path = projects / "repo-a"
+            first = worktree_assignment(projects, path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            config = dataclasses.replace(config, flows={
+                **config.flows,
+                "proposal": dataclasses.replace(
+                    config.flows["proposal"], command_template=config.flows["direct"].command_template
+                ),
+            })
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({path: "repo-mapped"})
+            result = dispatcher.launch(config, (first,), store, fake, force_unlock=False)
+            handle = result["results"][0]["terminal_handle"]
+            fake.terminals_by_handle[handle] = dataclasses.replace(
+                fake.terminals_by_handle[handle], connected=False, writable=False
+            )
+            second_result = dispatcher.launch(config, (second,), store, fake, force_unlock=False)
+            self.assertEqual(second_result["results"][0]["status"], "dispatched", second_result)
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 2)
+
+    def test_uncertain_same_prompt_never_creates_a_second_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
+            second = dataclasses.replace(first, dispatch_flow="proposal")
+            config = write_config(root, projects)
+            config = dataclasses.replace(config, flows={
+                **config.flows,
+                "proposal": dataclasses.replace(
+                    config.flows["proposal"], command_template=config.flows["direct"].command_template
+                ),
+            })
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"}, terminal_send_failure="发送回执丢失")
+            failed = dispatcher.launch(config, (first,), store, fake, force_unlock=False)
+            self.assertEqual(failed["results"][0]["status"], "requires_manual_reset")
+            fake.terminal_send_failure = None
+
+            result = dispatcher.launch(config, (second,), store, fake, force_unlock=False)
+
+            self.assertEqual(result["results"][0]["status"], "requires_manual_reset", result)
+            self.assertEqual(sum(op == "terminal-create" for op, _ in fake.operations), 1)
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
+            self.assertIn("首次投递结果未确认", result["results"][0]["message"])
+
+    def test_prompt_digest_is_saved_before_single_send(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            path = projects / "repo-a"
+            item = worktree_assignment(projects, path, "XSWL-1", dispatch_flow="direct")
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({path: "repo-mapped"})
+            expected = dispatcher.command_for(config, item)
+
+            def assert_saved(handle: str) -> None:
+                state = store.snapshot()["tasks"][dispatcher.state_key_for("XSWL-1", dispatch_flow="direct")]
+                self.assertEqual(state["dispatch_state"], "sending")
+                self.assertEqual(state["terminal_handle"], handle)
+                self.assertEqual(state["initial_prompt_digest"], hashlib.sha256(expected.encode("utf-8")).hexdigest())
+                self.assertNotIn(expected, store.state_file.read_text(encoding="utf-8"))
+
+            fake.before_terminal_send = assert_saved
+            result = dispatcher.launch(config, (item,), store, fake, force_unlock=False)
+            self.assertEqual(result["results"][0]["status"], "dispatched", result)
+            self.assertEqual(sum(op == "terminal-send" for op, _ in fake.operations), 1)
+
+    def test_unreadable_active_terminals_stop_without_creating_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "projects" / "repo-a"
+            item = worktree_assignment(root / "projects", path, "XSWL-1")
+            config = write_config(root, root / "projects")
+            fake = FakeOrca({path: "repo-mapped"})
+            with mock.patch.object(fake, "terminals", side_effect=dispatcher.DispatcherError("orca_invalid_json", "无法读取终端")):
+                result = dispatcher.launch(config, (item,), dispatcher.StateStore(config.state_file), fake, force_unlock=False)
+            self.assertEqual(result["results"][0]["status"], "requires_manual_reset")
+            self.assertNotIn("terminal-create", [op for op, _ in fake.operations])
+            self.assertNotIn("terminal-send", [op for op, _ in fake.operations])
+
+    def test_shared_worktree_different_flows_preserve_existing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            proposal = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="proposal")
+            direct = dataclasses.replace(proposal, dispatch_flow="direct", requirement_snapshot_path=None)
+            config = write_config(root, projects)
+            store = dispatcher.StateStore(config.state_file)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            first = dispatcher.launch(config, (proposal,), store, fake, force_unlock=False)
+            self.assertEqual(first["results"][0]["status"], "dispatched", first)
+            proposal_key = dispatcher.state_key_for("XSWL-1", dispatch_flow="proposal")
+            original_state = store.snapshot()["tasks"][proposal_key]
+            snapshot = Path(original_state["requirement_snapshot_path"])
+            snapshot.write_text(snapshot.read_text(encoding="utf-8") + "\n旧会话的新增内容\n", encoding="utf-8")
+            before = snapshot.read_bytes()
+
+            with mock.patch.object(dispatcher, "sync_worktree_files", side_effect=AssertionError("不能重新同步活动工作区")):
+                second = dispatcher.launch(config, (direct,), store, fake, force_unlock=False)
+
+            self.assertEqual(second["results"][0]["status"], "dispatched", second)
+            self.assertEqual(snapshot.read_bytes(), before)
+            self.assertEqual(store.snapshot()["tasks"][proposal_key], original_state)
+            self.assertEqual(len(fake.worktrees_by_id), 1)
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+            self.assertEqual(sum(op == "terminal-create" for op, _ in fake.operations), 2)
+            self.assertNotEqual(first["results"][0]["terminal_handle"], second["results"][0]["terminal_handle"])
 
     def test_turn_started_confirms_dispatch_without_warning(self) -> None:
         launched = self.launch_single_task()

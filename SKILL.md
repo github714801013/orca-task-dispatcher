@@ -15,7 +15,7 @@ proposal（出具开发方案）流程必须拆分为两个独立节点：Jira �
 - 直接流程（`direct`）只做最小分发，使用 `development_jira_spec(jira 参考方案驱动流程开发`；必须同时向下游传递原始实际开发任务编号 `source_task_id`（缺省回退为 `task_id`），供实际开发任务按需读取子任务中的仓库方案；全自动执行，无需人员介入。direct、complete、proposal 在同一任务/租户下使用独立内部状态 identity，可并发分发；对外 `assignment_id` 保持兼容，worktree/terminal 可共享。
 - 后续任务分发在当前会话内完成：当前会话直接执行任务查询、Jira 需求归档、调研、路由判断与制品暂存；这些准备阶段不调用 Orca、不创建 worktree，也不创建或打开新的 Agent 会话。工作区解析或创建、分支改名、制品迁入与开发会话启动全部由已确认的 `launch` 完成，顺序为 `orca worktree create`（不带 `--agent`）→ dev-spec-gen `--sync-only` 同步 → 制品迁入并校验 → `orca terminal create --command claude` → `orca terminal wait --for tui-idle` → `orca terminal send --enter --wait-submit`；启动后仅执行下述只读启动验收。
 - 调研、路由或报告无法确认时只暂停当前任务，不阻塞其他任务；主流程不得进行全目录泛搜。
-- 同一任务/租户下不同流程使用独立内部状态 identity；`state`、`recover`、`reset` 支持 `--dispatch-flow`，省略时多流程返回歧义，旧状态缺少流程字段按 `complete` 兼容；本次仅隔离状态，允许共享同一任务工作区，但每次分发都新开开发会话，不复用既有终端。
+- 同一任务/租户下不同流程使用独立内部状态 identity；`state`、`recover`、`reset` 支持 `--dispatch-flow`，省略时多流程返回歧义，旧状态缺少流程字段按 `complete` 兼容；流程可以共享同一任务工作区。工作区内活动 Claude 会话只有在 state 中记录的首次投递摘要与本次渲染文本一致时才判定为重复并跳过；摘要不同、活动会话无摘要或没有对应 state 时，新开 Claude 会话继续本流程，既有会话不关闭、不追加输入；相同摘要但首次投递回执未确认时只报告待人工核对，不视为分发成功，也不重发。共享活动工作区跳过初始化同步，制品仅补缺失、不覆盖旧会话内容。
 
 - 项目和分支确认后才暂存分发输入；工作区由 `launch` 按稳定名称解析或创建，开发会话复用报告并跳过重复调研。
 - 具体命令、字段、报告格式和终端的实际参数以对应 CLI 的 `--help`、`task-source`、`decide` 输出及配置提示为准；只有 `decide` 确认的任务才进入 worktree 与 launch。单任务优先通过 CLI 参数调用 `decide`，direct 必须显式传 `--dispatch-flow direct --source-task-id <原始开发子任务编号>`；将返回的 `result.launch_input` 原样保存给 launch，禁止手工重建 JSON 导致流程字段丢失。
@@ -25,6 +25,6 @@ proposal（出具开发方案）流程必须拆分为两个独立节点：Jira �
 1. 下发文本只使用所选流程的 `command_template` 渲染结果，不额外追加监督、心跳、汇报或追问要求。
 2. 接收方是普通 Claude 开发会话（`orca terminal create --command claude`），分发不注入任何协议前导，也不接管它的后续判断。
 3. 只按投递回执判定：`result.send.accepted` 证明任务文本被接受；`result.send.prompt.stages` 含 `turn_started` 才算观察到本轮起步。已接受但未观察到起步仍记为已分发，并保留「启动未确认」告警；回执里没有 `send` 对象、会话未在 120 秒内进入 `tui-idle`、或主机返回 `observation=unsupported` 时该任务落 `requires_manual_reset`。
-4. 汇总“任务 / 流程 / 已分发 / 投递回执”后结束本轮：记录 `terminal_handle` 与 `send_request_id`，不等待开发完成、不读取会话输出、不进入持续监督循环、不向下游追问。`--wait-submit` 的观察静默不构成重发理由：任何情况下都不重复创建或再次投递。
+4. 汇总“任务 / 流程 / 已分发 / 投递回执”后结束本轮：记录 `terminal_handle` 与 `send_request_id`，不等待开发完成、不读取会话输出、不进入持续监督循环、不向下游追问。`--wait-submit` 的观察静默不构成重发理由；只有相同首次投递摘要才跳过重复会话，摘要不同则按正常流程新开终端并只投递一次。
 
 本地配置文件的读取和修改遵循项目安全约束；不要绕过 CLI 或自行猜测配置和输入。
