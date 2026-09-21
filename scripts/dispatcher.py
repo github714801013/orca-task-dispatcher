@@ -263,6 +263,14 @@ class Assignment:
     parent_assignee: str | None = None
     gitnexus_report_path: Path | None = None
     requirement_snapshot_path: Path | None = None
+    # 直连数据类的内部构造（如 worktree create）不经过 decide，默认按"无候选资格要求"处理；
+    # 任何要交给 launch 校验的路径都必须用 Assignment.from_dict 解析，禁止直连后伪造资格证据。
+    candidate_eligible: bool | None = True
+    candidate_eligibility_reason: str | None = "内部已完成候选资格校验"
+    candidate_jql: str | None = "内部调用"
+    reference_plan_source: str = "none"
+    parent_reference_plan: str | None = None
+    candidate_evidence_provided: bool = field(default=True, repr=False, compare=False)
     dispatch_flow: str = "complete"
 
     @classmethod
@@ -272,6 +280,7 @@ class Assignment:
             "base_branch", "worktree_slug", "reference_plan", "assignee", "tenant", "tenant_slug", "assignment_id",
             "source_task_id", "source_assignee", "parent_task_id", "parent_assignee", "gitnexus_report_path",
             "requirement_snapshot_path",
+            "candidate_eligible", "candidate_eligibility_reason", "candidate_jql", "reference_plan_source", "parent_reference_plan",
             "dispatch_flow",
         }
         if unknown_fields:
@@ -299,6 +308,17 @@ class Assignment:
         parent_task_id = value.get("parent_task_id")
         if parent_task_id is not None:
             parent_task_id = require_task_id(parent_task_id)
+        canonical_task_id = require_task_id(value.get("task_id"))
+        if parent_task_id is not None and parent_task_id != canonical_task_id:
+            raise DispatcherError(
+                "invalid_input",
+                "task_id 必须是上游归一化后的实际需求编号；parent_task_id 必须省略或等于 task_id，Dispatcher 不会根据 parent_task_id 自动替换 task_id",
+            )
+        if parent_task_id is not None and source_task_id is None:
+            raise DispatcherError(
+                "invalid_input",
+                "归一化后的实际需求必须保留原始开发子任务编号 source_task_id，否则下游会按父需求编号处理开发任务",
+            )
         parent_assignee = require_optional_text(value.get("parent_assignee"), "parent_assignee")
         gitnexus_report_path = value.get("gitnexus_report_path")
         if gitnexus_report_path is not None and (not isinstance(gitnexus_report_path, str) or not gitnexus_report_path.strip()):
@@ -306,6 +326,21 @@ class Assignment:
         requirement_snapshot_path = value.get("requirement_snapshot_path")
         if requirement_snapshot_path is not None and (not isinstance(requirement_snapshot_path, str) or not requirement_snapshot_path.strip()):
             raise DispatcherError("invalid_input", "requirement_snapshot_path 必须是字符串或 null")
+        candidate_eligible = value.get("candidate_eligible")
+        if candidate_eligible is not None and not isinstance(candidate_eligible, bool):
+            raise DispatcherError("invalid_input", "candidate_eligible 必须是布尔值或 null")
+        candidate_reason = value.get("candidate_eligibility_reason")
+        if candidate_reason is not None and (not isinstance(candidate_reason, str) or not candidate_reason.strip()):
+            raise DispatcherError("invalid_input", "candidate_eligibility_reason 必须是非空字符串或 null")
+        candidate_jql = value.get("candidate_jql")
+        if candidate_jql is not None and (not isinstance(candidate_jql, str) or not candidate_jql.strip()):
+            raise DispatcherError("invalid_input", "candidate_jql 必须是非空字符串或 null")
+        reference_plan_source = value.get("reference_plan_source", "none")
+        if reference_plan_source not in {"task", "parent", "none"}:
+            raise DispatcherError("invalid_input", "reference_plan_source 必须是 task、parent 或 none")
+        parent_reference_plan = value.get("parent_reference_plan")
+        if parent_reference_plan is not None and (not isinstance(parent_reference_plan, str) or not parent_reference_plan.strip()):
+            raise DispatcherError("invalid_input", "parent_reference_plan 必须是字符串或 null")
         repository_path = Path(require_text(value.get("repository_path"), "repository_path"))
         if not repository_path.is_absolute():
             raise DispatcherError("invalid_input", "repository_path 必须是绝对路径")
@@ -319,6 +354,12 @@ class Assignment:
         if snapshot_value is not None and not Path(snapshot_value).is_absolute():
             raise DispatcherError("invalid_input", "requirement_snapshot_path 必须是绝对路径")
         dispatch_flow = require_dispatch_flow(value.get("dispatch_flow", default_flow))
+        evidence_fields = (
+            "candidate_eligible", "candidate_eligibility_reason", "candidate_jql", "reference_plan_source",
+        )
+        candidate_evidence_provided = all(field in value for field in evidence_fields)
+        if any(field in value for field in evidence_fields) and not candidate_evidence_provided:
+            raise DispatcherError("invalid_input", "任务缺少完整候选资格交接字段（含 candidate_jql）")
         return cls(
             task=Task.from_dict(value),
             repository=require_text(value.get("repository"), "repository"),
@@ -335,6 +376,12 @@ class Assignment:
             parent_assignee=parent_assignee,
             gitnexus_report_path=Path(report_value) if report_value is not None else None,
             requirement_snapshot_path=Path(snapshot_value) if snapshot_value is not None else None,
+            candidate_eligible=candidate_eligible,
+            candidate_eligibility_reason=candidate_reason.strip() if isinstance(candidate_reason, str) else None,
+            candidate_jql=candidate_jql.strip() if isinstance(candidate_jql, str) else None,
+            reference_plan_source=reference_plan_source,
+            parent_reference_plan=parent_reference_plan.strip() if isinstance(parent_reference_plan, str) else None,
+            candidate_evidence_provided=candidate_evidence_provided,
             dispatch_flow=dispatch_flow,
         )
 
@@ -363,6 +410,11 @@ class Assignment:
             "parent_assignee": self.parent_assignee,
             "gitnexus_report_path": self.gitnexus_report_path.as_posix() if self.gitnexus_report_path else None,
             "requirement_snapshot_path": self.requirement_snapshot_path.as_posix() if self.requirement_snapshot_path else None,
+            "candidate_eligible": self.candidate_eligible,
+            "candidate_eligibility_reason": self.candidate_eligibility_reason,
+            "candidate_jql": self.candidate_jql,
+            "reference_plan_source": self.reference_plan_source,
+            "parent_reference_plan": self.parent_reference_plan,
             "dispatch_flow": self.dispatch_flow,
         }
 
@@ -421,6 +473,8 @@ class FlowStage:
     next_steps: tuple[str, ...] = ()
     requires_worktree: bool = True
     requires_snapshot: bool = True
+    requires_candidate_eligibility: bool = False
+    requires_reference_plan_candidate: bool = False
 
 
 @dataclass(frozen=True)
@@ -436,6 +490,8 @@ class DispatchFlow:
     next_steps: tuple[str, ...]
     requires_worktree: bool
     requires_snapshot: bool
+    requires_candidate_eligibility: bool = False
+    requires_reference_plan_candidate: bool = False
     query: str | None = None
 
 
@@ -445,6 +501,7 @@ class Config:
     projects_root: Path
     projects: Mapping[str, Project]
     branch_options: Mapping[str, str | None]
+    default_branch: str | None
     validate_branch: bool
     max_tasks: int
     max_agents: int
@@ -703,7 +760,7 @@ def parse_flow_stage(value: Any, index: int) -> FlowStage:
     stage = require_mapping(value, field)
     unknown = set(stage) - {
         "name", "command_template", "session_prompt", "fetch_prompt", "query",
-        "next_steps", "requires_worktree", "requires_snapshot",
+        "next_steps", "requires_worktree", "requires_snapshot", "requires_candidate_eligibility", "requires_reference_plan_candidate",
     }
     if unknown:
         raise DispatcherError("invalid_config", f"{field} 包含未知字段：{sorted(unknown)[0]}")
@@ -720,6 +777,8 @@ def parse_flow_stage(value: Any, index: int) -> FlowStage:
         next_steps=require_flow_steps(stage.get("next_steps"), f"{field}.next_steps"),
         requires_worktree=require_bool(stage.get("requires_worktree", True), f"{field}.requires_worktree"),
         requires_snapshot=require_bool(stage.get("requires_snapshot", True), f"{field}.requires_snapshot"),
+        requires_candidate_eligibility=require_bool(stage.get("requires_candidate_eligibility", False), f"{field}.requires_candidate_eligibility"),
+        requires_reference_plan_candidate=require_bool(stage.get("requires_reference_plan_candidate", False), f"{field}.requires_reference_plan_candidate"),
     )
 
 
@@ -748,6 +807,10 @@ def compose_flow(
         raise DispatcherError("invalid_config", f"流程 {name} 引用了未定义节点：{missing}")
     resolved = tuple(stages[stage_name] for stage_name in stage_names)
     command_template = next((stage.command_template for stage in reversed(resolved) if stage.command_template), None)
+    requires_candidate_eligibility = any(stage.requires_candidate_eligibility for stage in resolved)
+    requires_reference_plan_candidate = any(stage.requires_reference_plan_candidate for stage in resolved)
+    if requires_reference_plan_candidate and not requires_candidate_eligibility:
+        raise DispatcherError("invalid_config", f"流程 {name} 要求参考方案候选时必须同时要求候选资格")
     if command_template is None:
         raise DispatcherError("invalid_config", f"流程 {name} 引用的节点都未声明 command_template")
     return DispatchFlow(
@@ -760,6 +823,8 @@ def compose_flow(
         next_steps=tuple(step for stage in resolved for step in stage.next_steps),
         requires_worktree=all(stage.requires_worktree for stage in resolved),
         requires_snapshot=all(stage.requires_snapshot for stage in resolved),
+        requires_candidate_eligibility=requires_candidate_eligibility,
+        requires_reference_plan_candidate=requires_reference_plan_candidate,
         query=next((stage.query for stage in resolved if stage.query), None),
     )
 
@@ -833,6 +898,8 @@ def legacy_flow_registry(
             next_steps=steps or (previous.next_steps if previous else ()),
             requires_worktree=previous.requires_worktree if previous else True,
             requires_snapshot=previous.requires_snapshot if previous else True,
+            requires_candidate_eligibility=previous.requires_candidate_eligibility if previous else False,
+            requires_reference_plan_candidate=previous.requires_reference_plan_candidate if previous else False,
         )
         flows[flow_name] = compose_flow(
             flow_name,
@@ -953,6 +1020,7 @@ def load_config(config_file: Path | None = None) -> Config:
         projects_root=projects_root,
         projects=projects,
         branch_options=require_branch_mapping(base_branch.get("options", []), "base_branch.options"),
+        default_branch=require_optional_text(base_branch.get("default"), "base_branch.default"),
         validate_branch=require_bool(base_branch.get("validate"), "base_branch.validate"),
         max_tasks=require_integer(task_source.get("max_tasks"), "task_source.max_tasks", 1, 12),
         max_agents=require_integer(concurrency.get("max_agents"), "dispatch.concurrency.max_agents", 1, 12),
@@ -1204,6 +1272,32 @@ def staged_docs_root(assignment: Assignment) -> Path:
     return (assignment.repository_path.resolve() / STAGING_DIRECTORY / assignment.task.task_id / "docs" / "engineering").resolve()
 
 
+def validate_candidate_eligibility(assignment: Assignment, flow: DispatchFlow) -> None:
+    """候选资格是进入任意分发流程的硬门槛；仓库映射兜底不得替代它。"""
+    if not flow.requires_candidate_eligibility:
+        return
+    if not assignment.candidate_evidence_provided:
+        raise DispatcherError("candidate_evidence_missing", "任务缺少完整候选资格交接字段（含 candidate_jql）")
+    if assignment.candidate_eligible is not True or not assignment.candidate_eligibility_reason or not assignment.candidate_jql:
+        raise DispatcherError(
+            "candidate_ineligible",
+            "任务缺少已确认的候选资格；查询失败或资格未确认时不得进入仓库映射兜底",
+        )
+    if flow.requires_reference_plan_candidate:
+        plan = assignment.reference_plan if assignment.reference_plan_source == "task" else assignment.parent_reference_plan
+        if assignment.reference_plan_source not in {"task", "parent"} or not plan:
+            raise DispatcherError(
+                "proposal_candidate_ineligible",
+                "proposal 任务必须有任务或父任务参考方案，父子参考方案均为空时不得分发",
+            )
+    if assignment.reference_plan_source == "task" and not assignment.reference_plan:
+        raise DispatcherError("invalid_input", "reference_plan_source=task 时必须提供 reference_plan")
+    if assignment.reference_plan_source == "parent" and not assignment.parent_reference_plan:
+        raise DispatcherError("invalid_input", "reference_plan_source=parent 时必须提供 parent_reference_plan")
+    if assignment.reference_plan_source == "none" and (assignment.reference_plan or assignment.parent_reference_plan):
+        raise DispatcherError("invalid_input", "reference_plan_source=none 时不得提供参考方案字段")
+
+
 def validate_assignment(config: Config, assignment: Assignment, repositories: Mapping[str, Repository]) -> None:
     repository = repositories[assignment.repository]
     if repository.path.resolve() != assignment.repository_path.resolve():
@@ -1216,6 +1310,7 @@ def validate_assignment(config: Config, assignment: Assignment, repositories: Ma
     if assignment.task.task_url != expected_task_url:
         raise DispatcherError("invalid_input", "task_url 必须由 task_url_template 生成")
     flow = config.flow_for(assignment.dispatch_flow)
+    validate_candidate_eligibility(assignment, flow)
     docs_root = staged_docs_root(assignment)
     validate_gitnexus_report_path(config, assignment, docs_root)
     if assignment.requirement_snapshot_path is None:
@@ -1492,6 +1587,11 @@ class StateStore:
                 "source_assignee": assignment.source_assignee,
                 "parent_task_id": assignment.parent_task_id,
                 "parent_assignee": assignment.parent_assignee,
+                "candidate_eligible": assignment.candidate_eligible,
+                "candidate_eligibility_reason": assignment.candidate_eligibility_reason,
+                "candidate_jql": assignment.candidate_jql,
+                "reference_plan_source": assignment.reference_plan_source,
+                "parent_reference_plan": assignment.parent_reference_plan,
                 "gitnexus_report_path": assignment.gitnexus_report_path.as_posix() if assignment.gitnexus_report_path else None,
                 "requirement_snapshot_path": assignment.requirement_snapshot_path.as_posix() if assignment.requirement_snapshot_path else None,
                 "dispatch_flow": assignment.dispatch_flow,
@@ -1576,6 +1676,11 @@ class StateStore:
                 "send_observation": record.receipt.observation,
                 "send_process_incarnation": record.receipt.process_incarnation,
                 "dispatch_state": "turn_started" if record.receipt.turn_started else "input_accepted",
+                "candidate_eligible": assignment.candidate_eligible,
+                "candidate_eligibility_reason": assignment.candidate_eligibility_reason,
+                "candidate_jql": assignment.candidate_jql,
+                "reference_plan_source": assignment.reference_plan_source,
+                "parent_reference_plan": assignment.parent_reference_plan,
                 "gitnexus_report_path": assignment.gitnexus_report_path.as_posix() if assignment.gitnexus_report_path else None,
                 "requirement_snapshot_path": assignment.requirement_snapshot_path.as_posix() if assignment.requirement_snapshot_path else None,
                 "dispatched_at": utc_now(),
@@ -1804,7 +1909,9 @@ class OrcaClient:
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as error:
-            raise DispatcherError("orca_invalid_json", f"Orca CLI 未返回 JSON：{stdout[:200]}") from error
+            raise DispatcherError(
+                "orca_invalid_json", f"Orca CLI 未返回 JSON：{stdout[:200]}", orca_code="runtime_unavailable"
+            ) from error
         if not isinstance(payload, Mapping) or payload.get("ok") is not True:
             error = payload.get("error") if isinstance(payload, Mapping) else None
             safe_message = orca_error_message(error)
@@ -1973,6 +2080,14 @@ class OrcaClient:
         key = os.path.normcase(os.path.normpath(str(path.resolve())))
         return self.repo_ids().get(key)
 
+    def repo_base_branch(self, repository_id: str) -> str | None:
+        result = self._call("repo", "show", "--repo", f"id:{repository_id}")
+        repository = result.get("repo")
+        if not isinstance(repository, Mapping):
+            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 repo 对象")
+        value = repository.get("worktreeBaseRef")
+        return require_optional_text(value, "Orca repo.worktreeBaseRef")
+
     def worktree_create(
         self,
         name: str,
@@ -1987,11 +2102,25 @@ class OrcaClient:
         ]
         if base_branch:
             arguments.extend(["--base-branch", base_branch])
-        result = self._call(*arguments, timeout_seconds=ORCA_WORKTREE_TIMEOUT_SECONDS)
+        try:
+            result = self._call(*arguments, timeout_seconds=ORCA_WORKTREE_TIMEOUT_SECONDS)
+        except DispatcherError as error:
+            if error.code == "orca_invalid_json":
+                raise DispatcherError(
+                    error.code, error.message, orca_code="runtime_unavailable"
+                ) from error
+            raise
         worktree = result.get("worktree")
         if not isinstance(worktree, Mapping):
-            raise DispatcherError("orca_invalid_json", "Orca CLI 结果缺少 worktree 对象")
-        return self._worktree_from_payload(worktree)
+            raise DispatcherError(
+                "orca_invalid_json", "Orca CLI 结果缺少 worktree 对象", orca_code="runtime_unavailable"
+            )
+        try:
+            return self._worktree_from_payload(worktree)
+        except DispatcherError as error:
+            raise DispatcherError(
+                "orca_invalid_json", error.message, orca_code="runtime_unavailable"
+            ) from error
 
 def parse_send_receipt(result: Mapping[str, Any]) -> SendReceipt:
     """只读回执本身判定接受与起步，不把顶层 ok 当作接受证明。"""
@@ -2389,10 +2518,7 @@ def rename_worktree_branch(worktree_path: Path, branch: str) -> None:
 
 
 def base_branch_matches(worktree: OrcaWorktree, base_branch: str | None) -> bool:
-    """Orca 记录的 baseRef 可能是裸引用，也可能是 refs/heads/ 或 refs/remotes/ 全名。
-
-    实测：`--base-branch origin/release_9ji` 会被记成 `refs/remotes/origin/release_9ji`。
-    """
+    """Orca 记录的 baseRef 可能是裸引用，也可能是 refs/heads/ 或 refs/remotes/ 全名。"""
     if base_branch is None:
         return True
     return worktree.base_branch in {
@@ -2421,6 +2547,23 @@ def validate_task_worktree(
         raise DispatcherError("worktree_base_branch_mismatch", "工作区基础分支与任务分支不一致")
 
 
+def resolve_worktree_base_branch(
+    config: Config,
+    orca: OrcaClient,
+    repository_id: str,
+    assignment: Assignment,
+) -> Assignment:
+    if assignment.base_branch is not None:
+        return assignment
+    resolver = getattr(orca, "repo_base_branch", None)
+    if not callable(resolver):
+        raise DispatcherError("worktree_base_branch_unknown", "无法确认 Orca 仓库默认基础分支")
+    default_branch = retry_read(config, lambda: resolver(repository_id))
+    if not default_branch:
+        raise DispatcherError("worktree_base_branch_unknown", "Orca 未返回仓库默认基础分支")
+    return replace(assignment, base_branch=default_branch)
+
+
 def ensure_worktree_branch(repository: Repository, assignment: Assignment, worktree: OrcaWorktree) -> None:
     """把分支收敛到 <用户名>/<工作区名>；Orca 的初始名视为创建未完成的中间态。"""
     expected = worktree_branch_for(assignment, repository)
@@ -2432,6 +2575,17 @@ def ensure_worktree_branch(repository: Repository, assignment: Assignment, workt
     rename_worktree_branch(worktree.path, expected)
     if git_current_branch(worktree.path) != expected:
         raise DispatcherError("worktree_branch_mismatch", "无法确认工作区目标分支")
+
+
+def settle_worktree_branch(
+    repository: Repository,
+    assignment: Assignment,
+    worktree: OrcaWorktree,
+    active_terminals: tuple[OrcaTerminal, ...],
+) -> None:
+    if active_terminals:
+        return
+    ensure_worktree_branch(repository, assignment, worktree)
 
 
 def cleanup_suffix_worktrees(
@@ -2541,7 +2695,7 @@ def observe_created_worktree(
                     # 资源一确认就先落状态，之后任何失败都能人工核对到实际工作区。
                     store.mark_worktree_prepared(assignment, worktree)
                     active_terminals = active_agent_terminals(config, orca, worktree)
-                    ensure_worktree_branch(repository, assignment, worktree)
+                    settle_worktree_branch(repository, assignment, worktree, active_terminals)
                     return PreparedWorktree(worktree, active_terminals, (
                         *(() if active_terminals else sync_worktree_files(repository, worktree.path)),
                         *warnings,
@@ -2579,7 +2733,7 @@ def prepare_task_worktree(
         validate_task_worktree(worktree, assignment, repository_id)
         active_terminals = active_agent_terminals(config, orca, worktree)
         store.mark_worktree_prepared(assignment, worktree)
-        ensure_worktree_branch(repository, assignment, worktree)
+        settle_worktree_branch(repository, assignment, worktree, active_terminals)
         return PreparedWorktree(
             worktree,
             active_terminals,
@@ -2665,6 +2819,129 @@ def relocate_requirement_artifacts(
         requirement_snapshot_path=relocated_snapshot,
         gitnexus_report_path=relocated_report,
     )
+
+
+def worktree_create_assignment(
+    config: Config,
+    task_id: str,
+    repository_name: str,
+    base_branch: str | None,
+    worktree_slug: str | None,
+) -> tuple[Repository, Assignment]:
+    repository_name = require_text(repository_name, "repository")
+    repository = configured_repository(config, repository_name)
+    if repository is None:
+        raise DispatcherError("repository_not_found", f"未找到配置仓库：{repository_name}")
+    branch = base_branch.strip() if isinstance(base_branch, str) and base_branch.strip() else config.default_branch
+    if branch is not None:
+        if branch not in config.branches_for(repository.name):
+            raise DispatcherError("invalid_branch", f"{branch} 不在 {repository.name} 的配置白名单中")
+        if config.validate_branch and not branch_exists(repository, branch):
+            raise DispatcherError("branch_not_found", f"{branch} 在 {repository.name} 中不存在")
+    slug = require_worktree_slug(worktree_slug) if worktree_slug is not None else None
+    task = require_task_id(task_id)
+    return repository, Assignment(
+        task=Task(task, task, task_url_for(config.task_url_template, task)),
+        repository=repository.name,
+        repository_path=repository.path,
+        base_branch=branch,
+        worktree_slug=slug,
+    )
+
+
+def create_or_reuse_task_worktree(
+    config: Config,
+    orca: OrcaClient,
+    repository: Repository,
+    assignment: Assignment,
+) -> dict[str, object]:
+    store = StateStore(config.state_file)
+    with store.launch_lock(force_unlock=False):
+        return _create_or_reuse_task_worktree(config, orca, repository, assignment)
+
+
+def _create_or_reuse_task_worktree(
+    config: Config,
+    orca: OrcaClient,
+    repository: Repository,
+    assignment: Assignment,
+) -> dict[str, object]:
+    repository_id = ensure_repository_registered(orca, repository)
+    assignment = resolve_worktree_base_branch(config, orca, repository_id, assignment)
+    expected_name = worktree_name_for(assignment)
+    worktrees = retry_read(config, lambda: orca.worktrees(repository_id))
+    conflict = creation_conflict_error(worktrees, assignment, repository_id, None)
+    if conflict is not None:
+        raise conflict
+    matching = tuple(worktree for worktree in worktrees if worktree.path.name == expected_name)
+    if len(matching) > 1:
+        raise DispatcherError("worktree_identity_mismatch", "存在多个同名任务工作区")
+    warnings: tuple[str, ...] = ()
+    reused = bool(matching)
+    if reused:
+        worktree = matching[0]
+        validate_task_worktree(worktree, assignment, repository_id)
+    else:
+        try:
+            worktree = orca.worktree_create(
+                name=expected_name,
+                repository_id=repository_id,
+                base_branch=assignment.base_branch,
+                comment=worktree_comment_for(assignment),
+            )
+        except DispatcherError as error:
+            if error.orca_code not in ORCA_TRANSPORT_ERRORS:
+                raise
+            retry_log(f"创建回执未收到（{error.orca_code}）；只读等待原名工作区就绪，不重发创建")
+            worktree = observe_created_worktree_resource(
+                config, orca, repository, assignment, repository_id, None
+            )
+            warnings = (WORKTREE_RECEIPT_RECOVERED,)
+        else:
+            worktree = observe_created_worktree_resource(
+                config, orca, repository, assignment, repository_id, worktree.worktree_id
+            )
+    active_terminals = active_agent_terminals(config, orca, worktree)
+    settle_worktree_branch(repository, assignment, worktree, active_terminals)
+    if not active_terminals:
+        warnings = (*sync_worktree_files(repository, worktree.path), *warnings)
+    return {
+        "task_id": assignment.task.task_id,
+        "repository": repository.to_dict(),
+        "worktree_name": expected_name,
+        "worktree_id": worktree.worktree_id,
+        "worktree_path": worktree.path.as_posix(),
+        "branch": git_current_branch(worktree.path),
+        "base_branch": assignment.base_branch,
+        "reused": reused,
+        "warnings": list(warnings),
+    }
+
+
+def observe_created_worktree_resource(
+    config: Config,
+    orca: OrcaClient,
+    repository: Repository,
+    assignment: Assignment,
+    repository_id: str,
+    expected_worktree_id: str | None,
+) -> OrcaWorktree:
+    name = worktree_name_for(assignment)
+    deadline = time.monotonic() + ORCA_WORKTREE_TIMEOUT_SECONDS
+    while True:
+        worktrees = retry_read(config, lambda: orca.worktrees(repository_id))
+        conflict = creation_conflict_error(worktrees, assignment, repository_id, expected_worktree_id)
+        if conflict is not None:
+            raise conflict
+        exact = tuple(worktree for worktree in worktrees if worktree.path.name == name)
+        if exact and worktree_git_ready(exact[0].path):
+            return exact[0]
+        if time.monotonic() >= deadline:
+            raise DispatcherError(
+                "worktree_creation_unconfirmed",
+                f"未在期限内确认工作区 {name}；资源保持不动，请人工核对",
+            )
+        time.sleep(ORCA_WORKTREE_POLL_SECONDS)
 
 
 def launch(
@@ -3104,6 +3381,7 @@ def validate_decision_values(tasks: object, default_flow: str) -> tuple[Mapping[
     decision_fields = {
         "task_id", "title", "description", "task_url", "assignee", "tenant", "tenant_slug",
         "source_task_id", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan",
+        "candidate_eligible", "candidate_eligibility_reason", "candidate_jql", "reference_plan_source", "parent_reference_plan",
         "dispatch_flow", "gitnexus_report_path", "requirement_snapshot_path", "repository", "base_branch", "worktree_slug",
     }
     values: list[Mapping[str, Any]] = []
@@ -3174,6 +3452,7 @@ def decision_result(identity: Mapping[str, object], status: str, **extra: object
 
 def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict[str, object]:
     """校验外部调研后的显式路由，不执行语义匹配或任何外部调用。"""
+    values = tuple(dict(value) for value in values)
     repositories = repositories_by_name(config)
     tenant_sets: dict[tuple[str, str], set[str]] = {}
     for value in values:
@@ -3196,6 +3475,30 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
             "assignment_id": legacy_state_key(task.task_id, tenant_slug),
             "dispatch_flow": dispatch_flow,
         }
+        flow = config.flow_for(dispatch_flow)
+        if flow.requires_candidate_eligibility:
+            evidence_fields = ("candidate_eligible", "candidate_eligibility_reason", "candidate_jql", "reference_plan_source")
+            if not all(field in value for field in evidence_fields):
+                results.append(decision_result(identity, "needs_confirmation", reason="任务缺少完整候选资格交接字段（含 candidate_jql）"))
+                continue
+            eligible = value.get("candidate_eligible")
+            reason = value.get("candidate_eligibility_reason")
+            jql = value.get("candidate_jql")
+            if eligible is not True or not isinstance(reason, str) or not reason.strip() or not isinstance(jql, str) or not jql.strip():
+                results.append(decision_result(identity, "needs_confirmation", reason="任务缺少已确认的候选资格；查询失败或资格未确认时不得进入仓库映射兜底"))
+                continue
+        if flow.requires_reference_plan_candidate:
+            source = value.get("reference_plan_source")
+            task_plan = value.get("reference_plan")
+            parent_plan = value.get("parent_reference_plan")
+            has_plan = (
+                source == "task" and isinstance(task_plan, str) and bool(task_plan.strip())
+            ) or (
+                source == "parent" and isinstance(parent_plan, str) and bool(parent_plan.strip())
+            )
+            if not has_plan:
+                results.append(decision_result(identity, "needs_confirmation", reason="proposal 任务必须有任务或父任务参考方案，且来源字段必须一致"))
+                continue
         repository_name = value.get("repository")
         if repository_name is not None and (not isinstance(repository_name, str) or not repository_name.strip()):
             raise DispatcherError("invalid_input", "repository 必须是字符串或省略")
@@ -3306,13 +3609,32 @@ def decide_values(config: Config, values: tuple[Mapping[str, Any], ...]) -> dict
                 ))
                 continue
 
-        assignment = Assignment.from_dict({
-            **value,
-            "repository": repository.name,
-            "repository_path": repository.path.as_posix(),
-            "base_branch": branch,
-        }, config.default_flow)
+        try:
+            assignment = Assignment.from_dict({
+                **value,
+                "repository": repository.name,
+                "repository_path": repository.path.as_posix(),
+                "base_branch": branch,
+            }, config.default_flow)
+        except DispatcherError as error:
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason=error.message,
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
+            continue
         flow = config.flow_for(assignment.dispatch_flow)
+        try:
+            validate_candidate_eligibility(assignment, flow)
+        except DispatcherError as error:
+            results.append(decision_result(
+                identity,
+                "needs_confirmation",
+                reason=error.message,
+                candidates={"repositories": [repository.to_dict()], "base_branches": branches},
+            ))
+            continue
         if assignment.requirement_snapshot_path is None and flow.requires_snapshot:
             results.append(decision_result(
                 identity,
@@ -3387,8 +3709,8 @@ def task_source_prompt(
         "dispatch_flow": resolved.name,
         "proposal_command": resolved.command_template if resolved.name == "proposal" else None,
         "jql_semantics": "native_jql_then_parent_post_filter",
-        # 父项字段不写死：各流程的查询条件可能指向不同字段，取该流程条件里父项条件所用的那一个。
-        "parent_lookup": {"relation": "parent", "field": "查询条件里父项条件所用的同一个字段", "required": True},
+        # 父项字段不写死：各流程的查询条件可能指向不同字段，统一取配置的参考方案字段。
+        "parent_lookup": {"relation": "parent", "field": config.reference_plan_field or "未配置", "required": True},
         "post_filter": "该字段在子任务或父任务上非空",
         "next_steps": list(resolved.next_steps),
     }
@@ -3403,7 +3725,9 @@ def config_summary(config: Config) -> dict[str, object]:
         "state_file": config.state_file.as_posix(),
         "default_flow": config.default_flow,
         "flows": [
-            {"name": flow.name, "stages": list(flow.stage_names), "default": flow.is_default}
+            {"name": flow.name, "stages": list(flow.stage_names), "default": flow.is_default,
+             "requires_candidate_eligibility": flow.requires_candidate_eligibility,
+             "requires_reference_plan_candidate": flow.requires_reference_plan_candidate}
             for flow in config.flows.values()
         ],
         "stages": [{"name": stage.name} for stage in config.stages.values()],
@@ -3441,6 +3765,14 @@ def build_parser(flow_names: tuple[str, ...] | None = None) -> argparse.Argument
             "读取 version=1 的 JSON：顶层仅包含 version 与 tasks。每项任务必须提供 task_id、title、task_url，"
             "可选 description、assignee、tenant、tenant_slug、source_task_id、source_assignee、parent_task_id、parent_assignee、"
             "reference_plan、gitnexus_report_path，并由外部流程提供 repository 与 base_branch。\n"
+            "流程要求候选资格时（节点声明 requires_candidate_eligibility: true）还必须提供完整的 "
+            "candidate_eligible、candidate_eligibility_reason、candidate_jql、reference_plan_source；"
+            "proposal 还要求 reference_plan 或 parent_reference_plan 与 reference_plan_source 一致。\n"
+            "不用 --input 时是单任务模式，必须提供 --task-id、--title、--task-url、--repository，例如：\n"
+            "  dispatcher.py decide --task-id CW-7622 --title \"任务标题\" --task-url https://jira.example/CW-7622"
+            " --repository finance --base-branch origin/release --dispatch-flow direct --source-task-id CW-7624"
+            " --candidate-eligible --candidate-eligibility-reason \"JQL 通过\" --candidate-jql \"status = 待开发\""
+            " --reference-plan-source none\n"
             "该命令不调用 Jira、GitNexus 或 Orca，不创建 worktree，不写运行状态；无法确认的任务返回 needs_confirmation。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3453,13 +3785,19 @@ def build_parser(flow_names: tuple[str, ...] | None = None) -> argparse.Argument
         ("source-task-id", {"dest": "source_task_id"}), ("description", {}), ("assignee", {}),
         ("tenant", {}), ("tenant-slug", {"dest": "tenant_slug"}), ("source-assignee", {"dest": "source_assignee"}),
         ("parent-task-id", {"dest": "parent_task_id"}), ("parent-assignee", {"dest": "parent_assignee"}),
-        ("reference-plan", {"dest": "reference_plan"}), ("gitnexus-report-path", {"dest": "gitnexus_report_path"}),
+        ("reference-plan", {"dest": "reference_plan"}),
+        ("candidate-eligible", {"dest": "candidate_eligible", "action": "store_true", "default": None}),
+        ("candidate-eligibility-reason", {"dest": "candidate_eligibility_reason"}),
+        ("candidate-jql", {"dest": "candidate_jql"}),
+        ("reference-plan-source", {"dest": "reference_plan_source"}),
+        ("parent-reference-plan", {"dest": "parent_reference_plan"}),
+        ("gitnexus-report-path", {"dest": "gitnexus_report_path"}),
         ("requirement-snapshot-path", {"dest": "requirement_snapshot_path"}), ("worktree-slug", {"dest": "worktree_slug"}),
     ):
         decide_parser.add_argument(f"--{name}", **kwargs)
     launch_parser = commands.add_parser(
         "launch",
-        help="建工作区、同步文件并启动受监督 worker",
+        help="建工作区、同步文件并启动普通 Claude 会话",
         description=(
             "输入 JSON 顶层只能为 tasks 列表，每项任务字段：\n"
             "  task_id（必填，字符串）：任务唯一标识\n"
@@ -3476,15 +3814,28 @@ def build_parser(flow_names: tuple[str, ...] | None = None) -> argparse.Argument
             "  dispatch_flow（可选，字符串）：分发流程；省略时为 complete，状态去重 identity 包含该字段\n"
             "  source_task_id（可选，字符串或 null）：归一化前的 Jira 开发子任务编号\n"
             "  source_assignee（可选，字符串或 null）：归一化前开发子任务的 Jira 负责人\n"
-            "  parent_task_id（可选，字符串或 null）：关联父产品需求编号\n"
+            "  parent_task_id（可选，字符串或 null）：关联父产品需求编号；必须省略或等于 task_id，提供时须同时给出 source_task_id\n"
             "  parent_assignee（可选，字符串或 null）：父产品需求负责人，仅作上下文\n"
-            "  requirement_snapshot_path（必填，字符串）：已校验的完整原始需求快照绝对路径，随任务上下文发送以复用正文与附件本体；缺失或不完整必须阻断该任务\n"
-            "每个任务都在独立 linked worktree 中启动独立受监督 worker；工作区由 Orca 创建、dev-spec-gen 同步。"
+            "  requirement_snapshot_path（流程声明 requires_snapshot: true 时必填，字符串）：已校验的完整原始需求快照绝对路径，随任务上下文发送以复用正文与附件本体；缺失或不完整必须阻断该任务\n"
+            "  candidate_eligible / candidate_eligibility_reason / candidate_jql / reference_plan_source（流程要求候选资格时必填）：\n"
+            "    由 Jira 节点逐任务交接的候选资格证据；缺任一字段时该流程的任务被拒绝\n"
+            "  reference_plan / parent_reference_plan（可选，字符串或 null）：参考方案文本，必须与 reference_plan_source 一致\n"
+            "每个任务都在独立 linked worktree 中启动普通 Claude 会话；工作区由 Orca 创建、dev-spec-gen 同步。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     launch_parser.add_argument("--input", type=Path, required=True)
     launch_parser.add_argument("--force-unlock", action="store_true")
+    worktree_parser = commands.add_parser("worktree", help="管理任务工作区")
+    worktree_commands = worktree_parser.add_subparsers(dest="worktree_command", required=True)
+    worktree_create_parser = worktree_commands.add_parser(
+        "create",
+        help="通过 Orca 创建或复用任务 worktree，并执行 dev-spec-gen 同步",
+    )
+    worktree_create_parser.add_argument("--task-id", required=True, help="任务编号；用于稳定工作区名称和归属标记")
+    worktree_create_parser.add_argument("--repository", required=True, help="配置中的仓库名")
+    worktree_create_parser.add_argument("--base-branch", help="可选基础分支；省略时使用配置默认值或 Orca 仓库默认")
+    worktree_create_parser.add_argument("--worktree-slug", help="可选的 1–2 个英文小写 kebab 词")
     reset = commands.add_parser("reset", help="允许任务重新分发")
     reset.add_argument("task_id")
     reset.add_argument("--force-unlock", action="store_true")
@@ -3557,7 +3908,7 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
     if arguments.command == "task-source":
         return task_source_prompt(config, arguments.jql, arguments.flow)
     if arguments.command == "decide":
-        cli_fields = ("task_id", "title", "task_url", "repository", "base_branch", "dispatch_flow", "source_task_id", "description", "assignee", "tenant", "tenant_slug", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan", "gitnexus_report_path", "requirement_snapshot_path", "worktree_slug")
+        cli_fields = ("task_id", "title", "task_url", "repository", "base_branch", "dispatch_flow", "source_task_id", "description", "assignee", "tenant", "tenant_slug", "source_assignee", "parent_task_id", "parent_assignee", "reference_plan", "candidate_eligible", "candidate_eligibility_reason", "candidate_jql", "reference_plan_source", "parent_reference_plan", "gitnexus_report_path", "requirement_snapshot_path", "worktree_slug")
         supplied = {name: getattr(arguments, name) for name in cli_fields if getattr(arguments, name) is not None}
         if arguments.input is not None:
             if supplied:
@@ -3568,6 +3919,19 @@ def execute(arguments: argparse.Namespace) -> dict[str, object]:
         if missing is not None:
             raise DispatcherError("invalid_input", f"缺少单任务参数：--{missing.replace('_', '-')}")
         return decide_values(config, validate_decision_values([supplied], config.default_flow))
+    if arguments.command == "worktree":
+        if arguments.worktree_command == "create":
+            orca = OrcaClient()
+            repository, assignment = worktree_create_assignment(
+                config,
+                arguments.task_id,
+                arguments.repository,
+                arguments.base_branch,
+                arguments.worktree_slug,
+            )
+            retry_read(config, orca.status)
+            return create_or_reuse_task_worktree(config, orca, repository, assignment)
+        raise DispatcherError("invalid_command", f"未知 worktree 子命令：{arguments.worktree_command}")
     if arguments.command == "reset":
         removed = store.reset_entry(
             arguments.task_id,

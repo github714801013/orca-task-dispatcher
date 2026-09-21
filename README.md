@@ -41,7 +41,7 @@ Windows 可在资源管理器中复制 `config/dispatcher.example.yaml` 并重�
 - `dispatch.terminal.read_retry_*`：Orca 只读查询的重试次数与间隔。启动命令固定为 `claude`，由 `launch` 通过 `orca terminal create --command claude` 显式启动，配置不再提供 `agent_commands` / `agent_extra_args`。
 - `base_branch.options`
 - `task_source.task_url_template`、`query`、`fetch_prompt`；`task_source.reference_plan_field` 填写 Jira 中“参考方案”字段的实际字段 ID（如 `customfield_12345`）或字段名，该映射只写在配置中，脚本不内置任何具体 Jira 字段 ID；字段未配置或值为空时可省略 `reference_plan`，不得伪造字段值
-- 配置顶层的 `stages:` 与 `flows:` 流程注册表；提示词整体只按流程引用节点的 `command_template` 渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`、`{source_task_id}`、`{source_assignee}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身。`{source_task_id}` 是来源开发子任务编号（缺省回退 `{task_id}`）、`{source_assignee}` 是其负责人（未归一化的任务回退到 `{assignee}`，归一化后缺少来源负责人时留空），proposal 模板用这两行下发用户任务编号与当前用户名
+- 配置顶层的 `stages:` 与 `flows:` 流程注册表；提示词整体只按流程引用节点的 `command_template` 渲染，不硬编码在脚本中。任务上下文字段（`{title}`、`{description}`、`{assignee}`、`{tenant}`、`{assignment_id}`、`{reference_plan}`、`{gitnexus_report_path}`、`{requirement_snapshot_path}`、`{source_task_id}`、`{source_assignee}`）与 `{task_url}`、`{task_id}`、`{base_branch}` 合并进同一模板，字段值为空的行会被省略；有父产品需求时任务已归一化为产品需求本身。`task_id` 必须是上游归一化后的实际需求编号；`source_task_id` 是来源开发子任务编号（缺省回退 `{task_id}`），`parent_task_id` 必须省略或等于 `task_id`，仅作父需求上下文，Dispatcher 不会根据它自动替换 `task_id`；一旦提供 `parent_task_id`，就必须同时提供 `source_task_id`。`{source_assignee}` 是其负责人（未归一化的任务回退到 `{assignee}`，归一化后缺少来源负责人时留空），proposal 模板用这两行下发用户任务编号与当前用户名
 
 `config/dispatcher.yaml` 与根目录 `config.yml` 都是本地文件，已被忽略，**不要提交**。不要在配置或任务输入中保存令牌、密码、Cookie、内部域名、内部路径或运行状态。
 
@@ -61,26 +61,45 @@ uv run --project . python scripts/dispatcher.py validate
 uv run --project . python scripts/dispatcher.py repos
 uv run --project . python scripts/dispatcher.py task-source --flow complete
 uv run --project . python scripts/dispatcher.py task-source --flow direct --jql "project = DEMO AND status = ready"
-uv run --project . python scripts/dispatcher.py decide --task-id CW-7622 --source-task-id CW-7624 --title "任务标题" --task-url "https://jira.example/CW-7622" --repository finance --base-branch origin/release_saas --dispatch-flow direct
+uv run --project . python scripts/dispatcher.py decide --task-id CW-7622 --source-task-id CW-7624 --title "任务标题" --task-url "https://jira.example/CW-7622" --repository finance --base-branch origin/release_saas --dispatch-flow direct --candidate-eligible --candidate-eligibility-reason "JQL 通过" --candidate-jql "issuetype = 开发需求 AND status = 待开发" --reference-plan-source none
 uv run --project . python scripts/dispatcher.py decide --input decision.json
 uv run --project . python scripts/dispatcher.py state
 uv run --project . python scripts/dispatcher.py state --dispatch-flow direct
 uv run --project . python scripts/dispatcher.py recover --task-id TASK-123 --dispatch-flow complete
 uv run --project . python scripts/dispatcher.py reset TASK-123 --dispatch-flow proposal
 uv run --project . python scripts/dispatcher.py branches --repository example-repository
+uv run --project . python scripts/dispatcher.py worktree create --task-id TASK-123 --repository example-repository --base-branch main --worktree-slug fix-login
 ```
 
 推荐流程：
 
 1. 运行 `validate` 验证配置和候选仓库。
-2. 运行 `task-source` 获取该流程的默认 JQL 与字段契约（节点声明 `query` 时用它，否则用 `task_source.query`，`--jql` 可临时覆盖，输出里的 `jql_source` 标明取自 `cli` / `flow` / `config`）；由外部 Jira 工具实际拉取开发需求，逐条解析父产品需求，保留实际任务、来源子任务、标题、描述、负责人和参考方案。参考方案按配置 `task_source.reference_plan_field` 指定的 Jira 字段读取并在非空时映射为 `reference_plan`；未配置或值为空时可省略，参考方案缺失不阻断项目与分支的联合决策。
+2. 运行 `task-source` 获取该流程的默认 JQL 与字段契约（节点声明 `query` 时用它，否则用 `task_source.query`，`--jql` 可临时覆盖，输出里的 `jql_source` 标明取自 `cli` / `flow` / `config`）；由外部 Jira 工具实际拉取任务，必须先通过当前流程候选资格筛选，逐条保留 `candidate_eligible`、`candidate_eligibility_reason`、`reference_plan_source`、参考方案字段和 `candidate_jql`。原始 JQL 及等价转换再次解析均失败时本轮没有可用任务，必须整轮停止并如实记录，禁止改用过宽基础 JQL 继续取候选。proposal 要求任务或父任务有参考方案；direct 可不带参考方案，但两者都必须有资格证据。
 3. 运行 `state`，跳过相同任务、租户和流程已是 `dispatched` 的分发；`launching` 或 `requires_manual_reset` 按现有规则处理。direct、complete、proposal 在同一任务/租户下拥有独立状态，支持 `state --dispatch-flow <flow>` 筛选。单个任务暂停不得阻塞其他任务。
-4. 对每个可处理任务，先读取完整 Jira 原始需求与全部附件本体：完整性校验失败时该任务不得进入 GitNexus 调研或分发。需求快照临时保存于 `.runtime/requirements/<实际-task-id>/`；图片在 Markdown 中保留 OCR 文本与语义描述，其他附件保留原件并由 Markdown 索引相对路径、SHA-256 与可读性状态。需求正文、附件或参考方案中指向其他系统的链接（如语雀）必须用该系统对应的专用工具读取，禁止用 WebFetch 等通用网页抓取直接读取；读到的正文同样归档进快照并索引来源 URL 与 SHA-256，工具不可用、无权限或读取/归档校验失败时该任务按 incomplete 阻断，不得跳过链接继续。随后由外部子 Agent 进行一次跨项目、只读的 GitNexus 远程调研，不创建 worktree；报告返回候选、证据和排除理由，作为路由的兜底证据。仓库、租户和基础分支以参考方案（`task_source.reference_plan_field`，如 `customfield_11103`）为准：从参考方案提取「人员—项目/技术栈」分工，与当前子任务负责人对应后映射到配置候选，命中即采用、不得被其他证据推翻；只有参考方案缺失或无法映射到配置候选时，才回退用 GitNexus 报告、任务标题/描述、子任务负责人、父产品需求及 `repos`、`branches` 描述联合决策。同一 Jira 实际任务命中多个项目或租户时，保留同一个 `task_id`，但展开为多条 tenant assignment；例如 saasoanew 的九讯云（智乐方）与易腾各一条，oanew 与 saasoanew 同时命中时也各一条。项目配置的 `branch_priority` 优先于普通分支候选，例如项目内同时命中九机与九讯云（智乐方）时选择 `release_saas`。
-5. 通过 `decide` 校验外部联合决策：可以使用单任务 CLI 参数直接传入 `dispatch-flow direct` 与 `source-task-id`，也可以使用旧版 `--input`。禁止手工重建或删减字段；直接使用返回 JSON 的 `launch_input` 作为后续 `launch` 输入。该命令只校验显式项目/分支，不调用 Jira、GitNexus 或 Orca，也不写分发状态。若输出 `needs_confirmation`，仅暂停对应任务并补充人工决策后重跑；绝不以候选顺序猜测项目或分支。
+4. 对每个已经通过当前流程候选资格的任务，先读取完整 Jira 原始需求与全部附件本体：完整性校验失败时该任务不得进入 GitNexus 调研或分发。需求快照临时保存于 `.runtime/requirements/<实际-task-id>/`；图片在 Markdown 中保留 OCR 文本与语义描述，其他附件保留原件并由 Markdown 索引相对路径、SHA-256 与可读性状态。需求正文、附件或参考方案中指向其他系统的链接（如语雀）必须用该系统对应的专用工具读取，禁止用 WebFetch 等通用网页抓取直接读取；读到的正文同样归档进快照并索引来源 URL 与 SHA-256，工具不可用、无权限或读取/归档校验失败时该任务按 incomplete 阻断，不得跳过链接继续。随后由外部子 Agent 进行一次跨项目、只读的 GitNexus 远程调研，不创建 worktree；报告返回候选、证据和排除理由，仅用于已合格任务的仓库映射兜底。仓库、租户和基础分支优先以参考方案映射；只有资格已通过但映射不唯一时，才回退用 GitNexus 报告、任务标题/描述、子任务负责人、父产品需求及 `repos`、`branches` 描述解决映射。
+5. 通过 `decide` 校验外部联合决策：输入必须保留 Jira 节点给出的候选资格证据，禁止手工重建或删减字段；直接使用返回 JSON 的 `launch_input`。`decide` 不调用 Jira、GitNexus 或 Orca，也不重新查询资格，但会拒绝缺资格、资格为 false，以及 proposal 父子参考方案均为空的任务；显式 repository/base_branch 不能替代资格。若输出 `needs_confirmation`，仅暂停对应任务。
 6. 把每个任务的需求快照、附件与调研报告暂存到源仓库的 `<源仓库>/.runtime/<实际-task-id>/docs/engineering/` 下，布局与工作区内的 `docs/engineering` 完全同构：快照写 `specs/`、附件写 `attachments/<实际-task-id>/`、调研报告写 `research/`；`requirement_snapshot_path` 与 `gitnexus_report_path` 都指向该暂存目录下的绝对路径。
 7. 将 `decide` 的 `launch_input` 中 selected 任务保存为 `tasks.json`，执行 `launch`：Dispatcher 会按任务依次确保源仓库已在 Orca 注册、`orca worktree create` 建工作区、把分支改名为 `<用户名>/<工作区名>`、复用 dev-spec-gen 的 worktree sync 同步未托管内容与 IDE 配置、把暂存制品迁入工作区并校验，最后用 `orca terminal create --command claude` 开启开发会话并投递一次任务文本。
 
-GitNexus 调研发生在“实际任务归一化、state 校验”之后和项目/分支锁定、worktree 创建之前。调研或报告失败只暂停当前任务，其他明确任务继续。Dispatcher 本身只校验最终确认输入、状态和终端，不执行 Jira 查询或 GitNexus 语义匹配。
+候选资格是硬门槛：Jira 节点必须交接 `candidate_eligible`、`candidate_eligibility_reason`、`reference_plan_source`、`reference_plan`/`parent_reference_plan` 和 `candidate_jql`。原始 JQL 与等价转换再次解析均失败时阻断，禁止用过宽基础 JQL 继续取候选；proposal 要求任务或父任务参考方案非空，direct/complete 不要求参考方案但同样要求资格为真。`decide` 不调用 Jira，但会拒绝缺资格或资格为假的输入；显式仓库、分支、快照不能替代资格。
+
+GitNexus 调研发生在候选资格与 state 校验之后和项目/分支锁定、worktree 创建之前，只为已合格任务解决仓库映射不确定性；它不能赋予候选资格。调研或报告失败只暂停当前任务，其他明确任务继续。
+
+## 直接创建任务工作区
+
+需要在分发前单独准备 Orca 工作区时，使用结构化 CLI：
+
+```bash
+uv run --project . python scripts/dispatcher.py worktree create \
+  --task-id TASK-123 \
+  --repository example-repository \
+  --base-branch main \
+  --worktree-slug fix-login
+```
+
+命令固定执行：配置/分支白名单校验 → 确保源仓库已注册到 Orca → 按稳定名称创建或严格复用 → 分支收敛为 `<git用户名拼音>/<任务编号>-<slug>` → dev-spec-gen `--sync-only`。`--base-branch` 省略时使用 `base_branch.default`；若默认配置也为空，必须先读取并确认 Orca 仓库默认基础分支，无法确认时阻断，不会按任意 baseRef 复用；`--worktree-slug` 省略时工作区名即任务编号。结果返回 `worktree_id`、`worktree_path`、`branch`、`base_branch`、`reused` 和 `warnings`。
+
+该命令不写 Dispatcher task state（仅复用 `.runtime/launch.lock` 防止同一 Dispatcher 并发创建），不迁移任务制品，不创建终端，不发送提示词。已有同名工作区只有 repo/comment/base/branch 身份全部一致时才返回 `reused=true`；存在活动 Claude 会话不阻止复用，因为命令不操作终端。创建回执丢失时只读等待原名工作区，绝不二次创建；身份冲突和自动后缀都明确失败。
 
 ## 启动任务
 
@@ -97,6 +116,11 @@ GitNexus 调研发生在“实际任务归一化、state 校验”之后和项�
       "repository_path": "/path/to/projects/example-repository",
       "base_branch": "main",
       "worktree_slug": "fix-login",
+      "source_task_id": "TASK-124",
+      "candidate_eligible": true,
+      "candidate_eligibility_reason": "JQL 解析并执行成功",
+      "candidate_jql": "issuetype = 开发需求 AND status = 待开发",
+      "reference_plan_source": "none",
       "requirement_snapshot_path": "/path/to/projects/example-repository/.runtime/TASK-123/docs/engineering/specs/2026-09-16-example-raw-requirements.md"
     }
   ]
@@ -113,7 +137,7 @@ uv run --project . python scripts/dispatcher.py launch --input tasks.json
 
 同一 `task_id` 可通过不同 `tenant` 与 `tenant_slug` 形成独立 `assignment_id`（`<task_id>::<tenant_slug>`），从而分别创建工作区与运行状态；同一任务/租户下的 `direct`、`complete`、`proposal` 则共享对外 `assignment_id`，但使用独立内部状态 identity（`<task_id>::<tenant_slug>::flow::<dispatch_flow>`），可并发分发、共享同一稳定工作区。`state`、`recover`、`reset` 均支持 `--dispatch-flow <流程名>`；省略时仅在唯一流程匹配时兼容，多流程会报歧义。这三个只读/复位命令同样接受已从注册表删除的历史流程名（只按字符串匹配已有状态），而 `task-source --flow`、`decide --dispatch-flow`、`launch` 只接受注册表中的流程，未注册会直接报错并列出当前可用流程。旧状态缺少流程字段时仅按 `complete` 解释。`tenant_slug=legacy` 为旧单租户输入的保留值，指定租户时不得使用。多租户任务复位时必须使用 `reset <task_id> --tenant-slug <slug>`，以免误操作其他租户；`recover --task-id <task_id>` 遇到同一任务的多个租户状态时会报歧义，必须追加 `--tenant-slug <slug>` 精确恢复。
 
-`decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。`worktree_slug` 可选；流程引用节点声明 `requires_snapshot: true`（缺省）时还必须提供位于源仓库 `.runtime` 暂存目录下的完整 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可直接交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
+`decide` 输入可以是旧版 `version=1` 文件，也可以是单任务 CLI 参数；单任务模式必须显式提供 `task_id`、`title`、`task_url`、`repository`，direct 流程必须显式传 `--dispatch-flow direct`，并建议同时传 `--source-task-id`。流程要求候选资格时（节点声明 `requires_candidate_eligibility: true`），`decide` 与 `launch` 都要求提供完整的 `candidate_eligible`、`candidate_eligibility_reason`、`candidate_jql`、`reference_plan_source`；节点未声明该要求时两者都跳过候选资格校验。成功返回的 `launch_input.tasks` 应原样保存并交给 `launch`，不得手工重建任务 JSON。`worktree_slug` 可选；流程引用节点声明 `requires_snapshot: true`（缺省）时还必须提供位于源仓库 `.runtime` 暂存目录下的完整 `requirement_snapshot_path`，快照缺失或完整性校验失败时该任务直接返回 `needs_confirmation`。`status=ready` 时，`launch_input.tasks` 是可直接交给 `launch` 的标准任务列表；`status=needs_confirmation` 时须仅处理返回的未决任务。
 
 ## 流程注册表
 
@@ -142,7 +166,7 @@ flows:                        # 有序数组，必须且只能有一个 default:
 
 - 节点名与流程名限 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`，重复名、未知节点引用、未知节点字段、`default` 缺失或不唯一、以及流程引用的节点全都未声明 `command_template`，都会在加载配置时报错。节点为独立定义，不支持在流程内做字段级覆盖。
 - 省略流程时统一使用注册表里 `default: true` 的那个流程：`task-source` 不传 `--flow`、`decide` 与 `launch` 输入不传 `dispatch_flow` 都按此回退；显式传入的流程必须命中注册表。
-- 一个流程引用多个节点时按顺序合成：`command_template` 取最后一个声明它的节点，`session_prompt` 取最后一个声明者，`fetch_prompt` 与 `query` 取第一个声明者，`next_steps` 顺序拼接，`requires_worktree` / `requires_snapshot` 需所有节点都为 `true` 才为 `true`。
+- 一个流程引用多个节点时按顺序合成：`command_template` 取最后一个声明它的节点，`session_prompt` 取最后一个声明者，`fetch_prompt` 与 `query` 取第一个声明者，`next_steps` 顺序拼接，`requires_worktree` / `requires_snapshot` 需所有节点都为 `true` 才为 `true`；`requires_candidate_eligibility` / `requires_reference_plan_candidate` 默认 `false`，任一节点声明为 `true` 即为 `true`（后者要求前者同时成立）。
 - `requires_worktree: false` 的流程不要求任务级独立工作树：开发会话落在源仓库 checkout，制品留在 `.runtime` 暂存目录，不做迁移。
 - 旧配置的 `dispatch.skill.command_templates` 与 `task_source.flows` 会自动映射为等价注册表并给出弃用告警，其中旧 `separate` 按 `complete` 处理。
 - 注册表沿用既有的合并规则：用户覆盖层出现 `stages` 或 `flows` 时，整份列表替换托管默认的同名列表，不做按名合并。因此在用户层追加流程需同时完整重述被复用的节点；直接改托管默认配置则只需追加一项。用户层只写旧键时仍按旧结构映射，新旧同时出现以注册表为准。

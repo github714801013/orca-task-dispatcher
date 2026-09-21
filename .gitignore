@@ -4,3 +4,12 @@ __pycache__/
 *.pyc
 /config/dispatcher.yaml
 config.yml
+
+# docs/engineering 仅托管计划与规格
+docs/engineering/*
+!docs/engineering/plans/
+!docs/engineering/plans/**
+!docs/engineering/specs/
+!docs/engineering/specs/**
+!docs/engineering/adr/
+!docs/engineering/adr/**

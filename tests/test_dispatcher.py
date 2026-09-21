@@ -110,14 +110,20 @@ def worktree_assignment(
     """暂存需求快照与附件，返回可直接分发的 assignment；工作区由 Orca 在 launch 时创建。"""
     snapshot_path = stage_snapshot(repository_path, task_id)
     return dispatcher.Assignment(
-        task=dispatcher.Task(task_id, task_id, f"https://jira.example/{task_id}"),
+        task=dispatcher.Task(task_id=task_id, title=task_id, task_url=f"https://jira.example/{task_id}"),
         repository="mapped",
         repository_path=repository_path,
         base_branch=branch,
         tenant=tenant,
         tenant_slug=tenant_slug,
         worktree_slug=worktree_suffix.lstrip("-") or task_id.lower(),
+        reference_plan="proposal 测试参考方案" if dispatch_flow == "proposal" else None,
+        reference_plan_source="task" if dispatch_flow == "proposal" else "none",
         requirement_snapshot_path=snapshot_path,
+        candidate_eligible=True,
+        candidate_eligibility_reason="测试候选资格",
+        candidate_jql="测试候选 JQL",
+        candidate_evidence_provided=True,
         dispatch_flow=dispatch_flow,
     )
 
@@ -218,7 +224,7 @@ def command_config(template: str, *, flow: str = "complete") -> dispatcher.Confi
         requires_snapshot=True,
     )
     return dispatcher.Config(
-        root=Path("."), projects_root=Path("."), projects={}, branch_options=(), validate_branch=False,
+        root=Path("."), projects_root=Path("."), projects={}, branch_options=(), default_branch=None, validate_branch=False,
         max_tasks=1, max_agents=1, read_retry_attempts=1, read_retry_delay_ms=0, state_file=Path("state.json"),
         task_url_template="https://jira.example/{task_id}", task_source_type="prompt",
         task_source_query="", fetch_prompt="",
@@ -245,6 +251,10 @@ def assignment(
         worktree_slug=worktree_slug,
         dispatch_flow=dispatch_flow,
         requirement_snapshot_path=requirement_snapshot_path,
+        candidate_eligible=True,
+        candidate_eligibility_reason="测试候选资格",
+        candidate_jql="测试候选 JQL",
+        candidate_evidence_provided=True,
     )
 
 
@@ -356,6 +366,7 @@ class FakeOrca:
         self.send_observation = send_observation
         self.send_payload = send_payload
         self.create_suffix = create_suffix
+        self.base_branch = "origin/release"
         self.before_terminal_send = before_terminal_send
         self.worktrees_by_id: dict[str, dispatcher.OrcaWorktree] = {}
         self.terminals_by_handle: dict[str, dispatcher.OrcaTerminal] = {}
@@ -376,6 +387,10 @@ class FakeOrca:
         key = os.path.normcase(os.path.normpath(str(path.resolve())))
         self.operations.append(("repo-show", key))
         return self.repository_ids.get(key)
+
+    def repo_base_branch(self, repository_id: str) -> str | None:
+        self.operations.append(("repo-base", repository_id))
+        return self.base_branch
 
     def worktree_set_in_progress(self, worktree_path: Path) -> None:
         self.operations.append(("worktree-status", worktree_path.resolve().as_posix()))
@@ -558,7 +573,7 @@ class DispatcherTests(unittest.TestCase):
                 "dispatch_flow": "complete",
                 "proposal_command": None,
                 "jql_semantics": "native_jql_then_parent_post_filter",
-                "parent_lookup": {"relation": "parent", "field": "查询条件里父项条件所用的同一个字段", "required": True},
+                "parent_lookup": {"relation": "parent", "field": "customfield_11103", "required": True},
                 "post_filter": "该字段在子任务或父任务上非空",
                 "next_steps": ["执行独立 Jira 节点并归档完整需求与附件", "执行独立 GitNexus 调研节点", "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/", "生成 version=1 decide 输入", "通过 decide 后 launch"],
             })
@@ -576,7 +591,7 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(result["proposal_command"], "/dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}")
             self.assertEqual(result["jql_semantics"], "native_jql_then_parent_post_filter")
             self.assertEqual(result["parent_lookup"]["relation"], "parent")
-            self.assertIn("父项条件所用的同一个字段", result["parent_lookup"]["field"])
+            self.assertEqual(result["parent_lookup"]["field"], "customfield_11103")
             self.assertIn("独立 Jira 节点", " ".join(result["next_steps"]))
             self.assertIn("独立 GitNexus", " ".join(result["next_steps"]))
             self.assertIn("独立 GitNexus 调研节点", " ".join(result["next_steps"]))
@@ -645,6 +660,111 @@ class DispatcherTests(unittest.TestCase):
                     if username is not None:
                         expected += f"\n当前用户名：{username}"
                     self.assertEqual(dispatcher.command_for(config, item), expected)
+
+    def test_direct_task_source_requires_canonical_parent_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config_path = root / "config" / "dispatcher.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'workspace:\n'
+                f'  projects_root: "{projects.as_posix()}"\n'
+                '  projects:\n'
+                '    example-repository:\n'
+                '      path: "repo-a"\n'
+                '      base_branches: ["main"]\n',
+                encoding="utf-8",
+            )
+            config = dispatcher.load_config(config_path)
+
+            prompt = dispatcher.task_source_prompt(config, flow="direct")["fetch_prompt"]
+
+            self.assertIn("parent key 与 parent issue type", prompt)
+            self.assertIn("task_id、title、task_url 使用父需求", prompt)
+            self.assertIn("不得把开发子任务编号原样写入 task_id", prompt)
+            self.assertIn("source_task_id", prompt)
+            self.assertIn("parent_task_id", prompt)
+
+    def test_assignment_rejects_noncanonical_parent_task_id(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "task_id 必须是上游归一化后的实际需求编号"):
+            dispatcher.Assignment.from_dict({
+                "task_id": "CHILD-2",
+                "title": "开发子任务",
+                "task_url": "https://jira.example/CHILD-2",
+                "repository": "mapped",
+                "repository_path": "D:/repo-a",
+                "base_branch": "origin/release",
+                "source_task_id": "CHILD-2",
+                "parent_task_id": "PARENT-1",
+            }, "complete")
+
+    def test_assignment_accepts_canonical_parent_task_id_and_preserves_source(self) -> None:
+        item = dispatcher.Assignment.from_dict({
+            "task_id": "PARENT-1",
+            "title": "产品需求",
+            "task_url": "https://jira.example/PARENT-1",
+            "repository": "mapped",
+            "repository_path": "D:/repo-a",
+            "base_branch": "origin/release",
+            "source_task_id": "CHILD-2",
+            "parent_task_id": "PARENT-1",
+            "dispatch_flow": "direct",
+        }, "complete")
+
+        self.assertEqual(dispatcher.worktree_name_for(item), "PARENT-1")
+        self.assertEqual(item.source_task_id, "CHILD-2")
+        self.assertEqual(item.parent_task_id, "PARENT-1")
+
+    def test_assignment_rejects_normalized_task_without_source_task_id(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "必须保留原始开发子任务编号 source_task_id"):
+            dispatcher.Assignment.from_dict({
+                "task_id": "PARENT-1",
+                "title": "产品需求",
+                "task_url": "https://jira.example/PARENT-1",
+                "repository": "mapped",
+                "repository_path": "D:/repo-a",
+                "base_branch": "origin/release",
+                "parent_task_id": "PARENT-1",
+                "dispatch_flow": "direct",
+            }, "complete")
+
+    def test_decide_pauses_only_noncanonical_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            snapshot_path = stage_snapshot(repository_path, "PARENT-1")
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([
+                {
+                    "task_id": "PARENT-1", "title": "已归一化", "task_url": "https://jira.example/PARENT-1",
+                    "repository": "mapped", "base_branch": "origin/release",
+                    "source_task_id": "CHILD-2", "parent_task_id": "PARENT-1",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "JQL 通过",
+                    "candidate_jql": "project = XSWL", "reference_plan_source": "none",
+                    "requirement_snapshot_path": str(snapshot_path),
+                },
+                {
+                    "task_id": "CHILD-3", "title": "未归一化", "task_url": "https://jira.example/CHILD-3",
+                    "repository": "mapped", "base_branch": "origin/release",
+                    "source_task_id": "CHILD-3", "parent_task_id": "PARENT-1",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "JQL 通过",
+                    "candidate_jql": "project = XSWL", "reference_plan_source": "none",
+                },
+            ], config.default_flow))
+
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertEqual(
+                [item["status"] for item in result["tasks"]],
+                ["selected", "needs_confirmation"],
+            )
+            self.assertIn("task_id 必须是上游归一化后的实际需求编号", result["tasks"][1]["reason"])
+            self.assertEqual(
+                [item["task_id"] for item in result["launch_input"]["tasks"]],
+                ["PARENT-1"],
+            )
 
     def test_assignment_rejects_malformed_dispatch_flow(self) -> None:
         with self.assertRaisesRegex(dispatcher.DispatcherError, "只能包含字母、数字、点、下划线和连字符"):
@@ -1205,6 +1325,209 @@ class DispatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(dispatcher.DispatcherError, "附件文件必须是现有普通文件"):
                 dispatcher.validate_assignment(config, item, {"mapped": dispatcher.Repository("mapped", repository_path)})
 
+    def test_proposal_accepts_parent_reference_plan_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            snapshot = stage_snapshot(repository, "XSWL-1")
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1", "title": "父方案候选", "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped", "base_branch": "origin/release", "dispatch_flow": "proposal",
+                "requirement_snapshot_path": str(snapshot), "candidate_eligible": True,
+                "candidate_eligibility_reason": "父任务参考方案非空", "candidate_jql": "project = XSWL",
+                "reference_plan_source": "parent",
+                "parent_reference_plan": "父任务方案",
+            }], config.default_flow))
+            self.assertEqual(result["status"], "ready", result)
+            selected = result["launch_input"]["tasks"][0]
+            self.assertTrue(selected["candidate_eligible"])
+            self.assertEqual(selected["reference_plan_source"], "parent")
+
+    def test_partial_candidate_evidence_cannot_bypass_decide(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            ensure_git_repository(repository)
+            config = write_config(root, projects)
+            for eligible in (True, False):
+                with self.subTest(eligible=eligible):
+                    result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                        "task_id": "XSWL-1", "title": "部分证据",
+                        "task_url": "https://jira.example/XSWL-1", "repository": "mapped",
+                        "base_branch": "origin/release", "dispatch_flow": "direct",
+                        "candidate_eligible": eligible,
+                    }], config.default_flow))
+                    self.assertEqual(result["status"], "needs_confirmation")
+                    self.assertEqual(result["launch_input"]["tasks"], [])
+                    self.assertIn("完整候选资格", result["tasks"][0]["reason"])
+
+    def test_decide_skips_candidate_evidence_for_lightweight_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            ensure_git_repository(repository)
+            config = write_registry_config(root, projects)
+
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1", "title": "轻量流程", "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped", "base_branch": "origin/release", "dispatch_flow": "lightweight",
+            }], config.default_flow))
+
+            self.assertEqual(result["status"], "ready", result)
+            self.assertEqual(result["launch_input"]["tasks"][0]["task_id"], "XSWL-1")
+
+    def test_assignment_rejects_partial_candidate_evidence(self) -> None:
+        with self.assertRaisesRegex(dispatcher.DispatcherError, "完整候选资格"):
+            dispatcher.Assignment.from_dict({
+                "task_id": "XSWL-1",
+                "title": "部分资格证据",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "repository_path": "C:/repo",
+                "base_branch": None,
+                "candidate_eligible": True,
+            }, "complete")
+
+    def test_decide_rejects_missing_reference_plan_source_before_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            ensure_git_repository(repository)
+            config = write_config(root, projects)
+            values = dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1",
+                "title": "缺少来源",
+                "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped",
+                "base_branch": "origin/release",
+                "dispatch_flow": "direct",
+                "candidate_eligible": True,
+                "candidate_eligibility_reason": "JQL 通过",
+                "candidate_jql": "project = XSWL",
+            }], config.default_flow)
+
+            result = dispatcher.decide_values(config, values)
+
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertIn("完整候选资格", result["tasks"][0]["reason"])
+            self.assertNotIn("candidates", result["tasks"][0])
+
+    def test_candidate_gate_precedes_repository_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1", "title": "不合格任务", "task_url": "https://jira.example/XSWL-1",
+                "dispatch_flow": "direct", "candidate_eligible": False,
+                "candidate_eligibility_reason": "解析失败", "candidate_jql": "project = XSWL",
+                "reference_plan_source": "none",
+            }], config.default_flow))
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertNotIn("candidates", result["tasks"][0])
+            self.assertIn("候选资格", result["tasks"][0]["reason"])
+
+    def test_proposal_true_eligibility_still_requires_reference_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            snapshot = stage_snapshot(repository, "XSWL-1")
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1", "title": "无方案", "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped", "base_branch": "origin/release", "dispatch_flow": "proposal",
+                "requirement_snapshot_path": str(snapshot), "candidate_eligible": True,
+                "candidate_eligibility_reason": "JQL 通过", "candidate_jql": "project = XSWL",
+                "reference_plan_source": "none",
+            }], config.default_flow))
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertIn("proposal", result["tasks"][0]["reason"])
+
+    def test_parent_source_rejects_task_only_reference_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            snapshot = stage_snapshot(repository, "XSWL-1")
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-1", "title": "来源错位", "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped", "base_branch": "origin/release", "dispatch_flow": "proposal",
+                "requirement_snapshot_path": str(snapshot), "candidate_eligible": True,
+                "candidate_eligibility_reason": "JQL 通过", "candidate_jql": "project = XSWL",
+                "reference_plan_source": "parent", "reference_plan": "错误地只给任务方案",
+            }], config.default_flow))
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertIn("父任务", result["tasks"][0]["reason"])
+
+    def test_proposal_ineligible_without_task_or_parent_reference_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            snapshot = stage_snapshot(repository, "XSWL-27358")
+            config = write_config(root, projects)
+            path = root / "decision.json"
+            path.write_text(json.dumps({"version": 1, "tasks": [{
+                "task_id": "XSWL-27358", "title": "错误候选",
+                "task_url": "https://jira.example/XSWL-27358",
+                "repository": "mapped", "base_branch": "origin/release",
+                "dispatch_flow": "proposal", "requirement_snapshot_path": str(snapshot),
+                "candidate_eligible": False,
+                "candidate_eligibility_reason": "父子参考方案均为空",
+                "candidate_jql": "project = XSWL",
+                "reference_plan_source": "none",
+            }]}), encoding="utf-8")
+
+            result = dispatcher.decide(config, path)
+
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertEqual(result["launch_input"]["tasks"], [])
+            self.assertIn("候选资格", result["tasks"][0]["reason"])
+
+    def test_direct_ineligible_even_with_explicit_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            ensure_git_repository(repository)
+            config = write_config(root, projects)
+            result = dispatcher.decide_values(config, dispatcher.validate_decision_values([{
+                "task_id": "XSWL-27358", "title": "过宽查询结果",
+                "task_url": "https://jira.example/XSWL-27358",
+                "repository": "mapped", "base_branch": "origin/release",
+                "dispatch_flow": "direct", "candidate_eligible": False,
+                "candidate_eligibility_reason": "原始 JQL 与等价转换均解析失败",
+                "candidate_jql": "project = XSWL",
+                "reference_plan_source": "none",
+            }], config.default_flow))
+            self.assertEqual(result["status"], "needs_confirmation")
+            self.assertEqual(result["launch_input"]["tasks"], [])
+            self.assertIn("候选资格", result["tasks"][0]["reason"])
+
+    def test_launch_rejects_manual_input_without_candidate_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository = projects / "repo-a"
+            ensure_git_repository(repository)
+            config = write_config(root, projects)
+            item = dispatcher.Assignment.from_dict({
+                "task_id": "XSWL-1", "title": "手工输入", "task_url": "https://jira.example/XSWL-1",
+                "repository": "mapped", "repository_path": str(repository), "base_branch": None,
+                "dispatch_flow": "direct", "candidate_eligible": None,
+                "candidate_eligibility_reason": None, "candidate_jql": None, "reference_plan_source": "none",
+            }, config.default_flow)
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "候选资格"):
+                dispatcher.launch(config, (item,), dispatcher.StateStore(config.state_file), FakeOrca({repository: "repo-mapped"}), False)
+
     def test_decide_blocks_tenant_task_without_complete_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1233,11 +1556,15 @@ class DispatcherTests(unittest.TestCase):
                     "task_id": "XSWL-1", "title": "测试", "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped", "tenant": "九机", "tenant_slug": "jiuji",
                     "base_branch": "origin/release",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "测试 JQL",
+                    "reference_plan_source": "none",
                 },
                 {
                     "task_id": "XSWL-2", "title": "测试", "task_url": "https://jira.example/XSWL-2",
                     "repository": "mapped", "tenant": "九机", "tenant_slug": "jiuji",
                     "base_branch": "origin/release",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "测试 JQL",
+                    "reference_plan_source": "none",
                     "requirement_snapshot_path": snapshot_path.as_posix(),
                 },
             ]}), encoding="utf-8")
@@ -1312,11 +1639,13 @@ class DispatcherTests(unittest.TestCase):
                 {
                     "task_id": "XSWL-1", "title": "测试", "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped", "tenant": "九机", "tenant_slug": "jiuji",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "project = XSWL", "reference_plan_source": "none",
                     "requirement_snapshot_path": snapshot_jiuji.as_posix(),
                 },
                 {
                     "task_id": "XSWL-1", "title": "测试", "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped", "tenant": "九讯云", "tenant_slug": "jiuxun",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "project = XSWL", "reference_plan_source": "none",
                     "requirement_snapshot_path": snapshot_jiuxun.as_posix(),
                 },
             ]}), encoding="utf-8")
@@ -1375,6 +1704,8 @@ class DispatcherTests(unittest.TestCase):
                 "--title", "测试任务", "--task-url", "https://jira.example/CW-7622", "--repository", "mapped",
                 "--base-branch", "origin/release", "--dispatch-flow", "direct",
                 "--worktree-slug", "fix-cw",
+                "--candidate-eligible", "--candidate-eligibility-reason", "测试候选", "--candidate-jql", "project = CW",
+                "--reference-plan-source", "none",
                 "--requirement-snapshot-path", snapshot_path.resolve().as_posix(),
             ])
             result = dispatcher.execute(arguments)
@@ -1422,6 +1753,7 @@ class DispatcherTests(unittest.TestCase):
                 "parent_task_id": "XSWL-1",
                 "parent_assignee": "父任务负责人",
                 "reference_plan": "参考方案",
+                "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "测试 JQL", "reference_plan_source": "task",
                 "requirement_snapshot_path": snapshot_path.resolve().as_posix(),
             }]}), encoding="utf-8")
 
@@ -1468,6 +1800,8 @@ class DispatcherTests(unittest.TestCase):
                     "task_url": "https://jira.example/XSWL-1",
                     "repository": "mapped",
                     "base_branch": "origin/release",
+                    "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "测试 JQL",
+                    "reference_plan_source": "none",
                     "requirement_snapshot_path": snapshot_path.as_posix(),
                 },
                 {
@@ -1954,6 +2288,7 @@ class DispatcherTests(unittest.TestCase):
                 "task_url": "https://jira.example/XSWL-1",
                 "repository": "mapped",
                 "base_branch": "origin/release",
+                "candidate_eligible": True, "candidate_eligibility_reason": "测试候选", "candidate_jql": "project = XSWL", "reference_plan_source": "none",
                 "requirement_snapshot_path": snapshot_path.as_posix(),
             }]}), encoding="utf-8")
 
@@ -1977,6 +2312,21 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(combined.next_steps, ("准备 worktree", "启动开发会话", "轻量处理"))
             self.assertEqual(combined.command_template, config.flows["lightweight"].command_template)
             self.assertFalse(combined.requires_worktree)
+
+    def test_registry_rejects_reference_candidate_without_candidate_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "必须同时要求候选资格"):
+                write_registry_config(
+                    root,
+                    projects,
+                    REGISTRY_CONFIG.replace(
+                        '    command_template: "/dev-spec-gen {{task_url}} shared；base_branch={{base_branch}}"',
+                        '    command_template: "/dev-spec-gen {{task_url}} shared；base_branch={{base_branch}}"\n    requires_reference_plan_candidate: true',
+                    ),
+                )
 
     def test_registry_default_flow_must_be_unique(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2210,6 +2560,11 @@ class DispatcherTests(unittest.TestCase):
                     "base_branch": "origin/release",
                     "dispatch_flow": item.dispatch_flow,
                     "worktree_slug": item.worktree_slug,
+                    "candidate_eligible": True,
+                    "candidate_eligibility_reason": "测试候选",
+                    "candidate_jql": "测试 JQL",
+                    "reference_plan_source": "task" if item.dispatch_flow == "proposal" else "none",
+                    "reference_plan": "proposal 参考方案" if item.dispatch_flow == "proposal" else None,
                     "requirement_snapshot_path": item.requirement_snapshot_path.resolve().as_posix(),
                 }
                 for item in items
@@ -2777,6 +3132,7 @@ class DispatcherTests(unittest.TestCase):
                 repository_path=repository_path,
                 base_branch=None,
                 reference_plan="参考方案内容",
+                reference_plan_source="task",
                 requirement_snapshot_path=snapshot_path,
             )
 
@@ -3648,6 +4004,214 @@ class DispatcherTests(unittest.TestCase):
             payload=result["results"][0], status=store.status("XSWL-1"),
         )
 
+    def test_worktree_create_cli_creates_and_reuses_without_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            with mock.patch.object(dispatcher, "sync_worktree_files", return_value=("同步完成",)) as sync:
+                first = dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", None, "cli-create")
+                first_result = dispatcher.create_or_reuse_task_worktree(config, fake, *first)
+                second = dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", None, "cli-create")
+                second_result = dispatcher.create_or_reuse_task_worktree(config, fake, *second)
+
+            self.assertFalse(first_result["reused"])
+            self.assertTrue(second_result["reused"])
+            self.assertEqual(first_result["worktree_id"], second_result["worktree_id"])
+            self.assertEqual(first_result["worktree_name"], "TASK-1-cli-create")
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+            self.assertEqual(sync.call_count, 2)
+            self.assertFalse(config.state_file.exists())
+            self.assertNotIn("terminal-create", [op for op, _ in fake.operations])
+
+    def test_worktree_create_cli_reuses_worktree_with_active_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", None, "active")
+            with mock.patch.object(dispatcher, "sync_worktree_files", return_value=()):
+                created = dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+                fake.add_agent_terminal(created["worktree_id"])
+                reused = dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+            self.assertTrue(reused["reused"])
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+
+    def test_worktree_create_cli_rejects_unknown_orca_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(
+                config, "TASK-1", "mapped", None, "unknown-default",
+            )
+
+            fake.base_branch = None
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "默认基础分支"):
+                dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+
+            self.assertNotIn("worktree-create", [operation for operation, _ in fake.operations])
+
+    def test_worktree_create_cli_uses_orca_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            fake.base_branch = "origin/release"
+            repository, item = dispatcher.worktree_create_assignment(
+                config, "TASK-1", "mapped", None, "orca-default",
+            )
+
+            with mock.patch.object(dispatcher, "sync_worktree_files", return_value=()):
+                result = dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+
+            self.assertEqual(result["base_branch"], "origin/release")
+            self.assertIn("repo-base", [operation for operation, _ in fake.operations])
+
+    def test_worktree_create_cli_checks_new_worktree_for_active_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(
+                config, "TASK-1", "mapped", "origin/release", "active-new",
+            )
+            original_worktree_create = fake.worktree_create
+
+            def create_with_agent(*args: object, **kwargs: object) -> dispatcher.OrcaWorktree:
+                worktree = original_worktree_create(*args, **kwargs)
+                fake.add_agent_terminal(worktree.worktree_id)
+                return worktree
+
+            with mock.patch.object(fake, "worktree_create", side_effect=create_with_agent), \
+                 mock.patch.object(dispatcher, "sync_worktree_files", return_value=()) as sync:
+                result = dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+
+            self.assertTrue(result["reused"] is False)
+            self.assertEqual(sync.call_count, 0)
+            self.assertNotIn("worktree-status", [operation for operation, _ in fake.operations])
+
+    def test_worktree_create_cli_rejects_malformed_create_receipt(self) -> None:
+        payload = {"worktree": {"id": "repo-1::D:/probe"}}
+        with mock.patch.object(dispatcher.OrcaClient, "_call", return_value=payload) as call:
+            client = dispatcher.OrcaClient("orca")
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "worktree.path") as raised:
+                client.worktree_create("TASK-1", "repo-1", "origin/release", "comment")
+
+            self.assertEqual(raised.exception.orca_code, "runtime_unavailable")
+            self.assertIn("worktree", call.call_args.args)
+
+    def test_worktree_create_cli_rejects_existing_suffix_before_create(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(
+                config, "TASK-1", "mapped", "origin/release", "suffix",
+            )
+            fake.create_suffix = "-2"
+            fake.worktree_create(
+                dispatcher.worktree_name_for(item),
+                "repo-mapped",
+                item.base_branch,
+                dispatcher.worktree_comment_for(item),
+            )
+            fake.create_suffix = ""
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "自动后缀"):
+                dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+
+    def test_worktree_create_cli_uses_dispatcher_lock_without_writing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            config.state_file.parent.mkdir(parents=True)
+            dispatcher.atomic_write_json(config.state_file.parent / "launch.lock", {
+                "pid": os.getpid(), "token": "active",
+            })
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(
+                config, "TASK-1", "mapped", None, "locked",
+            )
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "已有 Dispatcher"):
+                dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+
+            self.assertFalse(config.state_file.exists())
+            self.assertNotIn("worktree-create", [op for op, _ in fake.operations])
+
+    def test_worktree_create_cli_rejects_identity_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            repository_path = projects / "repo-a"
+            ensure_git_repository(repository_path)
+            config = write_config(root, projects)
+            fake = FakeOrca({repository_path: "repo-mapped"})
+            repository, item = dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", None, "conflict")
+            worktree = fake.worktree_create(
+                dispatcher.worktree_name_for(item), "repo-mapped", item.base_branch, "foreign-comment"
+            )
+            dispatcher.rename_worktree_branch(worktree.path, dispatcher.worktree_branch_for(item, repository))
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "归属标记"):
+                dispatcher.create_or_reuse_task_worktree(config, fake, repository, item)
+            self.assertEqual(sum(op == "worktree-create" for op, _ in fake.operations), 1)
+
+    def test_worktree_create_cli_uses_config_default_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = dataclasses.replace(write_config(root, projects), default_branch="origin/release")
+            _, item = dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", None, None)
+            self.assertEqual(item.base_branch, "origin/release")
+            self.assertEqual(dispatcher.worktree_name_for(item), "TASK-1")
+
+    def test_worktree_create_cli_rejects_unconfigured_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            (projects / "unconfigured" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "配置仓库"):
+                dispatcher.worktree_create_assignment(
+                    config, "TASK-1", "unconfigured", None, None,
+                )
+
+    def test_worktree_create_cli_rejects_non_whitelisted_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects = root / "projects"
+            (projects / "repo-a" / ".git").mkdir(parents=True)
+            config = write_config(root, projects)
+            with self.assertRaisesRegex(dispatcher.DispatcherError, "配置白名单"):
+                dispatcher.worktree_create_assignment(config, "TASK-1", "mapped", "forbidden", None)
+
     def test_worktree_create_never_requests_an_agent(self) -> None:
         payload = {"worktree": {
             "id": "repo-1::D:/probe", "path": "D:/probe", "repoId": "repo-1",
@@ -3682,7 +4246,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             config = dataclasses.replace(config, flows={
                 **config.flows,
@@ -3722,7 +4291,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake = FakeOrca({repository_path: "repo-mapped"})
@@ -3748,7 +4322,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             store = dispatcher.StateStore(config.state_file)
             fake = FakeOrca({repository_path: "repo-mapped"})
@@ -3782,7 +4361,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             path = projects / "repo-a"
             first = worktree_assignment(projects, path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             config = dataclasses.replace(config, flows={
                 **config.flows,
@@ -3804,7 +4388,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             path = projects / "repo-a"
             first = worktree_assignment(projects, path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             config = dataclasses.replace(config, flows={
                 **config.flows,
@@ -3829,7 +4418,12 @@ class DispatcherTests(unittest.TestCase):
             projects = root / "projects"
             repository_path = projects / "repo-a"
             first = worktree_assignment(projects, repository_path, "XSWL-1", dispatch_flow="direct")
-            second = dataclasses.replace(first, dispatch_flow="proposal")
+            second = dataclasses.replace(
+                first,
+                dispatch_flow="proposal",
+                reference_plan="proposal 测试参考方案",
+                reference_plan_source="task",
+            )
             config = write_config(root, projects)
             config = dataclasses.replace(config, flows={
                 **config.flows,

@@ -57,7 +57,7 @@ task_source:
 
     参考方案字段：配置值为 {{reference_plan_field}}。若配置为具体 Jira 字段（customfield ID 或字段名），读取其内容并在非空时映射为 reference_plan；
     子任务和父需求的参考方案采用 `子任务字段非空 OR 父需求字段非空` 后置过滤；原生 JQL 不支持父项字段 join 时，不得伪造“父需求的 cf”语法。
-    字段未配置、读取失败或值为空时不得伪造字段值，按下方规则回退到其他证据联合决策。
+    字段未配置、读取失败或值为空时不得伪造字段值，按下方规则回退到其他证据联合决策；proposal 因此不具备候选资格，direct/complete 仍须按各自候选条件给出资格证据。
 
     任务获取阶段先读取完整原始需求与全部附件本体；原件保存或 SHA-256 校验失败时，标记 incomplete 并阻断后续 GitNexus 调研和分发。
     先暂存 `<root>/.runtime/requirements/<实际-task-id>/`：Markdown 完整保留正文，图片写 OCR 文本和语义描述；其他附件保留原件并在 Markdown 索引相对路径、SHA-256 与可读性状态。
@@ -76,15 +76,17 @@ task_source:
     项目与分支定位必须以参考方案（{{reference_plan_field}}）为依据：提取其中的“人员—项目/技术栈”分工，用当前查询子任务的 source_assignee 匹配出本人对应的项目/技术栈，
     再映射到配置里的 repository、tenant、base_branch 候选。只要参考方案能唯一映射到配置候选，就必须采用该结果，不得被 GitNexus 报告、任务标题/描述或其他证据推翻。
     source_assignee 是当前执行归属，父任务负责人只作为上下文，不能覆盖或否定子任务负责人。
-    仅当参考方案缺失、冲突或无法映射到配置候选时，才回退到用父产品需求、任务标题/描述、GitNexus 报告和项目/分支描述联合决策；
-    回退后仍不能唯一确定项目、租户或基础分支时才请求用户确认；不得因父产品需求负责人不同而制造歧义。
+    仅当参考方案缺失、冲突或无法映射到配置候选时，才回退到用父产品需求、任务标题/描述、GitNexus 报告和项目/分支描述联合决策；只有任务已经通过当前流程候选资格时该规则才生效，参考方案缺失的 proposal 不是候选，不能进入兜底。
+    回退后仍不能唯一确定项目、租户或基础分支时才请求用户确认；人工确认不能补造候选资格。
+    原始 JQL 解析失败时只能按公开 dev-spec-gen 规范做等价转换，并将转换结果再次交 Jira 原生解析器；两次失败时本轮没有可用任务，必须整轮停止并如实记录 candidate_ineligible，禁止改用过宽基础 JQL 继续取候选。
+    上游 Jira 交接必须逐任务写 candidate_eligible、candidate_eligibility_reason、candidate_jql、reference_plan_source、reference_plan/parent_reference_plan；缺任一字段时阻断后续调研、decide 与 launch。
 
     state 过滤后，为每个可处理任务立即派发独立 GitNexus 子 Agent，使用一次跨项目只读远程 query；不得先锁定仓库、
     不得创建 worktree，不得修改文件、执行 launch 或进行全目录泛搜。报告必须返回候选项目/分支、完整查询意图、命中证据、
     排除理由、未确认项和 Markdown 调研结论。
 
     项目与分支以参考方案（{{reference_plan_field}}）为准：先从参考方案提取“人员—项目/技术栈”分工，再与当前开发子任务负责人交叉验证并映射到配置候选，命中即采用；
-    GitNexus 报告、任务标题/描述、父产品需求信息与 `repos`/`branches` 描述只在参考方案缺失或无法映射时作为兜底证据。父产品需求负责人只作上下文，不能覆盖 source_assignee。
+    GitNexus 报告、任务标题/描述、父产品需求信息与 `repos`/`branches` 描述只在参考方案缺失或无法映射时作为兜底证据；只在候选资格已经通过后生效，不能把 proposal/direct 的不合格任务变成候选。
     联合判断由外部编排器完成后，必须将每个任务的显式 repository、tenant、tenant_slug 与 base_branch 连同调研上下文写入 version=1 决策 JSON。
     同一实际 task_id 同时命中多个配置租户时，必须展开为多条 tenant assignment；每条后续都使用独立 worktree，禁止因 task_id 相同而合并。
     项目级 branch_priority 命中时必须使用其分支；未命中、项目/租户未确认或规则冲突时返回 needs_confirmation。调用 `dispatcher.py decide --input <json>` 校验；
@@ -116,28 +118,31 @@ task_source:
 
 # 流程注册表：stages 是独立可复用的节点，flows 按名引用节点组成流程。
 # 新增流程 = 在 flows 数组追加一项（必要时在 stages 追加可复用节点），无需改代码。
-# 节点字段：name、command_template（必须以 /dev-spec-gen 开头）、session_prompt、fetch_prompt、
-#           query（该流程的默认 JQL，可为伪 JQL）、next_steps、requires_worktree、requires_snapshot；
+# 节点字段：name、command_template、session_prompt、fetch_prompt、query、next_steps、
+#           requires_worktree、requires_snapshot、requires_candidate_eligibility、requires_reference_plan_candidate；
 #           名称限 [A-Za-z0-9][A-Za-z0-9._-]{0,63}。
 stages:
   - name: direct_dispatch
     command_template: "/dev-spec-gen {task_url} development_jira_spec(jira 参考方案驱动流程开发)；当前实际开发任务：{source_task_id}；全自动执行，无需人员介入"
     fetch_prompt: |
-      使用当前环境可用的任务查询工具，仅获取待分发任务的 task_id、title、task_url 和 assignee。
+      使用当前环境可用的任务查询工具，仅获取通过 direct 候选资格的待分发开发任务。
       查询条件（必须原样使用，严禁改写查询意图、增删条件或调整范围）：
       {{query}}
-      该条件可能是伪 SQL 或伪 JQL：先原样交给 Jira 原生解析器，解析失败才判定为伪 JQL 并转换，转换结果再交同一个解析器校验，通过后才执行。
-      其中的父项字段条件（「父需求的 cf[...]」）无法进原生 JQL：禁止伪造该语法，改为按 parent key 只读取父任务对应的那一个字段再后置过滤，并与子任务结果合并。
-      交接字段必须写明 jql_semantics=native_jql_then_parent_post_filter、parent_lookup 与 post_filter。
-      除该父项字段外，不要读取 Jira 详情、父需求的其余内容、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。
+      先将该 JQL 原样交给 Jira 原生解析器；失败时只允许按 dev-spec-gen 公开规范做等价转换并再次校验。两次失败都必须阻断，禁止改用更宽查询。
+      查询条件里的父项字段条件无法进原生 JQL：禁止伪造该语法，改为按 parent key 只读取父任务对应的那一个字段（{{reference_plan_field}}）再后置过滤，并与子任务结果合并。
+      每条结果必须保留原始开发子任务编号为 source_task_id；同时读取 parent key 与 parent issue type、parent summary、parent assignee。父项为产品需求时，必须以父需求作为归一化后的实际任务：task_id、title、task_url 使用父需求，parent_task_id 使用同一个父需求编号；不得把开发子任务编号原样写入 task_id。除父项 key、issue type、summary、assignee 和该父项字段外，不要读取父需求其余内容、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。父项不是产品需求或不存在时，task_id 保持原任务编号，source_task_id 可回退为 task_id，并省略 parent_task_id 与 parent_assignee；只要提供了 parent_task_id，就必须与 task_id 相同，且必须同时提供 source_task_id 保留原始开发子任务编号。
+      direct 的候选判据：JQL 原始解析或等价转换后再次解析成功并实际执行，任务范围符合本条查询。参考方案不是 direct 的候选条件；字段为空时以 reference_plan_source=none 交接，不得伪造字段值。
+      交接字段必须写明 jql_semantics=native_jql_then_parent_post_filter、parent_lookup、post_filter，并逐任务交接 candidate_eligible、candidate_eligibility_reason、candidate_jql、reference_plan_source，以及 task_id、source_task_id、parent_task_id 的归一化关系；父项字段非空时一并交接 reference_plan 或 parent_reference_plan。
     query: |
-      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11001] IS NOT EMPTY and cf[11001] not in('无','暂无') or 父需求的cf[11001] IS NOT EMPTY and 父需求的cf[11001] not in('无','暂无'))
+      issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()
     next_steps:
       - "根据实际任务编号和标题提炼语义 slug"
       - "把需求制品暂存到源仓库 .runtime/<task-id>/docs/engineering/"
       - "由 launch 建工作区、迁移制品并开启开发会话"
       - "仅将 Jira 地址和 direct 开发指令交给实际任务"
     requires_snapshot: false
+    requires_candidate_eligibility: true
+    requires_reference_plan_candidate: false
   - name: complete_dispatch
     command_template: "/dev-spec-gen {task_url} 工作区: 当前工作区当前分支 流程: development_proposal_delivery 调研: 无需调研直接澄清；base_branch={base_branch}；任务编号：{task_id}；任务标题：“{title}”；任务描述：“{description}”；负责人：“{assignee}”；租户：“{tenant}”；分发标识：{assignment_id}；参考方案：“{reference_plan}”；GitNexus 调研报告：{gitnexus_report_path}；完整原始需求快照：{requirement_snapshot_path}（先读此快照，再按其相对路径读取正文与附件本体）"
     next_steps:
@@ -146,19 +151,23 @@ stages:
       - "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/"
       - "生成 version=1 decide 输入"
       - "通过 decide 后 launch"
+    requires_candidate_eligibility: true
+    requires_reference_plan_candidate: false
   - name: proposal_dispatch
     command_template: |
       /dev-spec-gen 出具开发方案 {task_url} {requirement_snapshot_path}
       用户任务编号：{source_task_id}
       当前用户名：{source_assignee}
     query: |
-      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11103] IS NOT EMPTY and cf[11103] not in('无', '暂无') or 父需求的cf[11103] IS NOT EMPTY and 父需求的cf[11103] not in('无', '暂无')) AND (cf[11001] IS EMPTY or cf[11001] in('无', '暂无'))
+      issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()
     next_steps:
       - "独立 Jira 节点归档完整需求与附件"
       - "独立 GitNexus 调研节点执行只读调研"
       - "联合确定项目、租户与基础分支"
       - "暂存需求制品到源仓库 .runtime/<task-id>/docs/engineering/"
       - "由 launch 建工作区并开启开发方案会话"
+    requires_candidate_eligibility: true
+    requires_reference_plan_candidate: true
 flows:
   - name: direct
     stages: [direct_dispatch]
