@@ -129,12 +129,12 @@ stages:
       查询条件（必须原样使用，严禁改写查询意图、增删条件或调整范围）：
       {{query}}
       先将该 JQL 原样交给 Jira 原生解析器；失败时只允许按 dev-spec-gen 公开规范做等价转换并再次校验。两次失败都必须阻断，禁止改用更宽查询。
-      查询条件里的父项字段条件无法进原生 JQL：禁止伪造该语法，改为按 parent key 只读取父任务对应的那一个字段（{{reference_plan_field}}）再后置过滤，并与子任务结果合并。
+      查询条件里的父项字段条件无法进原生 JQL：禁止伪造该语法，改为按 parent key 只读取父任务对应的那一个字段再后置过滤，并与子任务结果合并。
       每条结果必须保留原始开发子任务编号为 source_task_id；同时读取 parent key 与 parent issue type、parent summary、parent assignee。父项为产品需求时，必须以父需求作为归一化后的实际任务：task_id、title、task_url 使用父需求，parent_task_id 使用同一个父需求编号；不得把开发子任务编号原样写入 task_id。除父项 key、issue type、summary、assignee 和该父项字段外，不要读取父需求其余内容、参考方案、原始需求、附件或图片；这些内容由实际开发任务按需处理。父项不是产品需求或不存在时，task_id 保持原任务编号，source_task_id 可回退为 task_id，并省略 parent_task_id 与 parent_assignee；只要提供了 parent_task_id，就必须与 task_id 相同，且必须同时提供 source_task_id 保留原始开发子任务编号。
       direct 的候选判据：JQL 原始解析或等价转换后再次解析成功并实际执行，任务范围符合本条查询。参考方案不是 direct 的候选条件；字段为空时以 reference_plan_source=none 交接，不得伪造字段值。
       交接字段必须写明 jql_semantics=native_jql_then_parent_post_filter、parent_lookup、post_filter，并逐任务交接 candidate_eligible、candidate_eligibility_reason、candidate_jql、reference_plan_source，以及 task_id、source_task_id、parent_task_id 的归一化关系；父项字段非空时一并交接 reference_plan 或 parent_reference_plan。
     query: |
-      issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()
+      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11001] IS NOT EMPTY and cf[11001] not in('无','暂无') or 父需求的cf[11001] IS NOT EMPTY and 父需求的cf[11001] not in('无','暂无'))
     next_steps:
       - "根据实际任务编号和标题提炼语义 slug"
       - "把需求制品暂存到源仓库 .runtime/<task-id>/docs/engineering/"
@@ -159,7 +159,7 @@ stages:
       用户任务编号：{source_task_id}
       当前用户名：{source_assignee}
     query: |
-      issuetype = 开发需求 AND status = 待开发 AND assignee = currentUser()
+      issuetype = 开发需求 AND status = 待开发 AND assignee =currentUser() AND (cf[11103] IS NOT EMPTY and cf[11103] not in('无', '暂无') or 父需求的cf[11103] IS NOT EMPTY and 父需求的cf[11103] not in('无', '暂无')) AND (cf[11001] IS EMPTY or cf[11001] in('无', '暂无'))
     next_steps:
       - "独立 Jira 节点归档完整需求与附件"
       - "独立 GitNexus 调研节点执行只读调研"
